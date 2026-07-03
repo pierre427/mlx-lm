@@ -37,6 +37,11 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: int = 8
     rope_theta: int = 150000
     rope_scaling: Any = None
+    # YaRN params live here rather than under `rope_scaling` so the HF
+    # tokenizer's AutoConfig (which crashes standardizing a yarn
+    # rope_scaling in transformers 5.x) can load the config; the model
+    # copies it back to rope_scaling at construction.
+    yarn_rope_scaling: Any = None
     # Per-layer [{num_local_experts, sliding_window}, ...]; sliding_window
     # None => full attention. Uniform fields below are fallbacks only.
     block_configs: Optional[List[dict]] = None
@@ -100,6 +105,10 @@ class PuzzleModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        # Restore YaRN (parked under yarn_rope_scaling to keep the HF
+        # tokenizer loadable) before the layers build their rope.
+        if args.rope_scaling is None and args.yarn_rope_scaling is not None:
+            args.rope_scaling = args.yarn_rope_scaling
         self.args = args
         self.model_type = args.model_type
         self.model = PuzzleModel(args)
@@ -109,7 +118,16 @@ class Model(nn.Module):
         return self.lm_head(self.model(inputs, cache))
 
     def sanitize(self, weights):
-        # mxfp4 expert weight layout is identical to stock gpt-oss.
+        # Drop the fp8-KV-cache calibration scales (k_scale/v_scale): they
+        # are serving-time quantization constants for vLLM/TensorRT and are
+        # unused by the bf16 KV path here — NVIDIA's own modeling ignores
+        # them (_keys_to_ignore_on_load_unexpected). The mxfp4 expert weight
+        # layout is otherwise identical to stock gpt-oss.
+        weights = {
+            k: v
+            for k, v in weights.items()
+            if not (k.endswith(".k_scale") or k.endswith(".v_scale"))
+        }
         return GptOssModel.sanitize(self, weights)
 
     @property
