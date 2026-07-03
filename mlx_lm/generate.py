@@ -499,6 +499,8 @@ class ThinkChannelState:
         self.tag_ids = self.open_ids | self.close_ids
         self.enabled = bool(tag_pairs)
         self.in_think = False
+        self._tokenizer = None
+        self._numeric_cache = {}
         if self.enabled and prompt_tokens is not None:
             self.in_think = self._scan(list(prompt_tokens)[-scan_window:])
 
@@ -513,7 +515,9 @@ class ThinkChannelState:
                 continue
             if len(oid) == 1 and len(cid) == 1:
                 pairs.append((oid[0], cid[0]))
-        return cls(pairs, prompt_tokens, scan_window)
+        state = cls(pairs, prompt_tokens, scan_window)
+        state._tokenizer = tokenizer
+        return state
 
     def _scan(self, tail):
         state = False
@@ -526,6 +530,23 @@ class ThinkChannelState:
 
     def is_tag(self, tok):
         return tok in self.tag_ids
+
+    def is_numeric(self, tok):
+        """True if the token's surface text contains a digit. Numeric tokens
+        are exempted from relaxed acceptance: a plausible-but-wrong digit in a
+        reasoning trace poisons downstream computation (measured: top-10
+        relaxation corrupted '12'->'1' and failed arithmetic probes)."""
+        if self._tokenizer is None:
+            return False
+        v = self._numeric_cache.get(tok)
+        if v is None:
+            try:
+                text = self._tokenizer.decode([tok])
+            except Exception:
+                text = ""
+            v = any(c.isdigit() for c in text)
+            self._numeric_cache[tok] = v
+        return v
 
     def on_commit(self, tok):
         if not self.enabled:
@@ -798,6 +819,8 @@ def speculative_generate_step(
                         and think_state.in_think
                         and not think_state.is_tag(dtn)
                         and not think_state.is_tag(tn)
+                        and not think_state.is_numeric(dtn)
+                        and not think_state.is_numeric(tn)
                     ):
                         gap = (mx.max(lpn) - lpn[dtn]).item()
                         if relaxed_delta is None or gap <= relaxed_delta:
