@@ -103,7 +103,8 @@ class AttentionBlock(nn.Module):
             scaling_config=config.rope_scaling,
         )
 
-    def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array, cache=None,
+                 kv_sink=None) -> mx.array:
         B, L, _ = x.shape
         D = self.head_dim
         Hk = self.num_key_value_heads
@@ -115,6 +116,11 @@ class AttentionBlock(nn.Module):
         if cache is not None:
             q = self.rope(q, offset=cache.offset)
             k = self.rope(k, offset=cache.offset)
+            if kv_sink is not None:
+                # Post-rope new-token K/V for this forward, so a speculative
+                # rollback can rebuild the cache to the accepted prefix
+                # without re-running the target (see spec_run rollback).
+                kv_sink.append((k, v))
             k, v = cache.update_and_fetch(k, v)
         else:
             q = self.rope(q)
@@ -176,10 +182,11 @@ class TransformerBlock(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array, cache=None,
+                 kv_sink=None) -> mx.array:
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, mask, cache)
+        x = self.self_attn(x, mask, cache, kv_sink=kv_sink)
         x = residual + x
 
         residual = x

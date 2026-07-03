@@ -80,6 +80,7 @@ class PuzzleModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        kv_sink=None,
     ):
         if input_embeddings is not None:
             x = input_embeddings
@@ -97,8 +98,11 @@ class PuzzleModel(nn.Module):
             else:
                 masks[w] = create_attention_mask(x, cache[ref], window_size=w)
 
-        for layer, c, w in zip(self.layers, cache, self.windows):
-            x = layer(x, masks[w], c)
+        # kv_sink (speculative rollback): a per-layer list; each layer appends
+        # its post-rope new-token K/V so the caller can rebuild caches to the
+        # accepted prefix without re-running the target.
+        for i, (layer, c, w) in enumerate(zip(self.layers, cache, self.windows)):
+            x = layer(x, masks[w], c, kv_sink=kv_sink)
         return self.norm(x)
 
 
@@ -114,8 +118,8 @@ class Model(nn.Module):
         self.model = PuzzleModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache=None):
-        return self.lm_head(self.model(inputs, cache))
+    def __call__(self, inputs: mx.array, cache=None, kv_sink=None):
+        return self.lm_head(self.model(inputs, cache, kv_sink=kv_sink))
 
     def sanitize(self, weights):
         # Drop the fp8-KV-cache calibration scales (k_scale/v_scale): they
