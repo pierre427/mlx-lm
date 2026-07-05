@@ -1518,6 +1518,17 @@ class SequenceStateMachine:
         return (s, n, states), seq, s
 
 
+# Optional hook: set mlx_lm.generate.BATCH_UID_HOOK to a callable(uids:
+# List[int]) to be notified of the current batch's row-to-uid order
+# immediately before each `self.model(...)` forward call inside
+# BatchGenerator. None (the default) is a no-op -- zero effect on any
+# caller that doesn't set it. Exists so a caller can correlate per-row
+# model internals (e.g. per-request steering) with which request occupies
+# which batch row, since that mapping isn't otherwise observable from
+# outside BatchGenerator once prefill/decode are in flight.
+BATCH_UID_HOOK = None
+
+
 class PromptProcessingBatch:
     """
     A batch processor for prompt tokens with support for incremental processing.
@@ -1699,6 +1710,8 @@ class PromptProcessingBatch:
         # Actual prompt processing loop
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
+            if BATCH_UID_HOOK is not None:
+                BATCH_UID_HOOK(list(self.uids))
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
@@ -1877,6 +1890,8 @@ class GenerationBatch:
         inputs = self._current_tokens
 
         # Forward pass
+        if BATCH_UID_HOOK is not None:
+            BATCH_UID_HOOK(list(self.uids))
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
 
