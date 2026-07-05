@@ -573,6 +573,104 @@ def adaptive_pld_generate_step(
             c.stop_speculation()
 
 
+def self_mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft: int = 1,
+    max_tokens: int = 256,
+    prefill_step_size: int = 512,
+    stats: Optional[HybridStats] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Self-speculative decoding with the model's own MTP (nextn) head.
+
+    The head drafts the next ``num_draft`` tokens from the trunk's last hidden
+    state (no external draft model); the trunk verifies them in one batched
+    forward and accepts the greedy-matching prefix. Requires ``model.mtp`` +
+    ``mtp_step``/``make_mtp_cache``/``logits`` and (for the hybrid trunk) the GDN
+    ``record_rollback`` protocol, so verify steps trim exactly on rejection.
+    The head is depth-1, so ``num_draft=1`` is the trained regime; k>1 chains the
+    head on its own hidden (out of training distribution — acceptance decays).
+
+    Greedy only. Yields ``(token, logprobs, from_draft)``.
+    """
+    if getattr(model, "mtp", None) is None:
+        raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
+    stats = stats if stats is not None else HybridStats()
+    cache = make_prompt_cache(model)
+
+    y = prompt.astype(mx.uint32)
+    with mx.stream(generation_stream):
+        while y.size > prefill_step_size:
+            model.model(y[:prefill_step_size][None], cache=cache)
+            mx.eval([c.state for c in cache])
+            y = y[prefill_step_size:]
+            mx.clear_cache()
+        hidden = model.model(y[None], cache=cache)   # [1, S, H] post-final-norm
+        seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
+        first_lp = mx.softmax(model.logits(seed_h)[0, -1], axis=-1)
+        cur = int(mx.argmax(first_lp).item())
+    for c in cache:
+        c.start_speculation()
+
+    ntoks = 0
+    try:
+        yield cur, mx.log(first_lp), False
+        ntoks += 1
+        stats.plain_tokens += 1
+
+        while ntoks < max_tokens:
+            stats.cycles += 1
+            k = min(num_draft, max_tokens - ntoks)
+
+            # ---- draft k tokens with the MTP head (chained) ------------------
+            mtp_cache = model.make_mtp_cache()
+            drafts: List[int] = []
+            h, tok = seed_h, mx.array([[cur]], mx.uint32)
+            with mx.stream(generation_stream):
+                for _ in range(k):
+                    d_logits, h = model.mtp_step(h, tok, mtp_cache)
+                    d = int(mx.argmax(d_logits[0, -1]).item())
+                    drafts.append(d)
+                    tok = mx.array([[d]], mx.uint32)
+
+            # ---- verify: trunk over [cur, drafts...] in one forward ----------
+            verify_in = mx.array([[cur] + drafts], mx.uint32)   # [1, k+1]
+            with mx.stream(generation_stream):
+                vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
+                vlogits = model.logits(vhidden)                 # [1, k+1, V]
+                logprobs = vlogits[0] - mx.logsumexp(vlogits[0], axis=-1, keepdims=True)
+                targets = mx.argmax(logprobs, axis=-1)
+            mx.eval(targets, vhidden)
+            targets = targets.tolist()
+
+            n_accept = 0
+            while n_accept < k and targets[n_accept] == drafts[n_accept]:
+                n_accept += 1
+            bonus = targets[n_accept]
+
+            # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
+            trim_prompt_cache(cache, k - n_accept)
+            seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
+            stats.draft_proposed += k
+            stats.draft_accepted += n_accept
+            stats.draft_cycles += 1
+            stats.bonus_tokens += 1
+
+            for i in range(n_accept):
+                ntoks += 1
+                yield drafts[i], logprobs[i], True
+                if ntoks == max_tokens:
+                    break
+            if ntoks < max_tokens:
+                ntoks += 1
+                yield bonus, logprobs[n_accept], False
+            cur = bonus
+    finally:
+        for c in cache:
+            c.stop_speculation()
+
+
 def hybrid_stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
