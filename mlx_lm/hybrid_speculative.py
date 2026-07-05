@@ -454,6 +454,8 @@ def adaptive_pld_generate_step(
     max_lookback: int = 32,
     warmup: int = 48,
     gate: float = 0.12,
+    mtp_tail: bool = False,
+    num_draft: int = 1,
     prefill_step_size: int = 512,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
@@ -463,10 +465,14 @@ def adaptive_pld_generate_step(
     Runs the suffix-automaton retrieval-verify cycle (the ~2x copy-heavy win).
     After ``warmup`` tokens, if the fraction of output that came from retrieval
     is below ``gate``, the work is not copy-heavy, so it **latches once** to a
-    single plain ``generate_step`` tail for all remaining tokens — recovering
-    full baseline throughput (which the per-cycle-sync verify loop cannot) with
-    no mid-stream thrashing. Copy-heavy work never latches, so it keeps the full
-    PLD speedup with zero regression vs pure PLD.
+    tail for all remaining tokens — with no mid-stream thrashing. Copy-heavy work
+    never latches, keeping the full PLD speedup with zero regression vs pure PLD.
+
+    The latched tail is a single plain ``generate_step`` (bit-exact, full
+    baseline throughput) unless ``mtp_tail=True`` and the model has an MTP head —
+    then it self-speculates with the head (``self_mtp_generate_step`` tail),
+    giving ~1.1x on the novel code PLD can't help with. So one greedy path serves
+    both regimes: copy-heavy -> PLD, novel -> MTP.
 
     Greedy only, draft-free; one shared prompt cache. The plain tail is
     single-token forwards (the exact sequential path, bit-exact); only committed
@@ -550,24 +556,39 @@ def adaptive_pld_generate_step(
             if ntoks >= warmup and retrieved / ntoks < gate:
                 latched = True
 
-        # ---- plain tail: one async generate_step for all remaining tokens ----
+        # ---- latched tail: self-MTP if available+requested, else plain -------
         if latched and ntoks < max_tokens:
-            for c in cache:
-                c.stop_speculation()
-            for tok, lp in generate_step(
-                mx.array(pending, mx.uint32), model,
-                max_tokens=max_tokens - ntoks, prompt_cache=cache, sampler=_GREEDY,
-            ):
-                it = int(tok)
-                sam.extend(it)
-                pending = [it]
-                stats.cycles += 1
-                stats.plain_cycles += 1
-                stats.plain_tokens += 1
+            if mtp_tail and getattr(model, "mtp", None) is not None:
+                # Keep speculation ON (MTP verify trims on reject). Bootstrap the
+                # seed hidden by forwarding the pending token through the trunk.
+                with mx.stream(generation_stream):
+                    bh = model.model(mx.array(pending, mx.uint32)[None], cache=cache)
+                    blp = model.logits(bh)[0, -1]
+                    blp = blp - mx.logsumexp(blp)
+                    nxt = int(mx.argmax(blp).item())
                 ntoks += 1
-                yield it, lp, False
-                if ntoks == max_tokens:
-                    break
+                stats.plain_tokens += 1
+                yield nxt, blp, False
+                yield from _mtp_draft_verify_loop(
+                    model, cache, nxt, bh[:, -1:, :], ntoks, max_tokens, num_draft, stats
+                )
+            else:
+                for c in cache:
+                    c.stop_speculation()
+                for tok, lp in generate_step(
+                    mx.array(pending, mx.uint32), model,
+                    max_tokens=max_tokens - ntoks, prompt_cache=cache, sampler=_GREEDY,
+                ):
+                    it = int(tok)
+                    sam.extend(it)
+                    pending = [it]
+                    stats.cycles += 1
+                    stats.plain_cycles += 1
+                    stats.plain_tokens += 1
+                    ntoks += 1
+                    yield it, lp, False
+                    if ntoks == max_tokens:
+                        break
     finally:
         for c in cache:
             c.stop_speculation()
@@ -608,67 +629,75 @@ def self_mtp_generate_step(
             mx.clear_cache()
         hidden = model.model(y[None], cache=cache)   # [1, S, H] post-final-norm
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
-        first_lp = mx.softmax(model.logits(seed_h)[0, -1], axis=-1)
+        first_lp = model.logits(seed_h)[0, -1]
+        first_lp = first_lp - mx.logsumexp(first_lp)
         cur = int(mx.argmax(first_lp).item())
     for c in cache:
         c.start_speculation()
 
-    ntoks = 0
     try:
-        yield cur, mx.log(first_lp), False
-        ntoks += 1
+        yield cur, first_lp, False
         stats.plain_tokens += 1
-
-        while ntoks < max_tokens:
-            stats.cycles += 1
-            k = min(num_draft, max_tokens - ntoks)
-
-            # ---- draft k tokens with the MTP head (chained) ------------------
-            mtp_cache = model.make_mtp_cache()
-            drafts: List[int] = []
-            h, tok = seed_h, mx.array([[cur]], mx.uint32)
-            with mx.stream(generation_stream):
-                for _ in range(k):
-                    d_logits, h = model.mtp_step(h, tok, mtp_cache)
-                    d = int(mx.argmax(d_logits[0, -1]).item())
-                    drafts.append(d)
-                    tok = mx.array([[d]], mx.uint32)
-
-            # ---- verify: trunk over [cur, drafts...] in one forward ----------
-            verify_in = mx.array([[cur] + drafts], mx.uint32)   # [1, k+1]
-            with mx.stream(generation_stream):
-                vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
-                vlogits = model.logits(vhidden)                 # [1, k+1, V]
-                logprobs = vlogits[0] - mx.logsumexp(vlogits[0], axis=-1, keepdims=True)
-                targets = mx.argmax(logprobs, axis=-1)
-            mx.eval(targets, vhidden)
-            targets = targets.tolist()
-
-            n_accept = 0
-            while n_accept < k and targets[n_accept] == drafts[n_accept]:
-                n_accept += 1
-            bonus = targets[n_accept]
-
-            # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
-            trim_prompt_cache(cache, k - n_accept)
-            seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
-            stats.draft_proposed += k
-            stats.draft_accepted += n_accept
-            stats.draft_cycles += 1
-            stats.bonus_tokens += 1
-
-            for i in range(n_accept):
-                ntoks += 1
-                yield drafts[i], logprobs[i], True
-                if ntoks == max_tokens:
-                    break
-            if ntoks < max_tokens:
-                ntoks += 1
-                yield bonus, logprobs[n_accept], False
-            cur = bonus
+        yield from _mtp_draft_verify_loop(
+            model, cache, cur, seed_h, 1, max_tokens, num_draft, stats
+        )
     finally:
         for c in cache:
             c.stop_speculation()
+
+
+def _mtp_draft_verify_loop(model, cache, cur, seed_h, ntoks, max_tokens, num_draft, stats):
+    """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
+    rejects. Assumes cache speculation is already ON; ``cur`` is the last
+    committed-but-uncached token and ``seed_h`` the trunk hidden that predicted
+    it. Yields (token, logprobs, from_draft). Does NOT start/stop speculation."""
+    while ntoks < max_tokens:
+        stats.cycles += 1
+        k = min(num_draft, max_tokens - ntoks)
+
+        # ---- draft k tokens with the MTP head (chained) ----------------------
+        mtp_cache = model.make_mtp_cache()
+        drafts: List[int] = []
+        h, tok = seed_h, mx.array([[cur]], mx.uint32)
+        with mx.stream(generation_stream):
+            for _ in range(k):
+                d_logits, h = model.mtp_step(h, tok, mtp_cache)
+                d = int(mx.argmax(d_logits[0, -1]).item())
+                drafts.append(d)
+                tok = mx.array([[d]], mx.uint32)
+
+        # ---- verify: trunk over [cur, drafts...] in one forward --------------
+        verify_in = mx.array([[cur] + drafts], mx.uint32)   # [1, k+1]
+        with mx.stream(generation_stream):
+            vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
+            vlogits = model.logits(vhidden)                 # [1, k+1, V]
+            logprobs = vlogits[0] - mx.logsumexp(vlogits[0], axis=-1, keepdims=True)
+            targets = mx.argmax(logprobs, axis=-1)
+        mx.eval(targets, vhidden)
+        targets = targets.tolist()
+
+        n_accept = 0
+        while n_accept < k and targets[n_accept] == drafts[n_accept]:
+            n_accept += 1
+        bonus = targets[n_accept]
+
+        # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
+        trim_prompt_cache(cache, k - n_accept)
+        seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
+        stats.draft_proposed += k
+        stats.draft_accepted += n_accept
+        stats.draft_cycles += 1
+        stats.bonus_tokens += 1
+
+        for i in range(n_accept):
+            ntoks += 1
+            yield drafts[i], logprobs[i], True
+            if ntoks == max_tokens:
+                break
+        if ntoks < max_tokens:
+            ntoks += 1
+            yield bonus, logprobs[n_accept], False
+        cur = bonus
 
 
 def hybrid_stream_generate(
