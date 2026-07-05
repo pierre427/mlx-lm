@@ -45,7 +45,12 @@ from .generate import (
     generation_stream,
     wired_limit,
 )
-from .models.cache import KVCache, make_prompt_cache, trim_prompt_cache
+from .models.cache import (
+    KVCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 
@@ -301,10 +306,15 @@ def hybrid_generate_step(
     sam = SuffixAutomaton(history)
 
     def _prefill(m, c, toks):
-        while toks.size > prefill_step_size:
-            m(toks[:prefill_step_size][None], cache=c)
+        # Leave exactly one token unprocessed (mirrors speculative_generate_step's
+        # prefill) so the first verify window is a single token + proposal, not the
+        # whole prompt tail — keeps the incremental-cache numerics close to plain
+        # decode instead of drifting off a large first forward.
+        while toks.size > 1:
+            n = min(prefill_step_size, toks.size - 1)
+            m(toks[:n][None], cache=c)
             mx.eval([layer.state for layer in c])
-            toks = toks[prefill_step_size:]
+            toks = toks[n:]
             mx.clear_cache()
         return toks
 
@@ -348,6 +358,14 @@ def hybrid_generate_step(
     spec_caches = list(model_cache) + (list(draft_cache) if use_draft else [])
     for c in spec_caches:
         c.start_speculation()
+    # Rejected proposals must be trimmable; trim_prompt_cache silently no-ops on a
+    # non-trimmable cache, which would leave rejected tokens committed and corrupt
+    # the output. Fail loudly instead (mirrors speculative_generate_step).
+    if not can_trim_prompt_cache(model_cache):
+        raise ValueError(
+            "hybrid speculative decoding requires a trimmable prompt cache "
+            "(recurrent layers need supports_speculative_rollback)."
+        )
 
     # Tokens committed to `history` but not yet in each model's KV cache.
     pending_target: List[int] = [int(t) for t in y.tolist()]
@@ -474,9 +492,12 @@ def adaptive_pld_generate_step(
     giving ~1.1x on the novel code PLD can't help with. So one greedy path serves
     both regimes: copy-heavy -> PLD, novel -> MTP.
 
-    Greedy only, draft-free; one shared prompt cache. The plain tail is
-    single-token forwards (the exact sequential path, bit-exact); only committed
-    multi-token retrieval spans carry the model's batched-verify numerics.
+    Greedy only, draft-free; one shared prompt cache. Like all speculative
+    decoders, output matches the target's own (batched) greedy — not bit-identical
+    to sequential ``generate_step``, since batched/incremental-cache verify forwards
+    differ numerically from single-token decode (this holds for upstream
+    ``speculative_generate_step`` too). The plain tail runs ``generate_step``
+    directly.
 
     Yields ``(token, logprobs, from_retrieval)``.
     """
@@ -485,13 +506,19 @@ def adaptive_pld_generate_step(
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
-        while y.size > prefill_step_size:
-            model(y[:prefill_step_size][None], cache=cache)
+        while y.size > 1:  # leave one token for the first verify window
+            n = min(prefill_step_size, y.size - 1)
+            model(y[:n][None], cache=cache)
             mx.eval([c.state for c in cache])
-            y = y[prefill_step_size:]
+            y = y[n:]
             mx.clear_cache()
     for c in cache:
         c.start_speculation()
+    if not can_trim_prompt_cache(cache):
+        raise ValueError(
+            "adaptive PLD requires a trimmable prompt cache "
+            "(recurrent layers need supports_speculative_rollback)."
+        )
 
     history: List[int] = [int(t) for t in prompt.tolist()]
     sam = SuffixAutomaton(history)
@@ -622,18 +649,24 @@ def self_mtp_generate_step(
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
-        while y.size > prefill_step_size:
-            model.model(y[:prefill_step_size][None], cache=cache)
+        while y.size > 1:  # leave one token to produce the seed hidden
+            n = min(prefill_step_size, y.size - 1)
+            model.model(y[:n][None], cache=cache)
             mx.eval([c.state for c in cache])
-            y = y[prefill_step_size:]
+            y = y[n:]
             mx.clear_cache()
-        hidden = model.model(y[None], cache=cache)   # [1, S, H] post-final-norm
+        hidden = model.model(y[None], cache=cache)   # [1, 1, H] post-final-norm
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
         first_lp = model.logits(seed_h)[0, -1]
         first_lp = first_lp - mx.logsumexp(first_lp)
         cur = int(mx.argmax(first_lp).item())
     for c in cache:
         c.start_speculation()
+    if not can_trim_prompt_cache(cache):
+        raise ValueError(
+            "self-MTP decoding requires a trimmable prompt cache "
+            "(recurrent layers need supports_speculative_rollback)."
+        )
 
     try:
         yield cur, first_lp, False
