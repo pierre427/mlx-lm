@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -406,7 +407,33 @@ class Model(nn.Module):
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
+    def make_cache(self):
+        # Most Laguna layers are sliding_attention: they never attend beyond
+        # their window, so a bounded RotatingKVCache is both correct and far
+        # cheaper than a full cache at long context. Only the full_attention
+        # (global) layers need an unbounded KVCache.
+        caches = []
+        for lt in self.args.layer_types:
+            # A sliding layer needs a valid window; if a (malformed) config
+            # omits sliding_window, fall back to a full cache rather than build
+            # a RotatingKVCache with max_size=None.
+            if lt == "sliding_attention" and self.args.sliding_window:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+            else:
+                caches.append(KVCache())
+        return caches
+
     def sanitize(self, weights):
+        # Some repacks (e.g. AtomicChat/Laguna-XS-2.1-MLX-8bit) wrap every
+        # tensor under a VLM-style `language_model.` prefix. Strip it so the
+        # keys line up with this module tree (model.* / lm_head.*).
+        if any(k.startswith("language_model.") for k in weights):
+            prefix = "language_model."
+            weights = {
+                (k[len(prefix) :] if k.startswith(prefix) else k): v
+                for k, v in weights.items()
+            }
+
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
