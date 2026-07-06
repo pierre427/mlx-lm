@@ -146,17 +146,19 @@ class _BaseCache:
     def is_trimmable(self):
         return False
 
-    def start_speculation(self):
-        """Called by speculative decoding before draft/verify steps begin.
+    def start_speculation(self, rollback_window: Optional[int] = None):
+        """Called before draft/verify (or multi-token proposal) steps begin.
 
         Caches that cannot trim directly but support an exact rollback (e.g.
-        recurrent-state caches, see ``ArraysCache``) use this to start recording
-        the information needed to roll a verify step back. No-op by default.
+        recurrent-state caches, see ``ArraysCache``, or sliding-window caches,
+        see ``RotatingKVCache``) use this to start recording the information
+        needed for exact future trims. ``rollback_window`` bounds how many
+        tokens of rollback history are kept. No-op by default.
         """
         pass
 
     def stop_speculation(self):
-        """Called by speculative decoding when it finishes. No-op by default."""
+        """Stop recording trim state and release any temporary rollback data."""
         pass
 
     def size(self):
@@ -432,6 +434,7 @@ class RotatingKVCache(_BaseCache):
         instance = super().__new__(cls)
         instance.speculating = False
         instance._rollbacks = deque()
+        instance._rollback_window = cls._ROLLBACK_WINDOW
         return instance
 
     def __init__(self, max_size, keep=0):
@@ -442,8 +445,16 @@ class RotatingKVCache(_BaseCache):
         self.max_size = max_size
         self._idx = 0
 
-    def start_speculation(self):
+    def start_speculation(self, rollback_window: Optional[int] = None):
         self.speculating = True
+        self._rollback_window = max(
+            1,
+            int(
+                self._ROLLBACK_WINDOW
+                if rollback_window is None
+                else rollback_window
+            ),
+        )
         self._rollbacks.clear()
 
     def stop_speculation(self):
@@ -457,14 +468,26 @@ class RotatingKVCache(_BaseCache):
         pushes out of the window are gone. So we stash the pre-forward window
         (``snapshot``) plus this forward's new K/V; ``trim`` rebuilds the exact
         window for any accepted prefix by restoring the snapshot and
-        re-appending the first ``m`` tokens. The verify path uses
-        ``_update_concat`` which reallocates (never mutates in place), so
-        holding references in ``snapshot`` is safe."""
-        self._rollbacks.append((num_tokens, snapshot, keys, values))
+        re-appending the first ``m`` tokens. Arrays are COPIED because the
+        single-token path (``_update_in_place``) mutates buffers in place, so
+        holding references would let a later forward corrupt the snapshot."""
+
+        def copy_array(x):
+            return None if x is None else mx.array(x)
+
+        copied_snapshot = [
+            copy_array(snapshot[0]),
+            copy_array(snapshot[1]),
+            snapshot[2],
+            snapshot[3],
+        ]
+        self._rollbacks.append(
+            (num_tokens, copied_snapshot, mx.array(keys), mx.array(values))
+        )
         total = sum(r[0] for r in self._rollbacks)
         while (
             len(self._rollbacks) > 1
-            and total - self._rollbacks[0][0] >= self._ROLLBACK_WINDOW
+            and total - self._rollbacks[0][0] >= self._rollback_window
         ):
             total -= self._rollbacks.popleft()[0]
 
@@ -692,6 +715,7 @@ class ArraysCache(_BaseCache):
         instance.lengths = None
         instance.speculating = False
         instance._rollbacks = deque()
+        instance._rollback_window = cls._ROLLBACK_WINDOW
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -699,8 +723,16 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
-    def start_speculation(self):
+    def start_speculation(self, rollback_window: Optional[int] = None):
         self.speculating = True
+        self._rollback_window = max(
+            1,
+            int(
+                self._ROLLBACK_WINDOW
+                if rollback_window is None
+                else rollback_window
+            ),
+        )
         self._rollbacks.clear()
 
     def stop_speculation(self):
@@ -723,7 +755,7 @@ class ArraysCache(_BaseCache):
         total = sum(r[0] for r in self._rollbacks)
         while (
             len(self._rollbacks) > 1
-            and total - self._rollbacks[0][0] >= self._ROLLBACK_WINDOW
+            and total - self._rollbacks[0][0] >= self._rollback_window
         ):
             total -= self._rollbacks.popleft()[0]
 
@@ -977,6 +1009,14 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def start_speculation(self, rollback_window: Optional[int] = None):
+        for c in self.caches:
+            c.start_speculation(rollback_window)
+
+    def stop_speculation(self):
+        for c in self.caches:
+            c.stop_speculation()
 
     @property
     def state(self):
@@ -1285,6 +1325,13 @@ class BatchKVCache(_BaseCache):
 class BatchRotatingKVCache(_BaseCache):
     step = 256
 
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance.speculating = False
+        instance._rollbacks = deque()
+        instance._rollback_window = RotatingKVCache._ROLLBACK_WINDOW
+        return instance
+
     def __init__(self, max_size, left_padding: List[int]):
         self.keys = None
         self.values = None
@@ -1300,6 +1347,43 @@ class BatchRotatingKVCache(_BaseCache):
         # Lengths for right_padded inputs to make sure that padding tokens do
         # not evict valid tokens.
         self._lengths = None
+
+    def start_speculation(self, rollback_window: Optional[int] = None):
+        self.speculating = True
+        self._rollback_window = max(
+            1,
+            int(
+                RotatingKVCache._ROLLBACK_WINDOW
+                if rollback_window is None
+                else rollback_window
+            ),
+        )
+        self._rollbacks.clear()
+
+    def stop_speculation(self):
+        self.speculating = False
+        self._rollbacks.clear()
+
+    def record_rollback(self, num_tokens, keys, values):
+        def copy_array(x):
+            return None if x is None else mx.array(x)
+
+        snapshot = (
+            copy_array(self.keys),
+            copy_array(self.values),
+            mx.array(self.offset),
+            mx.array(self.left_padding),
+            self._offset,
+            self._idx,
+            self.rotated,
+        )
+        self._rollbacks.append((num_tokens, snapshot, mx.array(keys), mx.array(values)))
+        total = sum(r[0] for r in self._rollbacks)
+        while (
+            len(self._rollbacks) > 1
+            and total - self._rollbacks[0][0] >= self._rollback_window
+        ):
+            total -= self._rollbacks.popleft()[0]
 
     def _trim(self, trim_size, v, append=None):
         if trim_size > 0:
@@ -1417,6 +1501,8 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
+        if self.speculating:
+            self.record_rollback(keys.shape[2], keys, values)
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
@@ -1566,22 +1652,56 @@ class BatchRotatingKVCache(_BaseCache):
         self._idx = max_idx
         self._offset = max(self._offset, other._offset)
 
-    def extract(self, idx):
-        mx.eval(self.left_padding, self.offset)
+    def _extract_rotating_state(
+        self, idx, keys, values, offset, left_padding, _offset, cache_idx, rotated
+    ):
         cache = RotatingKVCache(self.max_size)
-        padding = max(0, self.left_padding.tolist()[idx])
-        offset = self.offset.tolist()[idx]
-        cache.keys = self.keys[idx : idx + 1]
-        cache.values = self.values[idx : idx + 1]
-        cache._idx = self._idx
-        if self.rotated:
-            cache.keys = mx.roll(cache.keys, -self._idx, axis=2)
-            cache.values = mx.roll(cache.values, -self._idx, axis=2)
+        if keys is None:
+            cache.offset = int(offset[idx].item())
+            return cache
+        mx.eval(left_padding, offset)
+        padding = max(0, left_padding.tolist()[idx])
+        cache.keys = keys[idx : idx + 1]
+        cache.values = values[idx : idx + 1]
+        cache._idx = cache_idx
+        if rotated:
+            cache.keys = mx.roll(cache.keys, -cache_idx, axis=2)
+            cache.values = mx.roll(cache.values, -cache_idx, axis=2)
             cache._idx = self.max_size
         cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
         cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
-        cache.offset = offset
+        cache.offset = int(offset[idx].item())
         cache._idx = cache.keys.shape[2]
+        return cache
+
+    def extract(self, idx):
+        cache = self._extract_rotating_state(
+            idx,
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._offset,
+            self._idx,
+            self.rotated,
+        )
+        if self.speculating and self._rollbacks:
+            cache.start_speculation(self._rollback_window)
+            for num_tokens, snap, keys, values in self._rollbacks:
+                snap_cache = self._extract_rotating_state(idx, *snap)
+                cache._rollbacks.append(
+                    (
+                        num_tokens,
+                        [
+                            snap_cache.keys,
+                            snap_cache.values,
+                            snap_cache._idx,
+                            snap_cache.offset,
+                        ],
+                        mx.contiguous(keys[idx : idx + 1]),
+                        mx.contiguous(values[idx : idx + 1]),
+                    )
+                )
         return cache
 
     @classmethod
