@@ -60,6 +60,9 @@ class ModelArgs(BaseModelArgs):
     first_k_dense_replace: int = 1
     expert_selection_fn: str = "sigmoid"
     layer_types: Optional[List[str]] = None
+    # Optional self-speculation (MTP / EAGLE-style depth-1) head. 0 = absent
+    # (default; serving unaffected). Trained by train_mtp_north.py.
+    mtp_num_hidden_layers: int = 0
     # tolerated-but-unused config keys (kept so BaseModelArgs.from_dict is happy)
     use_parallel_block: bool = True
     use_qk_norm: bool = False
@@ -240,6 +243,41 @@ class Cohere2MoeModel(nn.Module):
         return self.norm(h)
 
 
+class Cohere2MoeMTP(nn.Module):
+    """Depth-1 self-speculation head (EAGLE/MTP style) for cohere2_moe.
+
+    Predicts token p+2 from the trunk's post-final-norm hidden at p and the
+    embedding of the committed token p+1: fuse the two (each LayerNorm'd, then a
+    linear over the concat), run one Cohere2 parallel block (dense MLP + full
+    causal RoPE attention), and decode with the backbone's tied lm_head. The
+    embedding and lm_head are the backbone's (passed in) — only this module is
+    trained. Mirrors the Qwen3NextMTP recipe; see train_mtp_north.py.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        h = args.hidden_size
+        eps = args.layer_norm_eps
+        self.hnorm = nn.LayerNorm(h, eps=eps, bias=False)
+        self.enorm = nn.LayerNorm(h, eps=eps, bias=False)
+        self.eh_proj = nn.Linear(2 * h, h, bias=False)
+        # layer_idx=1 is a sliding layer -> RoPE enabled; we pass a plain causal
+        # mask (training seq < window 4096, so it is full causal anyway).
+        self.self_attn = Attention(args, layer_idx=1)
+        self.mlp = MLP(h, args.prefix_dense_intermediate_size)
+        self.input_layernorm = nn.LayerNorm(h, eps=eps, bias=False)
+        self.norm = nn.LayerNorm(h, eps=eps, bias=False)
+
+    def __call__(self, hidden: mx.array, embeds: mx.array, cache=None) -> mx.array:
+        h = self.eh_proj(
+            mx.concatenate([self.hnorm(hidden), self.enorm(embeds)], axis=-1)
+        )
+        mask = create_attention_mask(h, cache)
+        hn = self.input_layernorm(h)
+        h = h + self.self_attn(hn, mask, cache) + self.mlp(hn)
+        return self.norm(h)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -249,14 +287,20 @@ class Model(nn.Module):
         self.logit_scale = args.logit_scale
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = Cohere2MoeMTP(args)
+
+    def logits(self, hidden: mx.array) -> mx.array:
+        """Apply the (tied) lm_head to a hidden state. Standalone so a self-spec
+        engine can verify without recomputing the trunk (self_mtp_generate_step)."""
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(hidden)
+        else:
+            out = self.lm_head(hidden)
+        return out * self.logit_scale
 
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
-        out = self.model(inputs, cache)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return out * self.logit_scale
+        return self.logits(self.model(inputs, cache))
 
     def make_cache(self):
         # 36 of 49 layers are sliding_attention (window 4096): a bounded
@@ -270,7 +314,22 @@ class Model(nn.Module):
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 
+    def make_mtp_cache(self):
+        return [KVCache()]
+
+    def mtp_step(self, hidden: mx.array, tokens: mx.array, cache):
+        """One self-spec step: given trunk hidden states and the committed
+        tokens, return the head's next-token logits (via the tied lm_head)."""
+        embeds = self.model.embed_tokens(tokens)
+        h = self.mtp(hidden, embeds, cache[0])
+        logits = self.model.embed_tokens.as_linear(h) * self.logit_scale
+        return logits, h
+
     def sanitize(self, weights):
+        # Drop a stray mtp.* head when this model has none (keeps base-checkpoint
+        # loads clean); keep it when the head module exists (merged self-spec ckpt).
+        if self.args.mtp_num_hidden_layers == 0:
+            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
         # mlx-vlm repacks (mlx-community North-Mini-Code-1.0-*) wrap every
         # tensor under a `language_model.` prefix. Strip it so keys line up with
         # this module tree (model.* / lm_head.*). Experts are already stacked
