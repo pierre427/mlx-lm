@@ -368,6 +368,9 @@ def generate(
     parallel_threshold: Optional[float] = None,
     return_stats: bool = False,
     kv_cache: bool = False,
+    remask_refine: bool = False,
+    remask_conf: float = 0.9,
+    remask_rounds: int = 2,
 ):
     """Diffusion (MDM) generation for LLaDA.
 
@@ -418,6 +421,22 @@ def generate(
             *approximate* (not bitwise-equal to ``kv_cache=False``) but stays
             coherent. **Restricted to ``cfg_scale == 0``** (greedy is the main
             use); asserts otherwise. Default False keeps behaviour identical.
+        remask_refine: opt-in order-aware re-masking for the parallel path only.
+            The parallel schedule can commit a low-reveal-confidence token in an
+            ambiguous spot (a "reveal-ORDER" artifact — e.g. it reveals a
+            competing branch's token before the greedy one). After a block fills,
+            up to ``remask_rounds`` refinement rounds re-mask the block positions
+            whose reveal-time confidence was below ``remask_conf`` (plus their
+            immediate neighbours, since collisions span adjacent tokens) and
+            re-decode them one-token-per-step in most-confident-first order,
+            conditioned on the now-fixed high-confidence tokens. This re-commits
+            the ambiguous span with more context locked, which can fix the order
+            artifact. Only active when ``parallel_threshold`` is set AND this is
+            True. Default False preserves the parallel path exactly.
+        remask_conf: reveal-time confidence bar below which a token is re-masked
+            in a refinement round (only used when ``remask_refine=True``).
+        remask_rounds: max number of refinement rounds per block (only used when
+            ``remask_refine=True``).
 
     Returns:
         Generated ids ``[1, gen_length]``; a trailing decoded ``text`` if a
@@ -572,23 +591,30 @@ def generate(
         # capped at ``block_length`` iterations (worst case = reveal one token
         # per step), which guarantees termination.
         # -------------------------------------------------------------------
-        for b in range(num_blocks):
-            block_start = prompt_len + b * block_length
-            block_end = prompt_len + (b + 1) * block_length
+        # Per-position reveal-time confidence, [1, total_len]. Prompt / never-
+        # masked positions stay at +inf; each parallel reveal records the clean-
+        # softmax confidence the token had at the step it was committed. Only
+        # consulted by the opt-in ``remask_refine`` refinement below.
+        pos_inf = mx.array(float("inf"), dtype=mx.float32)
+        reveal_conf = mx.full((1, total_len), pos_inf, dtype=mx.float32)
 
-            # Prime the prefix cache once per block (positions [0, block_start)).
-            # The prime is a full forward; reuse its logits for the block's
-            # first denoising step so priming costs nothing extra.
-            primed_logits = _prime_cache(x, block_start) if kv_cache else None
+        def _parallel_fill(eligible_mask, max_steps):
+            """Confidence-aware parallel fill over the given eligibility mask.
 
-            # Eligible = masked AND inside the current block window.
-            in_block = (col_index >= block_start) & (col_index < block_end)
-
+            Runs full forwards until every position in ``eligible_mask`` that is
+            currently masked has been revealed (or ``max_steps`` is hit). Each
+            forward unmasks every still-masked eligible position whose clean-
+            softmax confidence clears ``parallel_threshold`` (progress-guarantee
+            reveals the single most confident one otherwise). Records each
+            revealed position's reveal-time confidence into ``reveal_conf`` and
+            mutates the enclosing ``x``. Returns nothing.
+            """
+            nonlocal x, reveal_conf
             step = 0
-            while step < block_length:
+            while step < max_steps:
                 mask_index = x == mask_id
-                eligible = mask_index & in_block
-                # Stop the block once every position in it is filled.
+                eligible = mask_index & eligible_mask
+                # Stop once every eligible position is filled.
                 if int(eligible.sum()) == 0:
                     break
 
@@ -616,9 +642,89 @@ def generate(
                     top = mx.argmax(conf, axis=-1)  # [1]
                     reveal = col_index == top[:, None]
 
+                # Record reveal-time confidence for freshly revealed positions.
+                reveal_conf = mx.where(reveal, conf, reveal_conf)
                 x = mx.where(reveal, x0, x)
-                mx.eval(x)
+                mx.eval(x, reveal_conf)
                 step += 1
+
+        def _parallel_fill_sequential(eligible_mask):
+            """Re-decode: reveal exactly ONE token per forward, most-confident
+            first, over ``eligible_mask``. This maximises the fixed context each
+            re-committed token sees (order-aware greedy re-reveal), which is what
+            corrects a reveal-order artifact. Records reveal-time confidence and
+            mutates the enclosing ``x``.
+            """
+            nonlocal x, reveal_conf
+            n_masked = int(((x == mask_id) & eligible_mask).sum())
+            for _s in range(n_masked):
+                mask_index = x == mask_id
+                eligible = mask_index & eligible_mask
+                if int(eligible.sum()) == 0:
+                    break
+                if kv_cache:
+                    logits = _forward_logits_cached(x)
+                else:
+                    logits = _forward_logits(x)
+                noised = add_gumbel_noise(logits, temperature)
+                x0 = mx.argmax(noised, axis=-1)
+                p = mx.softmax(logits.astype(mx.float32), axis=-1)
+                conf = mx.take_along_axis(p, x0[..., None], axis=-1).squeeze(-1)
+                conf = mx.where(eligible, conf.astype(mx.float32), neg_inf)
+                # Single most-confident eligible position.
+                top = mx.argmax(conf, axis=-1)
+                reveal = col_index == top[:, None]
+                reveal_conf = mx.where(reveal, conf, reveal_conf)
+                x = mx.where(reveal, x0, x)
+                mx.eval(x, reveal_conf)
+
+        for b in range(num_blocks):
+            block_start = prompt_len + b * block_length
+            block_end = prompt_len + (b + 1) * block_length
+
+            # Prime the prefix cache once per block (positions [0, block_start)).
+            # The prime is a full forward; reuse its logits for the block's
+            # first denoising step so priming costs nothing extra.
+            primed_logits = _prime_cache(x, block_start) if kv_cache else None
+
+            # Eligible = masked AND inside the current block window.
+            in_block = (col_index >= block_start) & (col_index < block_end)
+
+            _parallel_fill(in_block, block_length)
+
+            # --------------------------------------------------------------
+            # Order-aware re-masking (opt-in). The parallel schedule can commit
+            # a low-reveal-confidence token in an ambiguous spot before the
+            # greedy branch's token is revealed. Re-mask the block's low-reveal-
+            # confidence positions (+/- 1 neighbour, since collisions span
+            # adjacent tokens) and re-decode them one-token-per-step in most-
+            # confident-first order, now conditioned on the fixed high-
+            # confidence tokens. Re-masking (not flipping) is what removes the
+            # locked-in wrong token so the model re-predicts from more context.
+            # --------------------------------------------------------------
+            if remask_refine:
+                for _r in range(remask_rounds):
+                    # Uncertain block positions: revealed under low confidence.
+                    low = in_block & (reveal_conf < remask_conf)
+                    if int(low.sum()) == 0:
+                        break
+                    # Widen to the immediate neighbours (contiguous span).
+                    low_left = mx.roll(low, 1, axis=1)
+                    low_right = mx.roll(low, -1, axis=1)
+                    span = (low | low_left | low_right) & in_block
+                    if int(span.sum()) == 0:
+                        break
+                    # Re-mask the span and reset its reveal-time confidence.
+                    x = mx.where(span, mask_id, x)
+                    reveal_conf = mx.where(span, pos_inf, reveal_conf)
+                    mx.eval(x, reveal_conf)
+                    # Re-prime the cache if used (block prefix unchanged, but the
+                    # active window now has fresh masks) and re-decode strictly
+                    # one token per step so each re-commit sees the maximum fixed
+                    # context (order-aware greedy re-reveal).
+                    if kv_cache:
+                        primed_logits = _prime_cache(x, block_start)
+                    _parallel_fill_sequential(span)
 
     out = x[:, prompt_len:]
     mx.eval(out)
