@@ -85,8 +85,9 @@ class Attention(nn.Module):
         prefix_kv: Optional[tuple] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        suffix_kv: Optional[tuple] = None,
     ):
-        """Bidirectional attention with an optional Fast-dLLM prefix KV cache.
+        """Bidirectional attention with an optional Fast-dLLM prefix/suffix KV cache.
 
         Modes:
 
@@ -96,7 +97,8 @@ class Attention(nn.Module):
 
         * **Prime** (``return_kv=True``): same full forward, but ALSO return the
           post-RoPE ``(keys, values)`` for the whole ``x`` so the caller can
-          slice out a prefix window ``[0, block_start)`` and cache it.
+          slice out a prefix window ``[0, block_start)`` and (for DualCache) a
+          suffix window ``[block_end, total_len)`` and cache them.
 
         * **Cached** (``prefix_kv`` given): ``x`` holds ONLY the active window's
           hidden states. Q/K/V are projected for the active positions, RoPE is
@@ -104,6 +106,14 @@ class Attention(nn.Module):
           prefix K/V are prepended, and active queries attend over the full
           ``[prefix ++ active]`` K/V bidirectionally. Only active outputs are
           returned.
+
+        * **DualCache** (``prefix_kv`` AND ``suffix_kv`` given): as cached, but
+          the cached suffix K/V (post-RoPE at absolute positions
+          ``[block_end, total_len)``) are ALSO appended, so active queries attend
+          over ``[prefix ++ active ++ suffix]``. Attention is permutation-
+          invariant over keys and RoPE is baked in at prime time, so the concat
+          order is fine as long as each cached K carries its correct absolute
+          position. This shrinks the active window to just the current block.
         """
         B, L, _ = x.shape
 
@@ -120,12 +130,21 @@ class Attention(nn.Module):
         queries = self.rope(queries, offset=pos_offset)
         keys = self.rope(keys, offset=pos_offset)
 
-        if prefix_kv is not None:
-            # Prepend the cached prefix K/V (already post-RoPE at positions
-            # [0, pos_offset)) so active queries see the whole sequence.
-            prefix_keys, prefix_values = prefix_kv
-            attn_keys = mx.concatenate([prefix_keys, keys], axis=2)
-            attn_values = mx.concatenate([prefix_values, values], axis=2)
+        if prefix_kv is not None or suffix_kv is not None:
+            # Prepend the cached prefix K/V and append the cached suffix K/V
+            # (each already post-RoPE at its absolute position) so active
+            # queries see the whole sequence bidirectionally.
+            key_parts, val_parts = [], []
+            if prefix_kv is not None:
+                key_parts.append(prefix_kv[0])
+                val_parts.append(prefix_kv[1])
+            key_parts.append(keys)
+            val_parts.append(values)
+            if suffix_kv is not None:
+                key_parts.append(suffix_kv[0])
+                val_parts.append(suffix_kv[1])
+            attn_keys = mx.concatenate(key_parts, axis=2)
+            attn_values = mx.concatenate(val_parts, axis=2)
         else:
             attn_keys, attn_values = keys, values
 
@@ -171,6 +190,7 @@ class TransformerBlock(nn.Module):
         prefix_kv: Optional[tuple] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        suffix_kv: Optional[tuple] = None,
     ):
         # Pre-norm: attn_norm before attention, ff_norm before MLP.
         attn = self.self_attn(
@@ -179,6 +199,7 @@ class TransformerBlock(nn.Module):
             prefix_kv=prefix_kv,
             pos_offset=pos_offset,
             return_kv=return_kv,
+            suffix_kv=suffix_kv,
         )
         if return_kv:
             attn, kv = attn
@@ -203,8 +224,9 @@ class LLaDAModel(nn.Module):
         prefix_kv: Optional[list] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        suffix_kv: Optional[list] = None,
     ):
-        """Bidirectional forward with an optional Fast-dLLM prefix KV cache.
+        """Bidirectional forward with an optional Fast-dLLM prefix/suffix KV cache.
 
         * ``prefix_kv=None, return_kv=False``: the plain full forward.
         * ``return_kv=True``: prime — also return a list of per-layer post-RoPE
@@ -212,6 +234,9 @@ class LLaDAModel(nn.Module):
         * ``prefix_kv`` given (a per-layer list of cached prefix ``(K, V)``):
           ``inputs`` holds only the active window; each layer prepends its
           cached prefix and RoPEs the active tokens at ``pos_offset``.
+        * ``suffix_kv`` given (DualCache; a per-layer list of cached suffix
+          ``(K, V)``): each layer ALSO appends its cached suffix, so the active
+          window is just the current block ``[block_start, block_end)``.
         """
         h = self.embed_tokens(inputs)
         if return_kv:
@@ -220,9 +245,13 @@ class LLaDAModel(nn.Module):
                 h, kv = layer(h, mask=None, pos_offset=pos_offset, return_kv=True)
                 kvs.append(kv)
             return self.norm(h), kvs
-        if prefix_kv is not None:
-            for layer, pkv in zip(self.layers, prefix_kv):
-                h = layer(h, mask=None, prefix_kv=pkv, pos_offset=pos_offset)
+        if prefix_kv is not None or suffix_kv is not None:
+            pkv_list = prefix_kv if prefix_kv is not None else [None] * len(self.layers)
+            skv_list = suffix_kv if suffix_kv is not None else [None] * len(self.layers)
+            for layer, pkv, skv in zip(self.layers, pkv_list, skv_list):
+                h = layer(
+                    h, mask=None, prefix_kv=pkv, pos_offset=pos_offset, suffix_kv=skv
+                )
             return self.norm(h)
         for layer in self.layers:
             h = layer(h, mask=None)
@@ -249,17 +278,21 @@ class Model(nn.Module):
         prefix_kv: Optional[list] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        suffix_kv: Optional[list] = None,
     ):
         """Bidirectional forward. Returns logits ``[B, L, vocab]``.
 
         With ``return_kv=True`` also returns the per-layer prefix KV list (for
-        priming the Fast-dLLM cache). With ``prefix_kv`` given, ``inputs`` is
-        the active window only and the returned logits cover just that window.
+        priming the Fast-dLLM cache). With ``prefix_kv`` (and optionally
+        ``suffix_kv`` for DualCache) given, ``inputs`` is the active window only
+        and the returned logits cover just that window.
         """
         if return_kv:
             out, kvs = self.model(inputs, return_kv=True)
             return self._head(out), kvs
-        out = self.model(inputs, prefix_kv=prefix_kv, pos_offset=pos_offset)
+        out = self.model(
+            inputs, prefix_kv=prefix_kv, pos_offset=pos_offset, suffix_kv=suffix_kv
+        )
         return self._head(out)
 
     def sanitize(self, weights):
@@ -368,6 +401,7 @@ def generate(
     parallel_threshold: Optional[float] = None,
     return_stats: bool = False,
     kv_cache: bool = False,
+    dual_cache: bool = False,
     remask_refine: bool = False,
     remask_conf: float = 0.9,
     remask_rounds: int = 2,
@@ -421,6 +455,16 @@ def generate(
             *approximate* (not bitwise-equal to ``kv_cache=False``) but stays
             coherent. **Restricted to ``cfg_scale == 0``** (greedy is the main
             use); asserts otherwise. Default False keeps behaviour identical.
+        dual_cache: if True (only meaningful when ``kv_cache=True``), ALSO cache
+            the **suffix** ``[block_end, total_len)`` K/V (all mask tokens, near-
+            stable across the block's denoising steps) so each cached forward
+            processes ONLY the current block ``[block_start, block_end)`` and
+            attends it against ``[cached_prefix ++ active ++ cached_suffix]``.
+            For early blocks the suffix is large (most of the sequence is still
+            masked tail), so this captures the win the prefix-only cache misses.
+            The suffix masks drift as the block reveals, so the approximation is
+            MORE aggressive than prefix-only; it stays coherent on real weights.
+            Default False keeps the prefix-only cache behaviour.
         remask_refine: opt-in order-aware re-masking for the parallel path only.
             The parallel schedule can commit a low-reveal-confidence token in an
             ambiguous spot (a "reveal-ORDER" artifact — e.g. it reveals a
@@ -460,6 +504,8 @@ def generate(
             "kv_cache=True is only supported with cfg_scale==0.0 "
             "(the doubled-batch CFG path is not cached). Disable one of them."
         )
+    if dual_cache and not kv_cache:
+        raise ValueError("dual_cache=True requires kv_cache=True.")
 
     neg_inf = mx.array(-float("inf"), dtype=mx.float32)
     col_index = mx.arange(total_len).reshape(1, total_len)
@@ -480,23 +526,30 @@ def generate(
         return model(x_cur)
 
     # ------------------------------------------------------------------
-    # Fast-dLLM prefix KV cache (only used when kv_cache=True).
+    # Fast-dLLM block-KV cache (only used when kv_cache=True).
     #
     # ``_prefix_cache`` is a per-layer list of cached prefix ``(K, V)`` for
-    # absolute positions ``[0, _prefix_len)``; ``_last_full_logits`` holds the
-    # full-length logits from the most recent prime so the sampler always sees a
-    # ``[1, total_len, vocab]`` tensor (prefix logits are never consumed).
+    # absolute positions ``[0, _prefix_len)``. With ``dual_cache=True``,
+    # ``_suffix_cache`` is a per-layer list of cached suffix ``(K, V)`` for
+    # absolute positions ``[_suffix_start, total_len)`` (the still-masked tail).
+    # ``_last_full_logits`` holds the full-length logits from the most recent
+    # prime so the sampler always sees a ``[1, total_len, vocab]`` tensor
+    # (prefix/suffix logits are never consumed by the sampler).
     # ------------------------------------------------------------------
     _prefix_cache = None
     _prefix_len = 0
+    _suffix_cache = None
+    _suffix_start = total_len
     _last_full_logits = None
 
-    def _prime_cache(x_cur: mx.array, block_start: int):
-        """Full forward over the whole ``x``; cache prefix K/V for [0, block_start).
+    def _prime_cache(x_cur: mx.array, block_start: int, block_end: int):
+        """Full forward over the whole ``x``; cache prefix [0, block_start) and,
+        with ``dual_cache``, suffix [block_end, total_len) K/V.
 
         Returns the full-length logits (also stashed for later scatter).
         """
-        nonlocal _prefix_cache, _prefix_len, _last_full_logits, forwards
+        nonlocal _prefix_cache, _prefix_len, _suffix_cache, _suffix_start
+        nonlocal _last_full_logits, forwards
         forwards += 1
         logits, kvs = model(x_cur, return_kv=True)  # kvs: per-layer (K, V) over all L
         # Slice out the fixed prefix window [0, block_start) along the seq axis.
@@ -504,26 +557,47 @@ def generate(
             (k[:, :, :block_start, :], v[:, :, :block_start, :]) for (k, v) in kvs
         ]
         _prefix_len = block_start
+        if dual_cache:
+            # Slice out the suffix window [block_end, total_len) — the masked
+            # tail, which is near-stable across the block's denoising steps.
+            _suffix_cache = [
+                (k[:, :, block_end:, :], v[:, :, block_end:, :]) for (k, v) in kvs
+            ]
+            _suffix_start = block_end
+        else:
+            _suffix_cache = None
+            _suffix_start = total_len
         _last_full_logits = logits
         return logits
 
     def _forward_logits_cached(x_cur: mx.array) -> mx.array:
         """Cached forward: process only the active window, scatter to full length.
 
-        Uses the primed ``_prefix_cache`` (positions ``[0, _prefix_len)``). The
-        active hidden states ``x_cur[:, _prefix_len:]`` are RoPE'd at absolute
-        offset ``_prefix_len`` and attended against ``[prefix ++ active]`` K/V.
-        The returned logits are ``[1, total_len, vocab]``; the prefix rows are
-        filled from the last prime (never consumed by the sampler).
+        Uses the primed ``_prefix_cache`` (positions ``[0, _prefix_len)``) and,
+        with ``dual_cache``, ``_suffix_cache`` (positions
+        ``[_suffix_start, total_len)``). The active hidden states
+        ``x_cur[:, _prefix_len:_suffix_start]`` are RoPE'd at absolute offset
+        ``_prefix_len`` and attended against ``[prefix ++ active ++ suffix]``
+        K/V. The returned logits are ``[1, total_len, vocab]``; the
+        prefix/suffix rows are filled from the last prime (never consumed by the
+        sampler).
         """
         nonlocal forwards, _last_full_logits
         forwards += 1
-        active = x_cur[:, _prefix_len:]
-        active_logits = model(active, prefix_kv=_prefix_cache, pos_offset=_prefix_len)
-        # Scatter active logits back into a full-length buffer.
-        full = mx.concatenate(
-            [_last_full_logits[:, :_prefix_len, :], active_logits], axis=1
+        active = x_cur[:, _prefix_len:_suffix_start]
+        active_logits = model(
+            active,
+            prefix_kv=_prefix_cache,
+            pos_offset=_prefix_len,
+            suffix_kv=_suffix_cache,
         )
+        # Scatter active logits back into a full-length buffer. Prefix rows come
+        # from the last prime; active rows are fresh; suffix rows (if any) come
+        # from the last prime too.
+        parts = [_last_full_logits[:, :_prefix_len, :], active_logits]
+        if _suffix_cache is not None:
+            parts.append(_last_full_logits[:, _suffix_start:, :])
+        full = mx.concatenate(parts, axis=1)
         _last_full_logits = full
         return full
 
@@ -538,10 +612,11 @@ def generate(
             block_start = prompt_len + b * block_length
             block_end = prompt_len + (b + 1) * block_length
 
-            # Prime the prefix cache once per block (positions [0, block_start)).
-            # The prime is itself a full forward, so its logits serve step 0.
+            # Prime the block cache once per block (prefix [0, block_start);
+            # with dual_cache also suffix [block_end, total_len)). The prime is
+            # itself a full forward, so its logits serve step 0.
             if kv_cache:
-                primed_logits = _prime_cache(x, block_start)
+                primed_logits = _prime_cache(x, block_start, block_end)
 
             # Mask positions still masked within the current block.
             block_mask_index = x[:, block_start:block_end] == mask_id
@@ -682,10 +757,11 @@ def generate(
             block_start = prompt_len + b * block_length
             block_end = prompt_len + (b + 1) * block_length
 
-            # Prime the prefix cache once per block (positions [0, block_start)).
-            # The prime is a full forward; reuse its logits for the block's
-            # first denoising step so priming costs nothing extra.
-            primed_logits = _prime_cache(x, block_start) if kv_cache else None
+            # Prime the block cache once per block (prefix [0, block_start);
+            # with dual_cache also suffix [block_end, total_len)). The prime is a
+            # full forward; reuse its logits for the block's first denoising step
+            # so priming costs nothing extra.
+            primed_logits = _prime_cache(x, block_start, block_end) if kv_cache else None
 
             # Eligible = masked AND inside the current block window.
             in_block = (col_index >= block_start) & (col_index < block_end)
@@ -723,7 +799,7 @@ def generate(
                     # one token per step so each re-commit sees the maximum fixed
                     # context (order-aware greedy re-reveal).
                     if kv_cache:
-                        primed_logits = _prime_cache(x, block_start)
+                        primed_logits = _prime_cache(x, block_start, block_end)
                     _parallel_fill_sequential(span)
 
     out = x[:, prompt_len:]
