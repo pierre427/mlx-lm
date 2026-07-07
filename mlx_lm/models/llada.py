@@ -237,12 +237,22 @@ class LLaDAModel(nn.Module):
         * ``suffix_kv`` given (DualCache; a per-layer list of cached suffix
           ``(K, V)``): each layer ALSO appends its cached suffix, so the active
           window is just the current block ``[block_start, block_end)``.
+        * ``return_kv=True`` WITH ``prefix_kv``/``suffix_kv`` (incremental
+          cache): a cached forward that ALSO returns the per-layer post-RoPE
+          ``(keys, values)`` for the ACTIVE window only. Used to capture a
+          finalized block's K/V so it can be appended to the prefix cache
+          instead of re-priming the next block.
         """
         h = self.embed_tokens(inputs)
         if return_kv:
+            pkv_list = prefix_kv if prefix_kv is not None else [None] * len(self.layers)
+            skv_list = suffix_kv if suffix_kv is not None else [None] * len(self.layers)
             kvs = []
-            for layer in self.layers:
-                h, kv = layer(h, mask=None, pos_offset=pos_offset, return_kv=True)
+            for layer, pkv, skv in zip(self.layers, pkv_list, skv_list):
+                h, kv = layer(
+                    h, mask=None, prefix_kv=pkv, pos_offset=pos_offset,
+                    return_kv=True, suffix_kv=skv,
+                )
                 kvs.append(kv)
             return self.norm(h), kvs
         if prefix_kv is not None or suffix_kv is not None:
@@ -285,10 +295,15 @@ class Model(nn.Module):
         With ``return_kv=True`` also returns the per-layer prefix KV list (for
         priming the Fast-dLLM cache). With ``prefix_kv`` (and optionally
         ``suffix_kv`` for DualCache) given, ``inputs`` is the active window only
-        and the returned logits cover just that window.
+        and the returned logits cover just that window. ``return_kv=True``
+        together with ``prefix_kv``/``suffix_kv`` is a cached forward that also
+        returns the active window's per-layer K/V (incremental-cache capture).
         """
         if return_kv:
-            out, kvs = self.model(inputs, return_kv=True)
+            out, kvs = self.model(
+                inputs, prefix_kv=prefix_kv, pos_offset=pos_offset,
+                return_kv=True, suffix_kv=suffix_kv,
+            )
             return self._head(out), kvs
         out = self.model(
             inputs, prefix_kv=prefix_kv, pos_offset=pos_offset, suffix_kv=suffix_kv
@@ -402,6 +417,7 @@ def generate(
     return_stats: bool = False,
     kv_cache: bool = False,
     dual_cache: bool = False,
+    incremental_cache: bool = False,
     remask_refine: bool = False,
     remask_conf: float = 0.9,
     remask_rounds: int = 2,
@@ -465,6 +481,21 @@ def generate(
             The suffix masks drift as the block reveals, so the approximation is
             MORE aggressive than prefix-only; it stays coherent on real weights.
             Default False keeps the prefix-only cache behaviour.
+        incremental_cache: if True (requires ``kv_cache`` and ``dual_cache``),
+            eliminate the per-block full-forward PRIME. Only block 0 is primed
+            (a full forward — unavoidable, no prior cache). When a block
+            finalizes, its now-revealed tokens' post-RoPE K/V (already computed
+            in the block's last cached forward) are **appended** to the prefix
+            cache, and the suffix cache is **sliced** to drop the next active
+            block — so block ``b>0`` needs no prime at all. This turns ``N``
+            full-length primes into 1 prime + append/slice bookkeeping, which is
+            the dominant cost of DualCache at long context (gen>=512: 16 primes
+            of ~137ms each). The approximation is the same class as DualCache's
+            (prefix K/V assumed stable across the boundary; the appended block
+            K/V and sliced suffix are one denoising-step staler than a fresh
+            prime), and stays coherent on real weights. Composes with the fixed
+            and parallel paths; ``remask_refine`` falls back to re-priming inside
+            a block (rare path). Default False keeps DualCache's per-block prime.
         remask_refine: opt-in order-aware re-masking for the parallel path only.
             The parallel schedule can commit a low-reveal-confidence token in an
             ambiguous spot (a "reveal-ORDER" artifact — e.g. it reveals a
@@ -506,6 +537,10 @@ def generate(
         )
     if dual_cache and not kv_cache:
         raise ValueError("dual_cache=True requires kv_cache=True.")
+    if incremental_cache and not (kv_cache and dual_cache):
+        raise ValueError(
+            "incremental_cache=True requires kv_cache=True and dual_cache=True."
+        )
 
     neg_inf = mx.array(-float("inf"), dtype=mx.float32)
     col_index = mx.arange(total_len).reshape(1, total_len)
@@ -541,6 +576,14 @@ def generate(
     _suffix_cache = None
     _suffix_start = total_len
     _last_full_logits = None
+    # Incremental cache: the per-layer post-RoPE (K, V) of the CURRENT active
+    # window from the most recent cached forward. When a block finalizes these
+    # are the finalized block's K/V, appended to the prefix cache in place of a
+    # re-prime for the next block. ``_active_kv_span`` records the absolute
+    # ``(start, end)`` those K/V cover, so we only append when they exactly match
+    # the just-finalized block (else we fall back to a prime).
+    _active_kv = None
+    _active_kv_span = (0, 0)
 
     def _prime_cache(x_cur: mx.array, block_start: int, block_end: int):
         """Full forward over the whole ``x``; cache prefix [0, block_start) and,
@@ -582,15 +625,27 @@ def generate(
         prefix/suffix rows are filled from the last prime (never consumed by the
         sampler).
         """
-        nonlocal forwards, _last_full_logits
+        nonlocal forwards, _last_full_logits, _active_kv, _active_kv_span
         forwards += 1
         active = x_cur[:, _prefix_len:_suffix_start]
-        active_logits = model(
-            active,
-            prefix_kv=_prefix_cache,
-            pos_offset=_prefix_len,
-            suffix_kv=_suffix_cache,
-        )
+        if incremental_cache:
+            # Also return the active window's per-layer post-RoPE K/V so the
+            # finalized block can be appended to the prefix cache next block.
+            active_logits, _active_kv = model(
+                active,
+                prefix_kv=_prefix_cache,
+                pos_offset=_prefix_len,
+                suffix_kv=_suffix_cache,
+                return_kv=True,
+            )
+            _active_kv_span = (_prefix_len, _suffix_start)
+        else:
+            active_logits = model(
+                active,
+                prefix_kv=_prefix_cache,
+                pos_offset=_prefix_len,
+                suffix_kv=_suffix_cache,
+            )
         # Scatter active logits back into a full-length buffer. Prefix rows come
         # from the last prime; active rows are fresh; suffix rows (if any) come
         # from the last prime too.
@@ -600,6 +655,38 @@ def generate(
         full = mx.concatenate(parts, axis=1)
         _last_full_logits = full
         return full
+
+    def _extend_cache(block_start: int, block_end: int):
+        """Incremental cache advance — NO full forward (the prime is eliminated).
+
+        Called at the start of block ``b>0`` in place of ``_prime_cache``. The
+        just-finalized block ``b-1`` occupied the active window
+        ``[_prefix_len, _suffix_start)`` == ``[block_start-block_len, block_start)``;
+        its post-RoPE K/V were captured in ``_active_kv`` by the block's last
+        cached forward. Append them to the prefix cache so the prefix now covers
+        ``[0, block_start)``, and slice the suffix cache to drop the new active
+        block, leaving ``[block_end, total_len)``. Attention is permutation-
+        invariant over keys and RoPE is baked into every cached K, so appending
+        the finalized block's K/V is order-correct.
+        """
+        nonlocal _prefix_cache, _prefix_len, _suffix_cache, _suffix_start
+        block_len = block_end - block_start
+        # Append finalized block K/V to the prefix (per layer, along seq axis).
+        _prefix_cache = [
+            (
+                mx.concatenate([pk, ak], axis=2),
+                mx.concatenate([pv, av], axis=2),
+            )
+            for (pk, pv), (ak, av) in zip(_prefix_cache, _active_kv)
+        ]
+        _prefix_len = block_start
+        # Slice the suffix: it covered [old block_end, total_len) == [block_start,
+        # total_len); drop the first block_len positions (the new active block).
+        _suffix_cache = [
+            (k[:, :, block_len:, :], v[:, :, block_len:, :])
+            for (k, v) in _suffix_cache
+        ]
+        _suffix_start = block_end
 
     if parallel_threshold is None:
         # -------------------------------------------------------------------
@@ -614,9 +701,26 @@ def generate(
 
             # Prime the block cache once per block (prefix [0, block_start);
             # with dual_cache also suffix [block_end, total_len)). The prime is
-            # itself a full forward, so its logits serve step 0.
+            # itself a full forward, so its logits serve step 0. With
+            # incremental_cache, only block 0 is primed; later blocks advance the
+            # cache by append/slice (no full forward), so step 0 has no free
+            # prime logits and runs a real cached forward.
+            primed_logits = None
             if kv_cache:
-                primed_logits = _prime_cache(x, block_start, block_end)
+                # Extend only when the captured active K/V exactly cover the
+                # just-finalized block [block_start-block_length, block_start);
+                # otherwise (block 0, or a block that filled in its prime with no
+                # cached forward) fall back to a full prime.
+                can_extend = (
+                    incremental_cache
+                    and b > 0
+                    and _active_kv is not None
+                    and _active_kv_span == (block_start - block_length, block_start)
+                )
+                if can_extend:
+                    _extend_cache(block_start, block_end)
+                else:
+                    primed_logits = _prime_cache(x, block_start, block_end)
 
             # Mask positions still masked within the current block.
             block_mask_index = x[:, block_start:block_end] == mask_id
@@ -627,7 +731,11 @@ def generate(
             for i in range(steps_per_block):
                 mask_index = x == mask_id
                 if kv_cache:
-                    logits = primed_logits if i == 0 else _forward_logits_cached(x)
+                    logits = (
+                        primed_logits
+                        if (i == 0 and primed_logits is not None)
+                        else _forward_logits_cached(x)
+                    )
                 else:
                     logits = _forward_logits(x)
 
@@ -694,7 +802,11 @@ def generate(
                     break
 
                 if kv_cache:
-                    logits = primed_logits if step == 0 else _forward_logits_cached(x)
+                    logits = (
+                        primed_logits
+                        if (step == 0 and primed_logits is not None)
+                        else _forward_logits_cached(x)
+                    )
                 else:
                     logits = _forward_logits(x)
 
@@ -760,8 +872,23 @@ def generate(
             # Prime the block cache once per block (prefix [0, block_start);
             # with dual_cache also suffix [block_end, total_len)). The prime is a
             # full forward; reuse its logits for the block's first denoising step
-            # so priming costs nothing extra.
-            primed_logits = _prime_cache(x, block_start, block_end) if kv_cache else None
+            # so priming costs nothing extra. With incremental_cache, block b>0
+            # advances the cache by append/slice instead of priming (no full
+            # forward), so there is no free step-0 logit — step 0 runs a cached
+            # forward. Extend only when the captured active K/V exactly cover the
+            # just-finalized block; otherwise fall back to a prime.
+            primed_logits = None
+            if kv_cache:
+                can_extend = (
+                    incremental_cache
+                    and b > 0
+                    and _active_kv is not None
+                    and _active_kv_span == (block_start - block_length, block_start)
+                )
+                if can_extend:
+                    _extend_cache(block_start, block_end)
+                else:
+                    primed_logits = _prime_cache(x, block_start, block_end)
 
             # Eligible = masked AND inside the current block window.
             in_block = (col_index >= block_start) & (col_index < block_end)
