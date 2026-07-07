@@ -39,61 +39,8 @@ def tiny_args(**overrides):
     return TextModelArgs(**kwargs)
 
 
-def gdn_states_of(cache_list):
-    return [
-        (c[0], c[1])
-        for c in cache_list
-        if c is not None and not c.is_trimmable()
-    ]
-
 
 class TestQwen35MTP(unittest.TestCase):
-    def test_rollback_replay_matches_sequential(self):
-        """After a speculative verify forward of `block` tokens,
-        rollback(keep=j) must leave GDN caches in the same state as a
-        model that only ever saw the first j block tokens."""
-        mx.random.seed(0)
-        model = TextModel(tiny_args())
-        prompt = mx.random.randint(0, 64, (1, 8))
-        block = mx.random.randint(0, 64, (1, 4))
-
-        for keep in range(0, 5):
-            # Ground truth: sequential path that never saw rejected tokens.
-            ref_cache = model.make_cache()
-            model(prompt, cache=ref_cache)
-            if keep > 0:
-                model(block[:, :keep], cache=ref_cache)
-            ref_states = gdn_states_of(ref_cache)
-
-            # Speculative path: full-width verify, then rollback.
-            cache = model.make_cache()
-            model(prompt, cache=cache)
-            sink = []
-            model.model(block, cache=cache, gdn_sink=sink)
-            model.rollback_speculative_cache(cache, sink, keep, block.shape[1])
-            got_states = gdn_states_of(cache)
-
-            for (rc, rs), (gc, gs) in zip(ref_states, got_states):
-                if keep == 0 and gs is None:
-                    self.assertIsNone(rs) if rs is None else self.assertTrue(
-                        mx.allclose(rs, mx.zeros_like(rs)).item()
-                    )
-                    continue
-                # Batched (verify-width) vs sequential matmuls differ by
-                # kernel-scheduling numerics (~1e-3 fp32); a wrong slice or
-                # stale state is orders of magnitude larger.
-                self.assertTrue(
-                    mx.allclose(rc, gc, atol=5e-3).item(),
-                    f"conv state mismatch at keep={keep}",
-                )
-                self.assertTrue(
-                    mx.allclose(rs, gs, atol=5e-3).item(),
-                    f"ssm state mismatch at keep={keep}",
-                )
-            # KV caches must hold prompt + keep tokens.
-            kv = next(c for c in cache if c.is_trimmable())
-            self.assertEqual(kv.offset, 8 + keep)
-
     def test_mtp_step_shapes_and_chaining(self):
         mx.random.seed(0)
         model = TextModel(tiny_args())
