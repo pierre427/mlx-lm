@@ -476,6 +476,8 @@ def adaptive_pld_generate_step(
     num_draft: int = 1,
     prefill_step_size: int = 512,
     stats: Optional[HybridStats] = None,
+    prompt_cache: Optional[Any] = None,
+    history_prompt: Optional[mx.array] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Retrieval-only PLD with a one-way latch so it does not lose on no-copy
     output.
@@ -492,7 +494,10 @@ def adaptive_pld_generate_step(
     giving ~1.1x on the novel code PLD can't help with. So one greedy path serves
     both regimes: copy-heavy -> PLD, novel -> MTP.
 
-    Greedy only, draft-free; one shared prompt cache. Like all speculative
+    Greedy only, draft-free; one shared prompt cache. ``prompt_cache`` may hold
+    a prefilled prefix; when it is provided, ``prompt`` is the uncached tail and
+    ``history_prompt`` must be the full prompt used to seed PLD retrieval history.
+    Like all speculative
     decoders, output matches the target's own (batched) greedy — not bit-identical
     to sequential ``generate_step``, since batched/incremental-cache verify forwards
     differ numerically from single-token decode (this holds for upstream
@@ -502,7 +507,7 @@ def adaptive_pld_generate_step(
     Yields ``(token, logprobs, from_retrieval)``.
     """
     stats = stats if stats is not None else HybridStats()
-    cache = make_prompt_cache(model)
+    cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
@@ -520,7 +525,8 @@ def adaptive_pld_generate_step(
             "(recurrent layers need supports_speculative_rollback)."
         )
 
-    history: List[int] = [int(t) for t in prompt.tolist()]
+    history_src = history_prompt if history_prompt is not None else prompt
+    history: List[int] = [int(t) for t in history_src.tolist()]
     sam = SuffixAutomaton(history)
     pending: List[int] = [int(t) for t in y.tolist()]  # committed, not yet cached
 
