@@ -319,11 +319,11 @@ class Model(nn.Module):
 
     def mtp_step(self, hidden: mx.array, tokens: mx.array, cache):
         """One self-spec step: given trunk hidden states and the committed
-        tokens, return the head's next-token logits (via the tied lm_head)."""
+        tokens, return the head's next-token logits (via the model's lm_head,
+        tied or not)."""
         embeds = self.model.embed_tokens(tokens)
         h = self.mtp(hidden, embeds, cache[0])
-        logits = self.model.embed_tokens.as_linear(h) * self.logit_scale
-        return logits, h
+        return self.logits(h), h
 
     def sanitize(self, weights):
         # Drop a stray mtp.* head when this model has none (keeps base-checkpoint
