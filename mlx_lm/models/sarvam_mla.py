@@ -27,6 +27,11 @@ class ModelArgs(_V3Args):
     num_shared_experts: Optional[int] = None   # -> n_shared_experts
     # Sarvam has no q_lora_rank -> direct q_proj path (V3 default is 1536).
     q_lora_rank: Optional[int] = None
+    # Default to None (not the V3 base's 1) so __post_init__ can tell a
+    # truly-absent key apart from an explicit n_group=1/topk_group=1
+    # ("no group restriction"), which must be honored as-is.
+    n_group: Optional[int] = None
+    topk_group: Optional[int] = None
     # present in Sarvam config; unused by the V3 attention math but kept so
     # BaseModelArgs.from_dict doesn't choke and for documentation.
     q_head_dim: int = 192
@@ -43,10 +48,13 @@ class ModelArgs(_V3Args):
             self.n_shared_experts = self.num_shared_experts
         # Sarvam omits the group-routing dims; its gate defaults to
         # n_group = n_routed_experts // 8, topk_group = 2 (see modeling MoEGate).
+        # Only fill in defaults when the config truly omits the keys — an
+        # explicit n_group=1/topk_group=1 means "no group restriction" and
+        # must be honored as-is.
         n_routed = self.n_routed_experts or self.num_experts or 128
-        if self.n_group in (None, 1):
+        if self.n_group is None:
             self.n_group = n_routed // 8
-        if self.topk_group in (None, 1):
+        if self.topk_group is None:
             self.topk_group = 2
 
 
