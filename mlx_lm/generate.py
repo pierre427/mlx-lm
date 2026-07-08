@@ -690,19 +690,32 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    def _can_speculate(c):
+    def _can_speculate(c, owner):
         # Trimmable directly, or able to record an exact rollback while
         # speculating (see ArraysCache.record_rollback). The model must also
         # declare support: recording is done by its recurrent layers.
         return c.is_trimmable() or (
             hasattr(c, "record_rollback")
-            and getattr(model, "supports_speculative_rollback", False)
+            and getattr(owner, "supports_speculative_rollback", False)
         )
 
-    if not all(_can_speculate(c) for c in model_cache):
-        types = {type(c).__name__ for c in model_cache if not _can_speculate(c)}
+    if not all(_can_speculate(c, model) for c in model_cache):
+        types = {
+            type(c).__name__ for c in model_cache if not _can_speculate(c, model)
+        }
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a trimmable target cache "
+            f"(got {types})."
+        )
+    if not all(_can_speculate(c, draft_model) for c in draft_cache):
+        types = {
+            type(c).__name__
+            for c in draft_cache
+            if not _can_speculate(c, draft_model)
+        }
+        raise ValueError(
+            f"Speculative decoding requires a trimmable draft cache "
+            f"(got {types})."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -862,7 +875,7 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
-        for c in model_cache:
+        for c in model_cache + draft_cache:
             c.stop_speculation()
 
 

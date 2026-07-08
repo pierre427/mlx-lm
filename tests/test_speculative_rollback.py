@@ -196,13 +196,23 @@ class TestSpeculativeRollback(unittest.TestCase):
         n = 24
 
         vanilla = [int(tok) for tok, _ in generate_step(prompt, model, max_tokens=n)]
+        c = cache.make_prompt_cache(model) + cache.make_prompt_cache(draft)
         spec = [
             int(tok)
             for tok, _, _ in speculative_generate_step(
-                prompt, model, draft, num_draft_tokens=3, max_tokens=n
+                prompt,
+                model,
+                draft,
+                num_draft_tokens=3,
+                max_tokens=n,
+                prompt_cache=c,
             )
         ]
         self.assertEqual(vanilla, spec)
+        for x in c:
+            if isinstance(x, cache.ArraysCache):
+                self.assertFalse(x.speculating)
+                self.assertEqual(len(x._rollbacks), 0)
 
     def test_draft_exception_not_masked(self):
         # An exception raised mid-round (e.g. inside the draft model) must

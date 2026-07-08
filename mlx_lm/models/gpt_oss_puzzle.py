@@ -118,8 +118,21 @@ class Model(nn.Module):
         self.model = PuzzleModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache=None, kv_sink=None):
-        return self.lm_head(self.model(inputs, cache, kv_sink=kv_sink))
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+        kv_sink=None,
+    ):
+        return self.lm_head(
+            self.model(
+                inputs,
+                cache,
+                input_embeddings=input_embeddings,
+                kv_sink=kv_sink,
+            )
+        )
 
     def sanitize(self, weights):
         # Drop the fp8-KV-cache calibration scales (k_scale/v_scale): they

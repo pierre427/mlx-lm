@@ -230,6 +230,12 @@ class TestTrustRemoteCode(unittest.TestCase):
             {"linear.weight": mx.zeros((8, 8)), "linear.bias": mx.zeros((8,))},
         )
 
+    def _write_custom_model_config(self, model_file):
+        config = {"model_type": "custom", "model_file": model_file}
+        with open(self.model_path / "config.json", "w") as f:
+            json.dump(config, f)
+        mx.save_safetensors(str(self.model_path / "model.safetensors"), {})
+
     def test_model_file_blocked_by_default(self):
         """load_model must refuse to execute a custom model_file by default."""
         self._write_custom_model_dir()
@@ -245,6 +251,27 @@ class TestTrustRemoteCode(unittest.TestCase):
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(config["model_file"], "arch.py")
         self.assertTrue(self._side_effect_file.exists())
+
+    def test_model_file_must_stay_inside_model_dir(self):
+        """trust_remote_code does not allow model_file path traversal."""
+        self._write_custom_model_config("../evil.py")
+        with self.assertRaises(ValueError) as cm:
+            utils.load_model(self.model_path, trust_remote_code=True)
+        self.assertIn("inside the model directory", str(cm.exception))
+
+    def test_model_file_must_not_be_absolute(self):
+        """trust_remote_code does not allow model_file absolute paths."""
+        self._write_custom_model_config(str(self.model_path / "arch.py"))
+        with self.assertRaises(ValueError) as cm:
+            utils.load_model(self.model_path, trust_remote_code=True)
+        self.assertIn("relative Python file", str(cm.exception))
+
+    def test_model_file_must_be_python_file(self):
+        """trust_remote_code accepts only Python source files."""
+        self._write_custom_model_config("arch.txt")
+        with self.assertRaises(ValueError) as cm:
+            utils.load_model(self.model_path, trust_remote_code=True)
+        self.assertIn("relative Python file", str(cm.exception))
 
     def test_normal_model_unaffected_by_default(self):
         """Models without model_file load fine with default arguments."""
