@@ -705,6 +705,7 @@ def self_mtp_generate_step(
 
 
 def _temperature_logprobs(logits, sampling_temp: float = 0.0):
+    logits = logits.astype(mx.float32)
     if sampling_temp and sampling_temp > 0:
         logits = logits / float(sampling_temp)
     return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
