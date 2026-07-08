@@ -379,10 +379,14 @@ def add_gumbel_noise(logits: mx.array, temperature: float) -> mx.array:
     """
     if temperature == 0.0:
         return logits
+    # Log-space reformulation of the official exp(logits) / (-log u)^T:
+    # logits - T * log(-log u) has the same argmax with no exp() overflow
+    # and no need for float64. Every call site takes argmax of the result.
     logits = logits.astype(mx.float32)
+    eps = 1e-7
     noise = mx.random.uniform(shape=logits.shape).astype(mx.float32)
-    gumbel = (-mx.log(noise)) ** temperature
-    return mx.exp(logits) / gumbel
+    noise = mx.clip(noise, eps, 1.0 - eps)
+    return logits - temperature * mx.log(-mx.log(noise))
 
 
 def get_num_transfer_tokens(mask_index: mx.array, steps: int) -> mx.array:
@@ -912,8 +916,12 @@ def generate(
                     if int(low.sum()) == 0:
                         break
                     # Widen to the immediate neighbours (contiguous span).
-                    low_left = mx.roll(low, 1, axis=1)
-                    low_right = mx.roll(low, -1, axis=1)
+                    # Shift without wrap-around: mx.roll is circular, which
+                    # would let a low-confidence token at the sequence edge
+                    # mark the opposite edge across the boundary.
+                    edge = mx.zeros_like(low[:, :1])
+                    low_left = mx.concatenate([edge, low[:, :-1]], axis=1)
+                    low_right = mx.concatenate([low[:, 1:], edge], axis=1)
                     span = (low | low_left | low_right) & in_block
                     if int(span.sum()) == 0:
                         break
