@@ -150,7 +150,19 @@ class Glm4MoeLiteAttention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        # A QuantizedKVCache returns (weight, scales, biases) tuples for the
+        # cached latent and rope keys.
+        quantized = not isinstance(k_pe, mx.array)
+        if quantized:
+            pe_scores = mx.quantized_matmul(
+                q_pe * self.scale,
+                *k_pe,
+                transpose=True,
+                group_size=cache.group_size,
+                bits=cache.bits,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
                 mask,
@@ -161,12 +173,26 @@ class Glm4MoeLiteAttention(nn.Module):
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+            if quantized and self.num_heads > 1:
+                # quantized_scaled_dot_product_attention reshapes queries to
+                # (B, n_kv_heads=1, n_heads, L, S); expand the additive
+                # pe_scores mask to match so it broadcasts correctly.
+                pe_scores = pe_scores[:, None]
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
         else:
+            if quantized:
+                kv_latent = mx.dequantize(
+                    *kv_latent, group_size=cache.group_size, bits=cache.bits
+                )
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
+            # k/v are materialized arrays here, so use the plain SDPA path
+            # even when the cache itself is quantized.
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=None, scale=self.scale, mask=pe_scores
+            )
         if L == 1:
             output = self.unembed_out(output)
 
