@@ -9,12 +9,41 @@ import mlx.nn as nn
 from .activations import swiglu
 
 
+def _mlx_version_tuple():
+    try:
+        return tuple(int(p) for p in mx.__version__.split(".")[:2])
+    except (AttributeError, ValueError):
+        return (0, 0)
+
+
+# mlx < 0.32 Metal mishandles the ragged tail tile in the sorted
+# gather_qmm/gather_mm path when the flattened row count exceeds 32768 and is
+# not a multiple of 64: expert outputs for most rows come out wrong (silent
+# MoE corruption at long single-shot prefill, e.g. gpt-oss rambling at 32k
+# context). Verified fixed in mlx 0.32.0.dev builds. On affected cores we pad
+# the sorted rows up to a multiple of 64 (duplicating the last row, which
+# keeps the indices sorted); _scatter_unsort gathers only the original rows,
+# so the padding never reaches the output.
+_SORTED_GATHER_TAIL_BUG = _mlx_version_tuple() < (0, 32)
+
+
 def _gather_sort(x, indices):
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x = x.flatten(0, -3)[order // M]
+    indices = indices[order]
+    n = indices.size
+    if _SORTED_GATHER_TAIL_BUG and n > 32768 and n % 64 != 0:
+        pad = 64 - n % 64
+        x = mx.concatenate(
+            [x, mx.broadcast_to(x[-1:], (pad,) + x.shape[1:])], axis=0
+        )
+        indices = mx.concatenate(
+            [indices, mx.broadcast_to(indices[-1:], (pad,))], axis=0
+        )
+    return x, indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
