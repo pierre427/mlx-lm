@@ -443,7 +443,17 @@ class Model(nn.Module):
                 if quantized:
                     dims = self.args.kv_lora_rank
                     scales = weights.pop(f"{prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases", None)
+                    quant_mode = (getattr(self.args, "quantization", None) or {}).get(
+                        "mode", "affine"
+                    )
+                    if biases is None or quant_mode != "affine":
+                        raise ValueError(
+                            "unsupported quantization mode for MLA kv_b_proj "
+                            f"folding: {quant_mode!r}"
+                            + ("" if biases is not None else " (no biases tensor)")
+                            + "; only affine quantization is supported"
+                        )
                     # Try to infer bits and group size
                     bits = (v.shape[-1] * 32) // dims
                     group_size = dims // scales.shape[-1]
