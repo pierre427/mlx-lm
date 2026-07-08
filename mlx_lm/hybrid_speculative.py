@@ -167,6 +167,8 @@ class HybridStats:
     draft_accepted: int = 0  # ... of which the target accepted
     bonus_tokens: int = 0  # bonus/correction tokens from propose cycles
     plain_tokens: int = 0  # tokens emitted by plain (no-proposal) cycles
+    external_cache_reconciled: bool = False
+    external_cache_trimmed_tokens: int = 0
 
     @property
     def total_emitted(self) -> int:
@@ -507,6 +509,7 @@ def adaptive_pld_generate_step(
     Yields ``(token, logprobs, from_retrieval)``.
     """
     stats = stats if stats is not None else HybridStats()
+    external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
     y = prompt.astype(mx.uint32)
@@ -533,6 +536,7 @@ def adaptive_pld_generate_step(
     ntoks = 0
     retrieved = 0  # tokens emitted from accepted retrieval spans
     latched = False
+    cached_unyielded = 0
     try:
         # ---- PLD phase: retrieval-verify cycles until latch or done ----------
         while ntoks < max_tokens and not latched:
@@ -560,6 +564,10 @@ def adaptive_pld_generate_step(
             bonus = choices[n_accept]
 
             trim_prompt_cache(cache, n_prop - n_accept)
+            # Accepted proposal tokens are already in the cache before they are
+            # yielded. If the caller closes early, trim any accepted tokens that
+            # never reached the caller so an external cache is not over-advanced.
+            cached_unyielded = n_accept
             emitted = proposal[:n_accept] + [bonus]
             history.extend(emitted)
             for t in emitted:
@@ -579,6 +587,7 @@ def adaptive_pld_generate_step(
             for i in range(n_accept):
                 ntoks += 1
                 yield proposal[i], logprobs[i], True
+                cached_unyielded -= 1
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
@@ -623,6 +632,11 @@ def adaptive_pld_generate_step(
                     if ntoks == max_tokens:
                         break
     finally:
+        if cached_unyielded > 0:
+            trimmed = trim_prompt_cache(cache, cached_unyielded)
+            if external_prompt_cache:
+                stats.external_cache_reconciled = True
+                stats.external_cache_trimmed_tokens += int(trimmed or 0)
         for c in cache:
             c.stop_speculation()
 

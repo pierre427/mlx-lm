@@ -301,7 +301,24 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+            if isinstance(c, (RotatingKVCache, BatchRotatingKVCache)):
+                raise ValueError(
+                    "KV cache quantization is not supported for "
+                    f"{type(c).__name__}. Sliding-window/rotating caches use a "
+                    "physical ring layout that needs a dedicated quantized "
+                    "implementation. Disable kv_bits for mixed rotating-cache "
+                    "models, or quantize only caches that are known to be "
+                    "plain KVCache instances."
+                )
+            try:
+                prompt_cache[e] = c.to_quantized(
+                    group_size=kv_group_size, bits=kv_bits
+                )
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "KV cache quantization is not available for "
+                    f"{type(c).__name__}."
+                ) from exc
 
 
 def generate_step(
