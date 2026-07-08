@@ -148,6 +148,14 @@ class Model(nn.Module):
             x = layer(x, target_hidden, anchor_pos, mask)
         return _rms(x, self.norm.weight)
 
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(
+            "dflash_laguna is a target-coupled DFlash speculator, not a "
+            "standalone causal language model. Use dflash_spec.py or "
+            "laguna_server.py --dflash so it can reuse the target Laguna "
+            "embedding and LM head."
+        )
+
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():

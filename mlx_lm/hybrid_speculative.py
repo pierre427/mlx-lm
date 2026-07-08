@@ -586,8 +586,8 @@ def adaptive_pld_generate_step(
 
             for i in range(n_accept):
                 ntoks += 1
-                yield proposal[i], logprobs[i], True
                 cached_unyielded -= 1
+                yield proposal[i], logprobs[i], True
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
