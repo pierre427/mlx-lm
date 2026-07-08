@@ -648,6 +648,7 @@ def self_mtp_generate_step(
     num_draft: int = 1,
     max_tokens: int = 256,
     prefill_step_size: int = 512,
+    sampling_temp: float = 0.0,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
@@ -660,7 +661,12 @@ def self_mtp_generate_step(
     The head is depth-1, so ``num_draft=1`` is the trained regime; k>1 chains the
     head on its own hidden (out of training distribution — acceptance decays).
 
-    Greedy only. Yields ``(token, logprobs, from_draft)``.
+    Greedy by default. When ``sampling_temp > 0``, the MTP path uses standard
+    speculative rejection sampling with temperature-scaled target and draft
+    distributions. This is exact for temperature-only sampling; top-p/top-k need
+    a shared distribution transform before they can be made exact here.
+
+    Yields ``(token, logprobs, from_draft)``.
     """
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
@@ -677,9 +683,8 @@ def self_mtp_generate_step(
             mx.clear_cache()
         hidden = model.model(y[None], cache=cache)   # [1, 1, H] post-final-norm
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
-        first_lp = model.logits(seed_h)[0, -1]
-        first_lp = first_lp - mx.logsumexp(first_lp)
-        cur = int(mx.argmax(first_lp).item())
+        first_lp = _temperature_logprobs(model.logits(seed_h)[0, -1], sampling_temp)
+        cur = _sample_from_logprobs(first_lp, sampling_temp)
     for c in cache:
         c.start_speculation()
     if not can_trim_prompt_cache(cache):
@@ -692,14 +697,55 @@ def self_mtp_generate_step(
         yield cur, first_lp, False
         stats.plain_tokens += 1
         yield from _mtp_draft_verify_loop(
-            model, cache, cur, seed_h, 1, max_tokens, num_draft, stats
+            model, cache, cur, seed_h, 1, max_tokens, num_draft, stats, sampling_temp
         )
     finally:
         for c in cache:
             c.stop_speculation()
 
 
-def _mtp_draft_verify_loop(model, cache, cur, seed_h, ntoks, max_tokens, num_draft, stats):
+def _temperature_logprobs(logits, sampling_temp: float = 0.0):
+    if sampling_temp and sampling_temp > 0:
+        logits = logits / float(sampling_temp)
+    return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+
+def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0) -> int:
+    if sampling_temp and sampling_temp > 0:
+        return int(mx.random.categorical(logprobs).item())
+    return int(mx.argmax(logprobs).item())
+
+
+def _residual_sample(target_logprobs, draft_logprobs, sampling_temp: float) -> int:
+    residual = mx.maximum(mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
+    total = mx.sum(residual)
+    mx.eval(total)
+    if float(total.item()) <= 0.0:
+        return _sample_from_logprobs(target_logprobs, sampling_temp)
+    residual_logprobs = mx.log(residual / total)
+    return int(mx.random.categorical(residual_logprobs).item())
+
+
+def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
+    target_p = mx.exp(target_logprobs[token])
+    draft_p = mx.exp(draft_logprobs[token])
+    ratio = mx.minimum(1.0, target_p / mx.maximum(draft_p, 1e-30))
+    u = mx.random.uniform(shape=())
+    mx.eval(ratio, u)
+    return float(u.item()) <= float(ratio.item())
+
+
+def _mtp_draft_verify_loop(
+    model,
+    cache,
+    cur,
+    seed_h,
+    ntoks,
+    max_tokens,
+    num_draft,
+    stats,
+    sampling_temp: float = 0.0,
+):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
     committed-but-uncached token and ``seed_h`` the trunk hidden that predicted
@@ -711,12 +757,15 @@ def _mtp_draft_verify_loop(model, cache, cur, seed_h, ntoks, max_tokens, num_dra
         # ---- draft k tokens with the MTP head (chained) ----------------------
         mtp_cache = model.make_mtp_cache()
         drafts: List[int] = []
+        draft_logprobs: List[mx.array] = []
         h, tok = seed_h, mx.array([[cur]], mx.uint32)
         with mx.stream(generation_stream):
             for _ in range(k):
                 d_logits, h = model.mtp_step(h, tok, mtp_cache)
-                d = int(mx.argmax(d_logits[0, -1]).item())
+                d_lp = _temperature_logprobs(d_logits[0, -1], sampling_temp)
+                d = _sample_from_logprobs(d_lp, sampling_temp)
                 drafts.append(d)
+                draft_logprobs.append(d_lp)
                 tok = mx.array([[d]], mx.uint32)
 
         # ---- verify: trunk over [cur, drafts...] in one forward --------------
@@ -724,15 +773,30 @@ def _mtp_draft_verify_loop(model, cache, cur, seed_h, ntoks, max_tokens, num_dra
         with mx.stream(generation_stream):
             vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
             vlogits = model.logits(vhidden)                 # [1, k+1, V]
-            logprobs = vlogits[0] - mx.logsumexp(vlogits[0], axis=-1, keepdims=True)
+            logprobs = _temperature_logprobs(vlogits[0], sampling_temp)
             targets = mx.argmax(logprobs, axis=-1)
         mx.eval(targets, vhidden)
-        targets = targets.tolist()
 
         n_accept = 0
-        while n_accept < k and targets[n_accept] == drafts[n_accept]:
-            n_accept += 1
-        bonus = targets[n_accept]
+        if sampling_temp and sampling_temp > 0:
+            while (
+                n_accept < k
+                and _accept_sampled_draft(
+                    logprobs[n_accept], draft_logprobs[n_accept], drafts[n_accept]
+                )
+            ):
+                n_accept += 1
+            if n_accept < k:
+                bonus = _residual_sample(
+                    logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+                )
+            else:
+                bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+        else:
+            targets = targets.tolist()
+            while n_accept < k and targets[n_accept] == drafts[n_accept]:
+                n_accept += 1
+            bonus = targets[n_accept]
 
         # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
         trim_prompt_cache(cache, k - n_accept)
