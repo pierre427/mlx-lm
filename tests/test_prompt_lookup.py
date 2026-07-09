@@ -26,6 +26,7 @@ from mlx_lm.prompt_lookup import (
     SuffixAutomaton,
     SuffixAutomatonProposer,
     make_proposer,
+    plan_proposal_around_verify_cliff,
     snap_proposal_around_verify_cliff,
 )
 from mlx_lm.sample_utils import make_sampler
@@ -79,6 +80,9 @@ class TestProposers(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             snap_proposal_around_verify_cliff(proposal, pending_rows=0)
+        self.assertEqual(plan_proposal_around_verify_cliff(8, 20), 15)
+        self.assertEqual(plan_proposal_around_verify_cliff(10, 12), 7)
+        self.assertEqual(plan_proposal_around_verify_cliff(16, 20), 16)
 
 
 class TestCacheHelpers(unittest.TestCase):
@@ -165,7 +169,7 @@ class TestPromptLookupLifecycle(unittest.TestCase):
                 pass
 
             def propose(self, seq, max_span, prompt_len):
-                return [0] * min(max_span, 10)
+                return [0] * max_span
 
         from mlx_lm.prompt_lookup import HybridStats
 
@@ -189,9 +193,28 @@ class TestPromptLookupLifecycle(unittest.TestCase):
         )
         next(snapped_gen)
         snapped_gen.close()
-        self.assertEqual(snapped_model.input_lengths[0], 8)
-        self.assertEqual(stats.span_snap_cycles, 1)
-        self.assertEqual(stats.span_snap_tokens, 3)
+        self.assertEqual(snapped_model.input_lengths[0], 16)
+        self.assertEqual(stats.span_extend_cycles, 1)
+        self.assertEqual(stats.span_extend_tokens, 5)
+        self.assertEqual(stats.verify_span_hist, {16: 1})
+
+        class ShortProposer(FixedProposer):
+            def propose(self, seq, max_span, prompt_len):
+                return [0] * min(max_span, 10)
+
+        short_stats = HybridStats()
+        short_model = _LifecycleModel()
+        short_gen = prompt_lookup_generate_step(
+            mx.array([1]), short_model, prompt_cache=[_LifecycleCache()],
+            max_tokens=16, num_draft=10, backend=ShortProposer(),
+            cliff_aware_span=True, stats=short_stats,
+        )
+        next(short_gen)
+        short_gen.close()
+        self.assertEqual(short_model.input_lengths[0], 8)
+        self.assertEqual(short_stats.span_snap_cycles, 1)
+        self.assertEqual(short_stats.span_snap_tokens, 3)
+        self.assertEqual(short_stats.verify_span_hist, {8: 1})
 
     def test_speculation_starts_after_prompt_prefill(self):
         cache = _LifecycleCache()

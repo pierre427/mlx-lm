@@ -1082,6 +1082,7 @@ def prompt_lookup_generate_step(
         HybridStats,
         NgramProposer,
         make_proposer,
+        plan_proposal_around_verify_cliff,
         snap_proposal_around_verify_cliff,
     )
 
@@ -1149,11 +1150,19 @@ def prompt_lookup_generate_step(
             # (and commits) more tokens than it will yield -> the cache stays
             # consistent with the yielded prefix at the max_tokens boundary.
             span = num_draft
+            available_span = max(num_draft, 15) if max_tokens < 0 else max(
+                max_tokens - generated - 1, 0
+            )
             if max_tokens >= 0:
                 span = min(num_draft, max(max_tokens - generated - 1, 0))
+            request_span = span
+            if cliff_aware_span and span > 0:
+                request_span = plan_proposal_around_verify_cliff(
+                    span, available_span, len(pending)
+                )
             prop = (
-                proposer.propose(history_seq, span, history_prompt_len)
-                if (span > 0 and len(pending) <= 2)
+                proposer.propose(history_seq, request_span, history_prompt_len)
+                if (request_span > 0 and len(pending) <= 2)
                 else []
             )
             if cliff_aware_span and prop:
@@ -1162,7 +1171,14 @@ def prompt_lookup_generate_step(
                 if len(prop) != raw_prop_len:
                     stats.span_snap_cycles += 1
                     stats.span_snap_tokens += raw_prop_len - len(prop)
+                if len(prop) > span:
+                    stats.span_extend_cycles += 1
+                    stats.span_extend_tokens += len(prop) - span
             x = pending + prop
+            verify_rows = len(x)
+            stats.verify_span_hist[verify_rows] = (
+                stats.verify_span_hist.get(verify_rows, 0) + 1
+            )
             snaps = _pld_snapshot(prompt_cache) if prop else None
             if snaps is not None:
                 last_snap = snaps

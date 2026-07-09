@@ -32,8 +32,8 @@ suffix automaton.
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Any, Generator, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -53,6 +53,7 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
+from .prompt_lookup import plan_proposal_around_verify_cliff
 
 _GREEDY = make_sampler(temp=0.0)
 
@@ -188,6 +189,11 @@ class HybridStats:
     plain_tokens: int = 0  # tokens emitted by plain (no-proposal) cycles
     external_cache_reconciled: bool = False
     external_cache_trimmed_tokens: int = 0
+    span_snap_cycles: int = 0
+    span_snap_tokens: int = 0
+    span_extend_cycles: int = 0
+    span_extend_tokens: int = 0
+    verify_span_hist: Dict[int, int] = field(default_factory=dict)
 
     @property
     def total_emitted(self) -> int:
@@ -491,6 +497,7 @@ def adaptive_pld_generate_step(
     max_tokens: int = 256,
     min_match: int = 3,
     max_span: int = 16,
+    cliff_aware_span: bool = False,
     max_lookback: int = 32,
     warmup: int = 48,
     gate: float = 0.12,
@@ -567,10 +574,29 @@ def adaptive_pld_generate_step(
             if budget > 0:
                 mlen, nxt = sam.longest_suffix_match(max_lookback)
                 if mlen >= min_match and 0 <= nxt < len(history):
-                    proposal = history[nxt : nxt + min(max_span, budget)]
+                    nominal_span = min(max_span, budget)
+                    available_span = min(len(history) - nxt, budget)
+                    chosen_span = min(nominal_span, available_span)
+                    if cliff_aware_span:
+                        chosen_span = plan_proposal_around_verify_cliff(
+                            nominal_span, available_span, len(pending)
+                        )
+                        if chosen_span < min(nominal_span, available_span):
+                            stats.span_snap_cycles += 1
+                            stats.span_snap_tokens += (
+                                min(nominal_span, available_span) - chosen_span
+                            )
+                        elif chosen_span > nominal_span:
+                            stats.span_extend_cycles += 1
+                            stats.span_extend_tokens += chosen_span - nominal_span
+                    proposal = history[nxt : nxt + chosen_span]
             n_prop = len(proposal)
 
             y_verify = mx.array(pending + proposal, mx.uint32)
+            verify_rows = len(pending) + n_prop
+            stats.verify_span_hist[verify_rows] = (
+                stats.verify_span_hist.get(verify_rows, 0) + 1
+            )
             with mx.stream(generation_stream):
                 logits = model(y_verify[None], cache=cache)
                 rel = logits[0, -(n_prop + 1) :, :]

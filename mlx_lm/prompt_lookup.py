@@ -17,7 +17,7 @@ The ``SuffixAutomaton`` and ``HybridStats`` classes here come from the
 hybrid-speculative work in this project (SuffixAutomaton retrieval + per-source
 accounting); they are reused verbatim so the two efforts converge on one core.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Sequence, Tuple
 
 
@@ -177,6 +177,31 @@ def snap_proposal_around_verify_cliff(
     return list(proposal)
 
 
+def plan_proposal_around_verify_cliff(
+    nominal_span: int, available_span: int, pending_rows: int = 1
+) -> int:
+    """Choose a safe proposal span, preferring the far side of the cliff.
+
+    ``nominal_span`` is the configured span, while ``available_span`` includes
+    the continuation and output-budget limits.  If the nominal verify shape
+    lands at L=9..15, extend to L=16 when the continuation exists; otherwise
+    shrink to L=8.  The opt-in caller owns the decision to exceed its nominal
+    span in order to escape the measured plateau.
+    """
+    if nominal_span < 0 or available_span < 0:
+        raise ValueError("proposal spans must be >= 0")
+    if pending_rows < 1:
+        raise ValueError("pending_rows must be >= 1")
+    span = min(nominal_span, available_span)
+    verify_rows = pending_rows + span
+    if 9 <= verify_rows <= 15:
+        long_span = 16 - pending_rows
+        if available_span >= long_span:
+            return long_span
+        return min(span, max(8 - pending_rows, 0))
+    return span
+
+
 @dataclass
 class HybridStats:
     """Per-source accounting for one prompt-lookup generation run."""
@@ -190,6 +215,9 @@ class HybridStats:
     plain_tokens: int = 0
     span_snap_cycles: int = 0
     span_snap_tokens: int = 0
+    span_extend_cycles: int = 0
+    span_extend_tokens: int = 0
+    verify_span_hist: dict[int, int] = field(default_factory=dict)
     latched: bool = False
 
     @property
