@@ -163,6 +163,38 @@ class _LifecycleModel:
 
 
 class TestPromptLookupLifecycle(unittest.TestCase):
+    def test_early_close_counts_only_yielded_tokens(self):
+        class AcceptAllProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, seq, max_span, prompt_len):
+                return [0] * max_span
+
+        from mlx_lm.prompt_lookup import HybridStats
+
+        cache = _LifecycleCache()
+        stats = HybridStats()
+        generator = prompt_lookup_generate_step(
+            mx.array([1]),
+            _LifecycleModel(),
+            prompt_cache=[cache],
+            max_tokens=16,
+            num_draft=8,
+            backend=AcceptAllProposer(),
+            stats=stats,
+        )
+        token, _logprobs, from_draft = next(generator)
+        self.assertEqual(token, 0)
+        self.assertTrue(from_draft)
+        generator.close()
+
+        self.assertEqual(stats.retrieval_proposed, 8)
+        self.assertEqual(stats.retrieval_accepted, 1)
+        self.assertEqual(stats.bonus_tokens, 0)
+        self.assertEqual(stats.total_emitted, 1)
+        self.assertEqual(cache.offset, 2)  # one prompt + one delivered token
+
     def test_cliff_aware_span_is_opt_in_and_tracks_trimming(self):
         class FixedProposer:
             def observe(self, token):
