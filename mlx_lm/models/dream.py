@@ -205,6 +205,26 @@ def _sample_logits(
     return confidence, tokens
 
 
+def _select_transfer_positions(confidence, mask_index, num_transfer, alg_temp):
+    """Select a distinct, row-local set of masked positions to transfer."""
+    scores = mx.where(mask_index, confidence, -mx.inf)
+    if alg_temp is not None and alg_temp > 0:
+        # Gumbel top-k is weighted sampling without replacement. Unlike repeated
+        # categorical draws it cannot select the same position twice, and it
+        # naturally preserves the batch dimension.
+        uniform = mx.random.uniform(shape=scores.shape)
+        uniform = mx.clip(uniform, 1e-10, 1.0 - 1e-10)
+        gumbel = -mx.log(-mx.log(uniform))
+        scores = scores / alg_temp + gumbel
+
+    order = mx.argsort(scores, axis=-1)
+    rank_selected = mx.arange(scores.shape[-1])[None, :] >= (
+        scores.shape[-1] - num_transfer[:, None]
+    )
+    transfer = mx.zeros(mask_index.shape, dtype=mx.bool_)
+    return mx.put_along_axis(transfer, order, rank_selected, axis=-1) & mask_index
+
+
 def diffusion_generate(
     model: Model,
     inputs: mx.array,
@@ -269,58 +289,29 @@ def diffusion_generate(
             transferred_counts.append(int(mx.sum(transfer).item()))
             x = mx.where(transfer, sampled, x)
         elif alg in {"maskgit_plus", "topk_margin", "entropy"}:
-            flat_mask = mask_index.reshape(-1)
             flat_logits = logits.reshape(-1, logits.shape[-1])
-            num_mask = int(mx.sum(mask_index).item())
-            flat_positions = mx.arange(flat_mask.shape[0], dtype=mx.int32)
-            masked_position_scores = mx.where(
-                flat_mask, flat_positions, flat_mask.shape[0]
-            )
-            mask_positions = mx.argpartition(
-                masked_position_scores, kth=num_mask - 1, axis=0
-            )[:num_mask]
-            mask_logits = flat_logits[mask_positions]
             confidence, sampled_tokens = _sample_logits(
-                mask_logits,
+                flat_logits,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 margin_confidence=(alg == "topk_margin"),
                 neg_entropy=(alg == "entropy"),
             )
-            num_transfer = (
-                int(num_mask * (1.0 - s / t)) if i < steps - 1 else num_mask
-            )
-            sampled = mx.full(flat_mask.shape, mask_token_id, dtype=x.dtype)
-            sampled = mx.put_along_axis(
-                sampled, mask_positions, sampled_tokens, axis=0
-            ).reshape(x.shape)
-            full_confidence = mx.full(flat_mask.shape, -mx.inf, dtype=logits.dtype)
-            full_confidence = mx.put_along_axis(
-                full_confidence, mask_positions, confidence, axis=0
-            ).reshape(x.shape)
-            if num_transfer > 0:
-                if alg_temp is None or alg_temp == 0:
-                    transfer_index = mx.argpartition(
-                        full_confidence, kth=-num_transfer, axis=-1
-                    )[:, -num_transfer:]
-                else:
-                    transfer_probs = mx.softmax(full_confidence / alg_temp, axis=-1)
-                    transfer_index = mx.random.categorical(
-                        mx.log(transfer_probs + 1e-10), shape=(num_transfer,)
-                    ).transpose(1, 0)
-                transfer = mx.zeros(x.shape, dtype=mx.bool_)
-                transfer = mx.put_along_axis(
-                    transfer,
-                    transfer_index,
-                    mx.ones(transfer_index.shape, dtype=mx.bool_),
-                    axis=-1,
-                )
-                transfer = mask_index & transfer
-                transferred_counts.append(int(mx.sum(transfer).item()))
-                x = mx.where(transfer, sampled, x)
+            confidence = confidence.reshape(x.shape)
+            sampled = sampled_tokens.reshape(x.shape)
+            num_mask = mx.sum(mask_index, axis=-1).astype(mx.int32)
+            if i < steps - 1:
+                num_transfer = (
+                    num_mask.astype(mx.float32) * (1.0 - s / t)
+                ).astype(mx.int32)
             else:
-                transferred_counts.append(0)
+                num_transfer = num_mask
+            transfer = _select_transfer_positions(
+                confidence, mask_index, num_transfer, alg_temp
+            )
+            transferred_counts.append(int(mx.sum(transfer).item()))
+            x = mx.where(transfer, sampled, x)
         else:
             raise NotImplementedError(
                 f"Dream diffusion alg '{alg}' is not implemented in this MLX port yet"

@@ -1214,7 +1214,16 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            # Parameter validation happens before completion/stream headers are
+            # emitted, so malformed requests receive a normal JSON 400 instead
+            # of a dropped connection after a streaming response has begun.
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1259,6 +1268,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("top_k", int, min_val=0)
         self._validate("min_p", (float, int), min_val=0, max_val=1)
         self._validate("num_draft_tokens", int, min_val=0)
+        for name in ("prompt_lookup_ngram", "prompt_lookup_tokens"):
+            if isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be of type int")
+        self._validate("prompt_lookup_ngram", int, min_val=0)
+        self._validate("prompt_lookup_tokens", int, min_val=1)
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))

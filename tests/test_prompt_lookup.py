@@ -14,7 +14,9 @@ import mlx.nn as nn
 from mlx_lm import load
 from mlx_lm.generate import (
     _pld_offset,
+    _pld_rewind,
     _pld_snapshot,
+    _pld_start_speculation,
     generate_step,
     prompt_lookup_generate_step,
 )
@@ -71,9 +73,134 @@ class TestCacheHelpers(unittest.TestCase):
         self.assertEqual(_pld_offset(cl), 7)
 
     def test_snapshot_rejects_unsupported_cache(self):
-        # ArraysCache (SSM/Mamba/recurrent) is unsupported and must fail loud.
+        # ArraysCache cannot be snapshotted until speculation recording is on.
         with self.assertRaises(NotImplementedError):
             _pld_snapshot([ArraysCache(size=2)])
+
+    def test_arrays_cache_snapshot_rewinds_recorded_delta(self):
+        c = ArraysCache(size=1)
+        c.cache = [mx.array([0])]
+        c.start_speculation()
+        c.record_rollback(2, lambda m: [mx.array([m])], list(c.cache))
+        snap = _pld_snapshot([c])
+        c.record_rollback(3, lambda m: [mx.array([2 + m])], [mx.array([2])])
+        _pld_rewind([c], snap)
+        self.assertEqual(sum(r[0] for r in c._rollbacks), 2)
+        self.assertEqual(c.cache[0].tolist(), [2])
+
+
+class _LifecycleCache:
+    def __init__(self, fail_start=False):
+        self.offset = 0
+        self.speculating = False
+        self.fail_start = fail_start
+        self.start_offsets = []
+        self.stop_calls = 0
+
+    @property
+    def state(self):
+        return []
+
+    def start_speculation(self, rollback_window=None):
+        self.start_offsets.append(self.offset)
+        self.speculating = True
+        if self.fail_start:
+            raise RuntimeError("start failed")
+
+    def stop_speculation(self):
+        self.stop_calls += 1
+        self.speculating = False
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.offset -= n
+        return n
+
+
+class _LifecycleModel:
+    def __init__(self, fail_calls=()):
+        self.calls = []
+        self.fail_calls = set(fail_calls)
+
+    def __call__(self, x, cache=None):
+        call_number = len(self.calls) + 1
+        self.calls.append(cache[0].speculating)
+        if call_number in self.fail_calls:
+            raise RuntimeError(f"model call {call_number} failed")
+        cache[0].offset += x.shape[-1]
+        return mx.zeros((x.shape[0], x.shape[1], 8))
+
+
+class TestPromptLookupLifecycle(unittest.TestCase):
+    def test_speculation_starts_after_prompt_prefill(self):
+        cache = _LifecycleCache()
+        model = _LifecycleModel()
+        gen = prompt_lookup_generate_step(
+            mx.array([1, 2, 3]), model, prompt_cache=[cache], max_tokens=2
+        )
+        next(gen)
+        gen.close()
+        self.assertEqual(model.calls[0], False)
+        self.assertTrue(all(model.calls[i] for i in range(1, len(model.calls))))
+        self.assertEqual(cache.start_offsets, [2])
+        self.assertFalse(cache.speculating)
+
+    def test_validation_and_proposer_errors_do_not_start_speculation(self):
+        for prompt, backend in ((mx.array([]), "ngram"), (mx.array([1]), "bad")):
+            cache = _LifecycleCache()
+            with self.assertRaises(ValueError):
+                list(
+                    prompt_lookup_generate_step(
+                        prompt, _LifecycleModel(), prompt_cache=[cache],
+                        backend=backend,
+                    )
+                )
+            self.assertEqual(cache.start_offsets, [])
+            self.assertFalse(cache.speculating)
+
+    def test_prefill_error_does_not_start_speculation(self):
+        cache = _LifecycleCache()
+        with self.assertRaises(RuntimeError):
+            list(
+                prompt_lookup_generate_step(
+                    mx.array([1, 2]), _LifecycleModel(fail_calls={1}),
+                    prompt_cache=[cache],
+                )
+            )
+        self.assertEqual(cache.start_offsets, [])
+        self.assertFalse(cache.speculating)
+
+    def test_loop_and_reconciliation_errors_stop_speculation(self):
+        loop_cache = _LifecycleCache()
+        with self.assertRaises(RuntimeError):
+            list(
+                prompt_lookup_generate_step(
+                    mx.array([1]), _LifecycleModel(fail_calls={1, 2}),
+                    prompt_cache=[loop_cache],
+                )
+            )
+        self.assertFalse(loop_cache.speculating)
+        self.assertGreater(loop_cache.stop_calls, 0)
+
+        reconcile_cache = _LifecycleCache()
+        gen = prompt_lookup_generate_step(
+            mx.array([1]), _LifecycleModel(fail_calls={2}),
+            prompt_cache=[reconcile_cache], max_tokens=2,
+        )
+        next(gen)
+        with self.assertRaises(RuntimeError):
+            gen.close()
+        self.assertFalse(reconcile_cache.speculating)
+        self.assertGreater(reconcile_cache.stop_calls, 0)
+
+    def test_partial_start_failure_stops_all_caches(self):
+        caches = [_LifecycleCache(), _LifecycleCache(fail_start=True)]
+        with self.assertRaises(RuntimeError):
+            _pld_start_speculation(caches, 8)
+        self.assertTrue(all(not c.speculating for c in caches))
+        self.assertTrue(all(c.stop_calls > 0 for c in caches))
 
 
 class _TinyCacheListModel(nn.Module):

@@ -41,6 +41,8 @@ class DummyModelProvider:
                 "trust_remote_code": False,
                 "draft_model": None,
                 "num_draft_tokens": 3,
+                "prompt_lookup_ngram": 0,
+                "prompt_lookup_tokens": 8,
                 "temp": 0.0,
                 "top_p": 1.0,
                 "top_k": 0,
@@ -206,6 +208,32 @@ class TestServer(unittest.TestCase):
             first_text,
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
+
+    def test_prompt_lookup_parameters_reject_invalid_values_before_streaming(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        invalid = (
+            ("prompt_lookup_ngram", "3"),
+            ("prompt_lookup_ngram", True),
+            ("prompt_lookup_ngram", -1),
+            ("prompt_lookup_tokens", "8"),
+            ("prompt_lookup_tokens", False),
+            ("prompt_lookup_tokens", 0),
+            ("prompt_lookup_tokens", -1),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name, value=value):
+                response = requests.post(
+                    url,
+                    json={
+                        "model": "default_model",
+                        "prompt": "hello",
+                        "stream": True,
+                        name: value,
+                    },
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.headers["Content-Type"], "application/json")
+                self.assertIn(name, response.json()["error"])
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"

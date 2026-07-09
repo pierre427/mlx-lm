@@ -906,31 +906,103 @@ def _pld_snapshot(caches):
       pushes the cache past the window, a later trim()-rewind desyncs the buffer
       from the mask and crashes attention (mask K-len != cached K-len). Copying is
       always correct.
+    - ArraysCache: snapshotted by the length of its recorded rollback window.
+      Rewind trims the forward delta recorded by recurrent layers while
+      speculation mode is active.
     - CacheList: recursed element-wise.
-    Any other cache type (e.g. ArraysCache for SSM/Mamba models) is unsupported;
-    prompt-lookup decoding raises rather than risk a silently-wrong rewind."""
+    Any other cache type is unsupported; prompt-lookup decoding raises rather
+    than risk a silently-wrong rewind."""
+    def array_rollback_total(c):
+        return sum(r[0] for r in getattr(c, "_rollbacks", ()))
+
     def snap_one(c):
         if isinstance(c, CacheList):
             return ("list", [snap_one(sub) for sub in c.caches])
+        if isinstance(c, ArraysCache):
+            if not c.is_trimmable():
+                raise NotImplementedError(
+                    "prompt-lookup decoding requires ArraysCache speculation "
+                    "recording to be active."
+                )
+            return ("array_trim", array_rollback_total(c))
         if isinstance(c, RotatingKVCache):
             k = None if c.keys is None else mx.array(c.keys)
             v = None if c.values is None else mx.array(c.values)
             return ("restore", k, v, c.offset, getattr(c, "_idx", None))
         if isinstance(c, KVCache):
             return ("trim", c.offset)
+        if hasattr(c, "offset") and hasattr(c, "trim"):
+            return ("trim", c.offset)
         raise NotImplementedError(
             f"prompt-lookup decoding does not support cache type "
             f"'{type(c).__name__}'. Supported: KVCache, RotatingKVCache (and "
-            "CacheList of those). Disable prompt_lookup for this model."
+            "rollback-capable ArraysCache / CacheList of those). Disable "
+            "prompt_lookup for this model."
         )
     return [snap_one(c) for c in caches]
 
 
+def _pld_validate_caches(caches):
+    """Validate PLD rollback support without enabling speculation."""
+
+    def validate_one(c):
+        if isinstance(c, CacheList):
+            for sub in c.caches:
+                validate_one(sub)
+        elif isinstance(c, (ArraysCache, RotatingKVCache, KVCache)):
+            return
+        elif not (hasattr(c, "offset") and hasattr(c, "trim")):
+            raise NotImplementedError(
+                f"prompt-lookup decoding does not support cache type "
+                f"'{type(c).__name__}'. Supported: KVCache, RotatingKVCache "
+                "(and rollback-capable ArraysCache / CacheList of those). "
+                "Disable prompt_lookup for this model."
+            )
+
+    for c in caches:
+        validate_one(c)
+
+
+def _pld_stop_speculation(caches):
+    """Stop speculation on every cache, even if one cleanup hook fails."""
+    first_error = None
+    for c in caches:
+        try:
+            c.stop_speculation()
+        except Exception as e:
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        raise first_error
+
+
+def _pld_start_speculation(caches, rollback_window):
+    try:
+        for c in caches:
+            try:
+                c.start_speculation(rollback_window=rollback_window)
+            except TypeError:
+                c.start_speculation()
+    except Exception:
+        # A later cache may fail after earlier caches have started. Never leak
+        # their rollback buffers on this partial-setup path.
+        try:
+            _pld_stop_speculation(caches)
+        except Exception:
+            pass
+        raise
+
+
 def _pld_rewind(caches, snaps):
+    def array_rollback_total(c):
+        return sum(r[0] for r in getattr(c, "_rollbacks", ()))
+
     def rewind_one(c, s):
         if s[0] == "list":
             for sub, subsnap in zip(c.caches, s[1]):
                 rewind_one(sub, subsnap)
+        elif s[0] == "array_trim":
+            c.trim(array_rollback_total(c) - s[1])
         elif s[0] == "trim":
             c.trim(c.offset - s[1])
         else:
@@ -946,6 +1018,13 @@ def _pld_offset(c):
     """Logical token offset of a possibly-nested cache leaf. A per-layer
     ``CacheList`` has no offset of its own; its sub-caches advance together, so
     descend to the first offset-bearing sub-cache."""
+    if isinstance(c, (list, tuple)):
+        for item in c:
+            try:
+                return _pld_offset(item)
+            except AttributeError:
+                continue
+        raise AttributeError("no offset-bearing cache leaf found")
     while isinstance(c, CacheList):
         c = next((s for s in c.caches if hasattr(s, "offset")), c.caches[0])
     return c.offset
@@ -1005,8 +1084,8 @@ def prompt_lookup_generate_step(
     # Validate cache types up front so unsupported models (e.g. ArraysCache/SSM)
     # fail loud immediately, and record the base offset so a non-empty (reused)
     # cache's existing prefix is preserved by the end-of-run reconciliation.
-    _pld_snapshot(prompt_cache)
-    base_offset = _pld_offset(prompt_cache[0])
+    _pld_validate_caches(prompt_cache)
+    base_offset = _pld_offset(prompt_cache)
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
     stats = stats if stats is not None else HybridStats()
@@ -1053,6 +1132,10 @@ def prompt_lookup_generate_step(
     latched = False
     prompt_len = len(seq)
     last_snap = None  # snapshot before the most recent proposal forward
+    # Begin recording recurrent/rotating rollback state only after prompt
+    # prefill. Starting earlier retains prompt-sized replay closures in
+    # ArraysCache and can cause a large transient memory spike.
+    _pld_start_speculation(prompt_cache, max(64, num_draft + 2))
     try:
         while (max_tokens < 0 or generated < max_tokens) and not latched:
             stats.cycles += 1
@@ -1137,31 +1220,33 @@ def prompt_lookup_generate_step(
                 stats.plain_tokens += 1
                 yield int(tok), lp, False
     finally:
-        # Leave prompt_cache representing EXACTLY prompt + emitted tokens (like
-        # generate_step), even though PLD forwards in batches and may stop mid-batch
-        # (e.g. caller breaks on EOS). This keeps callers that persist/reuse the
-        # cache (e.g. an LRU prompt cache) correct.
-        #   behind -> forward the missing emitted tail.
-        #   ahead  -> the extra tokens came from the last proposal forward, so undo
-        #     it via that snapshot (a copy-restore that is safe for rotating caches,
-        #     unlike trim past the window) and forward the emitted tail instead.
-        # Offsets are absolute (include any reused-cache base); seq is local
-        # (prompt+emitted), so index the missing tail by (off - base_offset).
-        target = base_offset + prompt_len + generated
-        off = _pld_offset(prompt_cache[0])
-        if off > target and last_snap is not None:
-            _pld_rewind(prompt_cache, last_snap)
-            off = _pld_offset(prompt_cache[0])
-        if off < target:
-            miss = seq[off - base_offset : prompt_len + generated]
-            if miss:
-                with mx.stream(generation_stream):
-                    model(mx.array(miss)[None], cache=prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
-        elif off > target:
-            for c in prompt_cache:
-                if c.is_trimmable():
-                    c.trim(off - target)
+        try:
+            # Leave prompt_cache representing EXACTLY prompt + emitted tokens
+            # (like generate_step), even though PLD forwards in batches and may
+            # stop mid-batch (e.g. caller breaks on EOS). This keeps callers that
+            # persist/reuse the cache (e.g. an LRU prompt cache) correct.
+            #   behind -> forward the missing emitted tail.
+            #   ahead  -> undo the last proposal forward, then forward the
+            #     emitted tail instead.
+            target = base_offset + prompt_len + generated
+            off = _pld_offset(prompt_cache)
+            if off > target and last_snap is not None:
+                _pld_rewind(prompt_cache, last_snap)
+                off = _pld_offset(prompt_cache)
+            if off < target:
+                miss = seq[off - base_offset : prompt_len + generated]
+                if miss:
+                    with mx.stream(generation_stream):
+                        model(mx.array(miss)[None], cache=prompt_cache)
+                        mx.eval([c.state for c in prompt_cache])
+            elif off > target:
+                for c in prompt_cache:
+                    if c.is_trimmable():
+                        c.trim(off - target)
+        finally:
+            # Reconciliation itself may fail (for example, a model error while
+            # forwarding the missing tail). Rollback recording must still stop.
+            _pld_stop_speculation(prompt_cache)
 
 
 def stream_generate(
@@ -1239,6 +1324,7 @@ def stream_generate(
             adaptive=prompt_lookup.get("adaptive", False),
             warmup=prompt_lookup.get("warmup", 48),
             gate=prompt_lookup.get("gate", 0.12),
+            stats=prompt_lookup.get("stats"),
             history_prompt=prompt_lookup.get("history_prompt"),
             **kwargs,
         )
