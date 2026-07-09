@@ -37,9 +37,26 @@ HybridProposerStats = _proto.HybridProposerStats
 make_hybrid_proposer = _proto.make_hybrid_proposer
 NgramProposer = _pl.NgramProposer
 SuffixAutomatonProposer = _pl.SuffixAutomatonProposer
+snap_proposal_around_verify_cliff = _pl.snap_proposal_around_verify_cliff
 
 
 class TestDatastoreProposer(unittest.TestCase):
+    def test_cliff_aware_span_policy_is_opt_in_safe(self):
+        proposal = list(range(32))
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:8]), proposal[:7]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:14]), proposal[:7]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:15]), proposal[:15]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:7], pending_rows=2),
+            proposal[:6],
+        )
+
     def test_returns_datastore_continuation_for_seeded_prefix(self):
         # Datastore holds the pattern "10 20 30 40 50". A running sequence whose
         # tail is "20 30" should retrieve the datastore continuation "40 50 ...".

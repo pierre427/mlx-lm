@@ -1045,6 +1045,7 @@ def prompt_lookup_generate_step(
     ngram_min: int = 1,
     prompt_only: bool = False,
     adaptive: bool = False,
+    cliff_aware_span: bool = False,
     warmup: int = 48,
     gate: float = 0.12,
     stats: Optional[Any] = None,
@@ -1077,7 +1078,12 @@ def prompt_lookup_generate_step(
     uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
     the full history, while target verification forwards only the uncached tail.
     """
-    from .prompt_lookup import HybridStats, NgramProposer, make_proposer
+    from .prompt_lookup import (
+        HybridStats,
+        NgramProposer,
+        make_proposer,
+        snap_proposal_around_verify_cliff,
+    )
 
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(model)
@@ -1150,6 +1156,12 @@ def prompt_lookup_generate_step(
                 if (span > 0 and len(pending) <= 2)
                 else []
             )
+            if cliff_aware_span and prop:
+                raw_prop_len = len(prop)
+                prop = snap_proposal_around_verify_cliff(prop, len(pending))
+                if len(prop) != raw_prop_len:
+                    stats.span_snap_cycles += 1
+                    stats.span_snap_tokens += raw_prop_len - len(prop)
             x = pending + prop
             snaps = _pld_snapshot(prompt_cache) if prop else None
             if snaps is not None:
@@ -1322,6 +1334,7 @@ def stream_generate(
             ngram_min=prompt_lookup.get("ngram_min", 1),
             prompt_only=prompt_lookup.get("prompt_only", False),
             adaptive=prompt_lookup.get("adaptive", False),
+            cliff_aware_span=prompt_lookup.get("cliff_aware_span", False),
             warmup=prompt_lookup.get("warmup", 48),
             gate=prompt_lookup.get("gate", 0.12),
             stats=prompt_lookup.get("stats"),

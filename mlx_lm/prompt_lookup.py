@@ -157,6 +157,26 @@ def make_proposer(spec):
     raise ValueError(f"unknown prompt-lookup backend {spec!r}")
 
 
+def snap_proposal_around_verify_cliff(
+    proposal: Sequence[int], pending_rows: int = 1
+) -> List[int]:
+    """Avoid the measured M5 verify-batch cliff without inventing tokens.
+
+    Target verification forwards ``pending_rows + len(proposal)`` rows.  Local
+    measurements show that rows 9..15 pay the same attention plateau as a much
+    longer batch, so a proposal that would land in that band is shortened to
+    keep the verify batch at eight rows.  Proposals already large enough to
+    reach 16 rows are preserved.  This is deliberately opt-in at the generator
+    boundary because the crossover is hardware/model dependent.
+    """
+    if pending_rows < 1:
+        raise ValueError("pending_rows must be >= 1")
+    verify_rows = pending_rows + len(proposal)
+    if 9 <= verify_rows <= 15:
+        return list(proposal[: max(8 - pending_rows, 0)])
+    return list(proposal)
+
+
 @dataclass
 class HybridStats:
     """Per-source accounting for one prompt-lookup generation run."""
@@ -168,6 +188,8 @@ class HybridStats:
     retrieval_accepted: int = 0
     bonus_tokens: int = 0
     plain_tokens: int = 0
+    span_snap_cycles: int = 0
+    span_snap_tokens: int = 0
     latched: bool = False
 
     @property

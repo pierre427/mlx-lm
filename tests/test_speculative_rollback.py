@@ -5,6 +5,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step, speculative_generate_step
+from mlx_lm.hybrid_speculative import _start_speculation_or_cleanup
 from mlx_lm.models import cache, llama, qwen3_next
 
 QWEN3_NEXT_ARGS = {
@@ -50,6 +51,46 @@ def make_hybrid(seed=0):
 
 
 class TestSpeculativeRollback(unittest.TestCase):
+
+    def test_hybrid_setup_failure_cleans_every_cache(self):
+        class LifecycleCache:
+            def __init__(self, supports_trim=True, fail_start=False):
+                self.supports_trim = supports_trim
+                self.fail_start = fail_start
+                self.speculating = False
+                self.stop_calls = 0
+
+            def start_speculation(self):
+                self.speculating = True
+                if self.fail_start:
+                    raise RuntimeError("start failed")
+
+            def stop_speculation(self):
+                self.speculating = False
+                self.stop_calls += 1
+
+            def is_trimmable(self):
+                return self.speculating and self.supports_trim
+
+        target = LifecycleCache()
+        unsupported_draft = LifecycleCache(supports_trim=False)
+        with self.assertRaisesRegex(ValueError, "needs rollback"):
+            _start_speculation_or_cleanup(
+                [target, unsupported_draft],
+                [target, unsupported_draft],
+                "needs rollback",
+            )
+        self.assertTrue(all(not c.speculating for c in (target, unsupported_draft)))
+        self.assertTrue(all(c.stop_calls == 1 for c in (target, unsupported_draft)))
+
+        first = LifecycleCache()
+        failing = LifecycleCache(fail_start=True)
+        with self.assertRaisesRegex(RuntimeError, "start failed"):
+            _start_speculation_or_cleanup(
+                [first, failing], [first, failing], "needs rollback"
+            )
+        self.assertTrue(all(not c.speculating for c in (first, failing)))
+        self.assertTrue(all(c.stop_calls == 1 for c in (first, failing)))
 
     def test_rollback_is_exact(self):
         # Tail independence: feed two verify chunks sharing the first m tokens

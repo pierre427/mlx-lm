@@ -26,6 +26,7 @@ from mlx_lm.prompt_lookup import (
     SuffixAutomaton,
     SuffixAutomatonProposer,
     make_proposer,
+    snap_proposal_around_verify_cliff,
 )
 from mlx_lm.sample_utils import make_sampler
 
@@ -56,6 +57,28 @@ class TestProposers(unittest.TestCase):
         self.assertEqual(len(p.sam), 0)
         with self.assertRaises(ValueError):
             make_proposer("nope")
+
+    def test_verify_cliff_span_snapping(self):
+        proposal = list(range(32))
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:7]), proposal[:7]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:8]), proposal[:7]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:14]), proposal[:7]
+        )
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:15]), proposal[:15]
+        )
+        # Two pending rows need a six-token proposal to stay at eight total.
+        self.assertEqual(
+            snap_proposal_around_verify_cliff(proposal[:7], pending_rows=2),
+            proposal[:6],
+        )
+        with self.assertRaises(ValueError):
+            snap_proposal_around_verify_cliff(proposal, pending_rows=0)
 
 
 class TestCacheHelpers(unittest.TestCase):
@@ -122,11 +145,13 @@ class _LifecycleCache:
 class _LifecycleModel:
     def __init__(self, fail_calls=()):
         self.calls = []
+        self.input_lengths = []
         self.fail_calls = set(fail_calls)
 
     def __call__(self, x, cache=None):
         call_number = len(self.calls) + 1
         self.calls.append(cache[0].speculating)
+        self.input_lengths.append(x.shape[-1])
         if call_number in self.fail_calls:
             raise RuntimeError(f"model call {call_number} failed")
         cache[0].offset += x.shape[-1]
@@ -134,6 +159,40 @@ class _LifecycleModel:
 
 
 class TestPromptLookupLifecycle(unittest.TestCase):
+    def test_cliff_aware_span_is_opt_in_and_tracks_trimming(self):
+        class FixedProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, seq, max_span, prompt_len):
+                return [0] * min(max_span, 10)
+
+        from mlx_lm.prompt_lookup import HybridStats
+
+        default_cache = _LifecycleCache()
+        default_model = _LifecycleModel()
+        default_gen = prompt_lookup_generate_step(
+            mx.array([1]), default_model, prompt_cache=[default_cache],
+            max_tokens=16, num_draft=10, backend=FixedProposer(),
+        )
+        next(default_gen)
+        default_gen.close()
+        self.assertEqual(default_model.input_lengths[0], 11)
+
+        stats = HybridStats()
+        snapped_cache = _LifecycleCache()
+        snapped_model = _LifecycleModel()
+        snapped_gen = prompt_lookup_generate_step(
+            mx.array([1]), snapped_model, prompt_cache=[snapped_cache],
+            max_tokens=16, num_draft=10, backend=FixedProposer(),
+            cliff_aware_span=True, stats=stats,
+        )
+        next(snapped_gen)
+        snapped_gen.close()
+        self.assertEqual(snapped_model.input_lengths[0], 8)
+        self.assertEqual(stats.span_snap_cycles, 1)
+        self.assertEqual(stats.span_snap_tokens, 3)
+
     def test_speculation_starts_after_prompt_prefill(self):
         cache = _LifecycleCache()
         model = _LifecycleModel()

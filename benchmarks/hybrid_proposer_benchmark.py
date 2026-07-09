@@ -268,6 +268,7 @@ def _run_once(
         backend=backend,
         num_draft=args.num_draft,
         adaptive=args.adaptive_latch,
+        cliff_aware_span=args.cliff_aware_span,
         warmup=args.warmup,
         gate=args.gate,
         stats=generation_stats,
@@ -342,6 +343,7 @@ def main() -> None:
     parser.add_argument("--datastore-cooldown", type=int, default=0)
     parser.add_argument("--datastore-warmup-tokens", type=int, default=0)
     parser.add_argument("--adaptive-span", action="store_true")
+    parser.add_argument("--cliff-aware-span", action="store_true")
     parser.add_argument("--span-scale", type=float, default=1.0)
     parser.add_argument("--min-span", type=int, default=1)
     parser.add_argument("--adaptive-latch", action="store_true")

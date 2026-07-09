@@ -57,6 +57,25 @@ from .tokenizer_utils import TokenizerWrapper
 _GREEDY = make_sampler(temp=0.0)
 
 
+def _start_speculation_or_cleanup(caches, required_caches, error_message):
+    """Enable rollback atomically and fail without leaking cache state."""
+    try:
+        for c in caches:
+            c.start_speculation()
+        if not can_trim_prompt_cache(required_caches):
+            raise ValueError(error_message)
+    except Exception:
+        # Validation happens after start because recurrent caches only become
+        # trimmable while recording rollback.  A failed capability gate or a
+        # later cache's start failure must still unwind every earlier cache.
+        for c in caches:
+            try:
+                c.stop_speculation()
+            except Exception:
+                pass
+        raise
+
+
 class SuffixAutomaton:
     """Online suffix automaton over token ids.
 
@@ -358,16 +377,17 @@ def hybrid_generate_step(
     # no-op for plain KV caches. Done post-prefill so we never stash prompt-sized
     # recurrent state — only the small per-cycle verify windows.
     spec_caches = list(model_cache) + (list(draft_cache) if use_draft else [])
-    for c in spec_caches:
-        c.start_speculation()
     # Rejected proposals must be trimmable; trim_prompt_cache silently no-ops on a
     # non-trimmable cache, which would leave rejected tokens committed and corrupt
-    # the output. Fail loudly instead (mirrors speculative_generate_step).
-    if not can_trim_prompt_cache(model_cache):
-        raise ValueError(
+    # the output. Both target and draft caches may be trimmed, so validate both.
+    _start_speculation_or_cleanup(
+        spec_caches,
+        spec_caches,
+        (
             "hybrid speculative decoding requires a trimmable prompt cache "
             "(recurrent layers need supports_speculative_rollback)."
-        )
+        ),
+    )
 
     # Tokens committed to `history` but not yet in each model's KV cache.
     pending_target: List[int] = [int(t) for t in y.tolist()]
@@ -520,13 +540,14 @@ def adaptive_pld_generate_step(
             mx.eval([c.state for c in cache])
             y = y[n:]
             mx.clear_cache()
-    for c in cache:
-        c.start_speculation()
-    if not can_trim_prompt_cache(cache):
-        raise ValueError(
+    _start_speculation_or_cleanup(
+        cache,
+        cache,
+        (
             "adaptive PLD requires a trimmable prompt cache "
             "(recurrent layers need supports_speculative_rollback)."
-        )
+        ),
+    )
 
     history_src = history_prompt if history_prompt is not None else prompt
     history: List[int] = [int(t) for t in history_src.tolist()]
@@ -685,13 +706,14 @@ def self_mtp_generate_step(
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
         first_lp = _temperature_logprobs(model.logits(seed_h)[0, -1], sampling_temp)
         cur = _sample_from_logprobs(first_lp, sampling_temp)
-    for c in cache:
-        c.start_speculation()
-    if not can_trim_prompt_cache(cache):
-        raise ValueError(
+    _start_speculation_or_cleanup(
+        cache,
+        cache,
+        (
             "self-MTP decoding requires a trimmable prompt cache "
             "(recurrent layers need supports_speculative_rollback)."
-        )
+        ),
+    )
 
     try:
         yield cur, first_lp, False
