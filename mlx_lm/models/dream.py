@@ -175,27 +175,33 @@ def _sample_logits(
     temperature: float = 0.0,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    margin_confidence: bool = False,
+    neg_entropy: bool = False,
 ):
     if temperature == 0.0:
         tokens = mx.argmax(logits, axis=-1)
-        confidence = mx.max(mx.softmax(logits, axis=-1), axis=-1)
-        return confidence, tokens
+    else:
+        logits = logits / temperature
+        if top_k is not None and top_k > 0 and top_k < logits.shape[-1]:
+            kth = mx.sort(logits, axis=-1)[:, -top_k]
+            logits = mx.where(logits < kth[:, None], -mx.inf, logits)
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_idx = mx.argsort(logits, axis=-1)
+            sorted_logits = mx.take_along_axis(logits, sorted_idx, axis=-1)
+            sorted_probs = mx.softmax(sorted_logits, axis=-1)
+            keep = mx.cumsum(sorted_probs, axis=-1) >= (1.0 - top_p)
+            sorted_logits = mx.where(keep, sorted_logits, -mx.inf)
+            logits = mx.put_along_axis(logits, sorted_idx, sorted_logits, axis=-1)
+        tokens = mx.random.categorical(logits)
 
-    logits = logits / temperature
-    if top_k is not None and top_k > 0 and top_k < logits.shape[-1]:
-        kth = mx.sort(logits, axis=-1)[:, -top_k]
-        logits = mx.where(logits < kth[:, None], -mx.inf, logits)
-    if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_idx = mx.argsort(logits, axis=-1)
-        sorted_logits = mx.take_along_axis(logits, sorted_idx, axis=-1)
-        sorted_probs = mx.softmax(sorted_logits, axis=-1)
-        keep = mx.cumsum(sorted_probs, axis=-1) >= (1.0 - top_p)
-        sorted_logits = mx.where(keep, sorted_logits, -mx.inf)
-        logits = mx.put_along_axis(logits, sorted_idx, sorted_logits, axis=-1)
-
-    tokens = mx.random.categorical(logits)
     probs = mx.softmax(logits, axis=-1)
     confidence = mx.take_along_axis(probs, tokens[:, None], axis=-1).squeeze(-1)
+    if margin_confidence:
+        sorted_probs = mx.sort(probs, axis=-1)
+        confidence = sorted_probs[:, -1] - sorted_probs[:, -2]
+    if neg_entropy:
+        log_probs = mx.log(probs + 1e-10)
+        confidence = mx.sum(probs * log_probs, axis=-1)
     return confidence, tokens
 
 
@@ -262,6 +268,59 @@ def diffusion_generate(
             transfer = mask_index & transfer
             transferred_counts.append(int(mx.sum(transfer).item()))
             x = mx.where(transfer, sampled, x)
+        elif alg in {"maskgit_plus", "topk_margin", "entropy"}:
+            flat_mask = mask_index.reshape(-1)
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            num_mask = int(mx.sum(mask_index).item())
+            flat_positions = mx.arange(flat_mask.shape[0], dtype=mx.int32)
+            masked_position_scores = mx.where(
+                flat_mask, flat_positions, flat_mask.shape[0]
+            )
+            mask_positions = mx.argpartition(
+                masked_position_scores, kth=num_mask - 1, axis=0
+            )[:num_mask]
+            mask_logits = flat_logits[mask_positions]
+            confidence, sampled_tokens = _sample_logits(
+                mask_logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                margin_confidence=(alg == "topk_margin"),
+                neg_entropy=(alg == "entropy"),
+            )
+            num_transfer = (
+                int(num_mask * (1.0 - s / t)) if i < steps - 1 else num_mask
+            )
+            sampled = mx.full(flat_mask.shape, mask_token_id, dtype=x.dtype)
+            sampled = mx.put_along_axis(
+                sampled, mask_positions, sampled_tokens, axis=0
+            ).reshape(x.shape)
+            full_confidence = mx.full(flat_mask.shape, -mx.inf, dtype=logits.dtype)
+            full_confidence = mx.put_along_axis(
+                full_confidence, mask_positions, confidence, axis=0
+            ).reshape(x.shape)
+            if num_transfer > 0:
+                if alg_temp is None or alg_temp == 0:
+                    transfer_index = mx.argpartition(
+                        full_confidence, kth=-num_transfer, axis=-1
+                    )[:, -num_transfer:]
+                else:
+                    transfer_probs = mx.softmax(full_confidence / alg_temp, axis=-1)
+                    transfer_index = mx.random.categorical(
+                        mx.log(transfer_probs + 1e-10), shape=(num_transfer,)
+                    ).transpose(1, 0)
+                transfer = mx.zeros(x.shape, dtype=mx.bool_)
+                transfer = mx.put_along_axis(
+                    transfer,
+                    transfer_index,
+                    mx.ones(transfer_index.shape, dtype=mx.bool_),
+                    axis=-1,
+                )
+                transfer = mask_index & transfer
+                transferred_counts.append(int(mx.sum(transfer).item()))
+                x = mx.where(transfer, sampled, x)
+            else:
+                transferred_counts.append(0)
         else:
             raise NotImplementedError(
                 f"Dream diffusion alg '{alg}' is not implemented in this MLX port yet"
@@ -274,5 +333,7 @@ def diffusion_generate(
             "transferred_total": int(sum(transferred_counts)),
             "tokens_per_step_mean": float(generated / max(1, forward_count)),
             "parallel_threshold": parallel_threshold,
+            "alg": alg,
+            "alg_temp": alg_temp,
         }
     return x
