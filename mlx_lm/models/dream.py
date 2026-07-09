@@ -212,6 +212,8 @@ def diffusion_generate(
     temperature: float = 0.0,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    parallel_threshold: Optional[float] = None,
+    return_stats: bool = False,
 ):
     """Dream denoising loop in MLX.
 
@@ -228,10 +230,13 @@ def diffusion_generate(
     )
     x = mx.concatenate([inputs, pad], axis=1)
     timesteps = mx.linspace(1.0, eps, steps + 1)
+    forward_count = 0
+    transferred_counts = []
 
     for i in range(steps):
         mask_index = x == mask_token_id
         logits = model(x)
+        forward_count += 1
         logits = mx.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
         if mx.all(~mask_index).item():
             break
@@ -240,18 +245,34 @@ def diffusion_generate(
         s = timesteps[i + 1].item()
         if alg == "origin":
             p_transfer = 1.0 - s / t if i < steps - 1 else 1.0
-            _, sampled = _sample_logits(
+            confidence, sampled = _sample_logits(
                 logits.reshape(-1, logits.shape[-1]),
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
             )
             sampled = sampled.reshape(x.shape)
-            transfer = mx.random.uniform(shape=x.shape) < p_transfer
-            x = mx.where(mask_index & transfer, sampled, x)
+            if parallel_threshold is None:
+                transfer = mx.random.uniform(shape=x.shape) < p_transfer
+            else:
+                confidence = confidence.reshape(x.shape)
+                transfer = confidence >= parallel_threshold
+                if i == steps - 1:
+                    transfer = mx.ones_like(transfer)
+            transfer = mask_index & transfer
+            transferred_counts.append(int(mx.sum(transfer).item()))
+            x = mx.where(transfer, sampled, x)
         else:
             raise NotImplementedError(
                 f"Dream diffusion alg '{alg}' is not implemented in this MLX port yet"
             )
 
+    if return_stats:
+        generated = max(1, int(mx.sum(x[:, inputs.shape[1] :] != mask_token_id).item()))
+        return x, {
+            "forwards": forward_count,
+            "transferred_total": int(sum(transferred_counts)),
+            "tokens_per_step_mean": float(generated / max(1, forward_count)),
+            "parallel_threshold": parallel_threshold,
+        }
     return x
