@@ -16,8 +16,18 @@ from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Thread
-from typing import (Any, Callable, Dict, List, Literal, NamedTuple, Optional,
-                    Sequence, Tuple, Union)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -401,8 +411,12 @@ def _make_sampler(args, tokenizer):
     # Memoize on the sampling parameters so concurrent requests with identical
     # settings share one sampler object. GenerationBatch groups rows by sampler
     # identity, letting a whole batch sample in a single vectorized call.
+    xtc_special_tokens = (
+        tokenizer.eos_token_id,
+        tuple(tokenizer.encode("\n")),
+    )
     key = (
-        id(tokenizer),
+        xtc_special_tokens,
         args.sampling.temperature,
         args.sampling.top_p,
         args.sampling.top_k,
