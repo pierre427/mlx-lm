@@ -425,6 +425,8 @@ def generate(
     remask_refine: bool = False,
     remask_conf: float = 0.9,
     remask_rounds: int = 2,
+    prefix_snapshot: Optional[dict] = None,
+    return_prefix_snapshot: bool = False,
 ):
     """Diffusion (MDM) generation for LLaDA.
 
@@ -589,14 +591,109 @@ def generate(
     _active_kv = None
     _active_kv_span = (0, 0)
 
+    # ---- cross-request prompt-prefix snapshot (opt-in) ----------------------
+    # {"layers": [(K,V) per layer], "prefix_len": int, "token_hash": str}.
+    # Injected ONLY when prefix_len == this prompt's length AND the token hash
+    # matches (never-stale-HIT: mismatch = MISS -> normal full prime).
+    # Snapshot arrays are consumed read-only via mx.concatenate (fork-safe).
+    import hashlib as _hashlib
+
+    _hash_memo: list = []
+
+    def _prompt_token_hash() -> str:
+        if not _hash_memo:  # memoized: tolist() forces a sync; do it once
+            toks = [int(v) for v in prompt.reshape(-1).tolist()]
+            _hash_memo.append(_hashlib.sha256(
+                ",".join(map(str, toks)).encode()).hexdigest()[:16])
+        return _hash_memo[0]
+
+    _prompt_len = int(prompt.shape[1]) if prompt.ndim > 1 else int(prompt.shape[0])
+    # LLaDA attention is BIDIRECTIONAL: captured prefix K/V depend on the
+    # capturing run's full sequence geometry, not just the prompt. A snapshot
+    # is valid only for an identical decode geometry — anything else is a MISS
+    # (never-stale-HIT), or the injected prefix would silently condition the
+    # generation on a different masked-tail shape.
+    _geometry = {"gen_length": int(gen_length),
+                 "block_length": int(block_length),
+                 "dual_cache": bool(dual_cache),
+                 "mask_id": int(mask_id),
+                 "cfg_scale": float(cfg_scale)}
+    _snapshot_valid = False
+    if prefix_snapshot is not None and kv_cache:
+        try:
+            _snapshot_valid = (
+                int(prefix_snapshot.get("prefix_len", -1)) == _prompt_len
+                and prefix_snapshot.get("token_hash") == _prompt_token_hash()
+                and prefix_snapshot.get("geometry") == _geometry
+            )
+        except Exception:
+            _snapshot_valid = False
+    _snapshot_used = False
+    _captured_snapshot = None
+
+    def _maybe_capture_prefix():
+        """After a prime whose prefix is exactly the prompt, capture it once."""
+        nonlocal _captured_snapshot
+        if (return_prefix_snapshot and _captured_snapshot is None
+                and _prefix_len == _prompt_len and _prefix_cache):
+            _captured_snapshot = {
+                "layers": [(mx.array(k), mx.array(v)) for (k, v) in _prefix_cache],
+                "prefix_len": _prefix_len,
+                "token_hash": _prompt_token_hash(),
+                "geometry": dict(_geometry),
+            }
+
+    def _prime_cache_from_snapshot(x_cur: mx.array, block_start: int,
+                                   block_end: int):
+        """Snapshot-backed PARTIAL prime (first block only): forward just the
+        tail [prefix_len, total_len) against the injected prompt-prefix K/V.
+        Prefix logit rows are zeros — the sampler never consumes them. Suffix
+        K/V (dual_cache) is sliced from the partial forward's own KVs."""
+        nonlocal _prefix_cache, _prefix_len, _suffix_cache, _suffix_start
+        nonlocal _last_full_logits, forwards, _snapshot_used
+        forwards += 1
+        _snapshot_used = True
+        plen = int(prefix_snapshot["prefix_len"])
+        _prefix_cache = list(prefix_snapshot["layers"])
+        _prefix_len = plen
+        active = x_cur[:, plen:]
+        tail_logits, kvs = model(
+            active, prefix_kv=_prefix_cache, pos_offset=plen, return_kv=True
+        )
+        if dual_cache:
+            rel = block_end - plen
+            _suffix_cache = [
+                (k[:, :, rel:, :], v[:, :, rel:, :]) for (k, v) in kvs
+            ]
+            _suffix_start = block_end
+        else:
+            _suffix_cache = None
+            _suffix_start = total_len
+        # Zero-pad prefix logit rows (never consumed by the sampler). The
+        # transient is the SAME magnitude the replaced full prime's logits
+        # would have had; the fast path's saving is the skipped prefix
+        # COMPUTE, not the logits allocation. An offset-aware logits
+        # representation would remove it but touches every consumer.
+        zeros = mx.zeros((tail_logits.shape[0], plen, tail_logits.shape[2]),
+                         tail_logits.dtype)
+        _last_full_logits = mx.concatenate([zeros, tail_logits], axis=1)
+        return _last_full_logits
+
     def _prime_cache(x_cur: mx.array, block_start: int, block_end: int):
         """Full forward over the whole ``x``; cache prefix [0, block_start) and,
         with ``dual_cache``, suffix [block_end, total_len) K/V.
 
         Returns the full-length logits (also stashed for later scatter).
+
+        First block + valid snapshot -> snapshot-backed partial prime instead.
         """
         nonlocal _prefix_cache, _prefix_len, _suffix_cache, _suffix_start
         nonlocal _last_full_logits, forwards
+        if (_snapshot_valid and not _snapshot_used
+                and block_start == _prompt_len):
+            out = _prime_cache_from_snapshot(x_cur, block_start, block_end)
+            _maybe_capture_prefix()
+            return out
         forwards += 1
         logits, kvs = model(x_cur, return_kv=True)  # kvs: per-layer (K, V) over all L
         # Slice out the fixed prefix window [0, block_start) along the seq axis.
@@ -615,6 +712,7 @@ def generate(
             _suffix_cache = None
             _suffix_start = total_len
         _last_full_logits = logits
+        _maybe_capture_prefix()
         return logits
 
     def _forward_logits_cached(x_cur: mx.array) -> mx.array:
@@ -946,6 +1044,8 @@ def generate(
     if return_stats:
         revealed = gen_length  # every gen position ends unmasked
         stats = {
+            "prefix_snapshot_used": _snapshot_used,
+            "prefix_snapshot": _captured_snapshot if return_prefix_snapshot else None,
             "forwards": forwards,
             "tokens_per_step_mean": (revealed / forwards) if forwards else 0.0,
             "steps": forwards,

@@ -53,6 +53,7 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
+from .prompt_lookup import HybridStats as _PromptLookupStatsBase
 from .prompt_lookup import plan_proposal_around_verify_cliff
 
 _GREEDY = make_sampler(temp=0.0)
@@ -173,27 +174,36 @@ class SuffixAutomaton:
         return match_len, self._first_end[v] + 1
 
 
-@dataclass
-class HybridStats:
-    """Per-source accounting for one hybrid generation run."""
+def _require_hybrid_stats(stats) -> None:
+    """F7' guard: hybrid/MTP/adaptive paths write draft_*/external_cache_*
+    fields that only hybrid_speculative.HybridStats carries. Reject a base
+    prompt_lookup stats object at ENTRY with a clear error instead of an
+    AttributeError mid-generation."""
+    if not hasattr(stats, "draft_proposed"):
+        raise TypeError(
+            "this generator needs hybrid_speculative.HybridStats (with "
+            "draft_*/external_cache_* fields); got a stats object without "
+            "them - likely prompt_lookup.HybridStats (F7' footgun)."
+        )
 
-    cycles: int = 0
-    retrieval_cycles: int = 0  # cycles whose proposal came from retrieval
+
+@dataclass
+class HybridStats(_PromptLookupStatsBase):
+    """Per-source accounting for one hybrid generation run.
+
+    Extends prompt_lookup.HybridStats (the F7' unification: shared retrieval/
+    plain/span fields are defined ONCE, there) with the draft-chain and
+    external-cache accounting the MTP paths need. isinstance-compatible with
+    the base, so a hybrid stats object can be passed anywhere the
+    prompt-lookup one is expected; the reverse (base into an MTP path) is
+    rejected early with a clear error instead of an attribute crash mid-run.
+    """
+
     draft_cycles: int = 0  # cycles whose proposal came from the draft chain
-    plain_cycles: int = 0  # cycles with no proposal (single target step)
-    retrieval_proposed: int = 0  # tokens proposed by retrieval
-    retrieval_accepted: int = 0  # ... of which the target accepted
     draft_proposed: int = 0  # tokens proposed by the draft chain
     draft_accepted: int = 0  # ... of which the target accepted
-    bonus_tokens: int = 0  # bonus/correction tokens from propose cycles
-    plain_tokens: int = 0  # tokens emitted by plain (no-proposal) cycles
     external_cache_reconciled: bool = False
     external_cache_trimmed_tokens: int = 0
-    span_snap_cycles: int = 0
-    span_snap_tokens: int = 0
-    span_extend_cycles: int = 0
-    span_extend_tokens: int = 0
-    verify_span_hist: Dict[int, int] = field(default_factory=dict)
 
     @property
     def total_emitted(self) -> int:
@@ -318,6 +328,7 @@ def hybrid_generate_step(
         raise ValueError("max_span must be >= 1")
 
     stats = stats if stats is not None else HybridStats()
+    _require_hybrid_stats(stats)
 
     y = prompt.astype(mx.uint32)
     # Use each model's own cache layout so hybrid architectures get the right
@@ -536,6 +547,7 @@ def adaptive_pld_generate_step(
     Yields ``(token, logprobs, from_retrieval)``.
     """
     stats = stats if stats is not None else HybridStats()
+    _require_hybrid_stats(stats)
     external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
@@ -718,6 +730,7 @@ def self_mtp_generate_step(
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
     stats = stats if stats is not None else HybridStats()
+    _require_hybrid_stats(stats)
     cache = make_prompt_cache(model)
 
     y = prompt.astype(mx.uint32)

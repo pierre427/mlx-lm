@@ -391,6 +391,19 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
+    if kv_bits is not None and any(
+        isinstance(c, (cache.RotatingKVCache, cache.BatchRotatingKVCache))
+        for c in prompt_cache
+    ):
+        # Fail at setup, not mid-generation: rotating caches have no
+        # quantized implementation, and max_kv_size (now honored by hybrid
+        # models like qwen3_next) produces RotatingKVCache layers.
+        raise ValueError(
+            "kv_bits cannot be combined with rotating/sliding-window caches "
+            "(RotatingKVCache quantization is not implemented). Drop kv_bits "
+            "or max_kv_size."
+        )
+
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
     quantize_cache_fn = functools.partial(
