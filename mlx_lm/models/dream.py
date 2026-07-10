@@ -250,6 +250,8 @@ def diffusion_generate(
         mask_token_id = model.args.mask_token_id
     if max_length < inputs.shape[1]:
         raise ValueError("max_length must be >= input length")
+    if steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps}")
 
     pad = mx.full(
         (inputs.shape[0], max_length - inputs.shape[1]), mask_token_id, dtype=inputs.dtype
@@ -261,11 +263,14 @@ def diffusion_generate(
 
     for i in range(steps):
         mask_index = x == mask_token_id
+        # No masked positions left: stop BEFORE running a forward so both the
+        # no-new-token input (nothing ever masked) and normal early-completion
+        # report honest zero-work stats with no extra model call.
+        if mx.all(~mask_index).item():
+            break
         logits = model(x)
         forward_count += 1
         logits = mx.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
-        if mx.all(~mask_index).item():
-            break
 
         t = timesteps[i].item()
         s = timesteps[i + 1].item()
@@ -318,11 +323,13 @@ def diffusion_generate(
             )
 
     if return_stats:
-        generated = max(1, int(mx.sum(x[:, inputs.shape[1] :] != mask_token_id).item()))
+        generated = int(mx.sum(x[:, inputs.shape[1] :] != mask_token_id).item())
         return x, {
             "forwards": forward_count,
             "transferred_total": int(sum(transferred_counts)),
-            "tokens_per_step_mean": float(generated / max(1, forward_count)),
+            "tokens_per_step_mean": (
+                float(generated / forward_count) if forward_count else 0.0
+            ),
             "parallel_threshold": parallel_threshold,
             "alg": alg,
             "alg_temp": alg_temp,

@@ -406,6 +406,82 @@ def get_num_transfer_tokens(mask_index: mx.array, steps: int) -> mx.array:
     return num_transfer
 
 
+def _model_fingerprint(model) -> dict:
+    """Opaque loaded-model identity + config/cache-layout fingerprint.
+
+    A prompt-prefix snapshot's K/V are only reusable by the *exact same loaded
+    model instance*. Two models with an identical ``ModelArgs`` (same geometry)
+    but different weights would share a config fingerprint, so we ALSO bind an
+    opaque per-instance identity (a uuid stamped on the model on first use) —
+    that is what makes a cross-model snapshot a MISS even at matched geometry.
+    """
+    a = getattr(model, "args", None)
+    cfg = {}
+    if a is not None:
+        for key in (
+            "model_type", "d_model", "n_layers", "n_heads",
+            "n_kv_heads", "vocab_size", "rope_theta",
+        ):
+            if hasattr(a, key):
+                cfg[key] = getattr(a, key)
+    ident = getattr(model, "_llada_snapshot_identity", None)
+    if ident is None:
+        import uuid
+        ident = uuid.uuid4().hex
+        try:
+            model._llada_snapshot_identity = ident
+        except Exception:
+            pass
+    try:
+        n_layers = len(model.layers)
+    except Exception:
+        n_layers = None
+    return {"config": cfg, "identity": ident, "n_layers": n_layers}
+
+
+def _snapshot_layers_valid(snapshot: dict, model, prefix_len: int) -> bool:
+    """Structurally validate a snapshot's ``layers`` payload against the model.
+
+    Independent of the metadata/fingerprint check: even a snapshot whose
+    metadata matches must carry a per-layer ``(K, V)`` list with the exact layer
+    count, tuple arity, K/V shapes ``[1, n_kv_heads, prefix_len, head_dim]``, and
+    matching floating dtype — otherwise the short ``zip`` in the model forward
+    would silently skip layers (``layers=[]``/truncated) or attend against a
+    wrong-shaped/garbage prefix (replaced-array). Any deviation => MISS.
+    """
+    layers = snapshot.get("layers")
+    if not isinstance(layers, (list, tuple)):
+        return False
+    try:
+        n_layers = len(model.layers)
+    except Exception:
+        return False
+    if len(layers) != n_layers or n_layers == 0:
+        return False
+    a = model.args
+    try:
+        expected = (1, int(a.n_kv_heads), int(prefix_len), int(a.head_dim))
+    except Exception:
+        return False
+    try:
+        expected_dtype = model.layers[0].self_attn.k_proj.weight.dtype
+    except Exception:
+        expected_dtype = None
+    for entry in layers:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            return False
+        k, v = entry
+        if not isinstance(k, mx.array) or not isinstance(v, mx.array):
+            return False
+        if tuple(k.shape) != expected or tuple(v.shape) != expected:
+            return False
+        if k.dtype != v.dtype:
+            return False
+        if expected_dtype is not None and k.dtype != expected_dtype:
+            return False
+    return True
+
+
 def generate(
     model: Model,
     prompt: mx.array,
@@ -528,13 +604,26 @@ def generate(
         prompt = prompt[None, :]
     prompt_len = prompt.shape[1]
 
+    # Geometry validation via explicit ValueError (never assert — asserts vanish
+    # under ``python -O``, which would let gen_length=0/block_length=0 raise a
+    # bare ZeroDivisionError and steps=0 silently return an all-mask sequence).
+    if steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps}")
+    if gen_length <= 0:
+        raise ValueError(f"gen_length must be positive, got {gen_length}")
+    if block_length <= 0:
+        raise ValueError(f"block_length must be positive, got {block_length}")
+    if gen_length % block_length != 0:
+        raise ValueError(
+            f"gen_length ({gen_length}) must be divisible by "
+            f"block_length ({block_length})"
+        )
+    num_blocks = gen_length // block_length
+
     total_len = prompt_len + gen_length
     x = mx.full((1, total_len), mask_id, dtype=prompt.dtype)
     x[:, :prompt_len] = prompt
     prompt_index = x != mask_id
-
-    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
-    num_blocks = gen_length // block_length
 
     if kv_cache and cfg_scale > 0.0:
         raise ValueError(
@@ -617,7 +706,11 @@ def generate(
                  "block_length": int(block_length),
                  "dual_cache": bool(dual_cache),
                  "mask_id": int(mask_id),
-                 "cfg_scale": float(cfg_scale)}
+                 "cfg_scale": float(cfg_scale),
+                 # Bind to the exact loaded-model instance (opaque identity) plus
+                 # its config/cache-layout so a same-geometry snapshot captured
+                 # from a DIFFERENT model is a MISS, not a silent stale HIT.
+                 "fingerprint": _model_fingerprint(model)}
     _snapshot_valid = False
     if prefix_snapshot is not None and kv_cache:
         try:
@@ -625,6 +718,10 @@ def generate(
                 int(prefix_snapshot.get("prefix_len", -1)) == _prompt_len
                 and prefix_snapshot.get("token_hash") == _prompt_token_hash()
                 and prefix_snapshot.get("geometry") == _geometry
+                # Structural check is independent of the metadata match: a
+                # metadata-valid snapshot with layers=[]/truncated/wrong-shape/
+                # replaced-array must still MISS and recompute fresh.
+                and _snapshot_layers_valid(prefix_snapshot, model, _prompt_len)
             )
         except Exception:
             _snapshot_valid = False
@@ -794,7 +891,10 @@ def generate(
         # -------------------------------------------------------------------
         # Fixed-schedule path (unchanged historical behaviour).
         # -------------------------------------------------------------------
-        assert steps % num_blocks == 0, "steps must be divisible by num_blocks"
+        if steps % num_blocks != 0:
+            raise ValueError(
+                f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
+            )
         steps_per_block = steps // num_blocks
 
         for b in range(num_blocks):

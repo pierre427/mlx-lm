@@ -12,10 +12,49 @@ class _DreamStub:
     def __init__(self, mask_token_id=9, vocab_size=12):
         self.args = types.SimpleNamespace(mask_token_id=mask_token_id)
         self.vocab_size = vocab_size
+        self.calls = 0
 
     def __call__(self, x):
+        self.calls += 1
         scores = mx.arange(self.vocab_size, dtype=mx.float32)
         return mx.broadcast_to(scores, (*x.shape, self.vocab_size))
+
+
+class TestDreamScheduleBoundaries(unittest.TestCase):
+    """Finding D4: schedule/stats must not fail open at zero work."""
+
+    def test_zero_and_negative_steps_raise(self):
+        model = _DreamStub()
+        inputs = mx.array([[1, 9, 2, 9]])
+        for bad_steps in (0, -1):
+            with self.assertRaises(ValueError):
+                diffusion_generate(model, inputs, max_length=5, steps=bad_steps)
+
+    def test_no_new_token_input_early_returns_with_zero_stats(self):
+        # max_length == prompt length AND no masked positions: nothing to
+        # denoise. Must early-return BEFORE any model call with honest zeros
+        # (no phantom forward, no clamped tokens_per_step_mean=1.0).
+        model = _DreamStub()
+        inputs = mx.array([[1, 2, 3, 4]])  # no mask id (9) present
+        output, stats = diffusion_generate(
+            model, inputs, max_length=4, steps=8, return_stats=True
+        )
+        self.assertEqual(model.calls, 0, "model was called on a no-work input")
+        self.assertEqual(stats["forwards"], 0)
+        self.assertEqual(stats["tokens_per_step_mean"], 0.0)
+        self.assertEqual(output.tolist(), [[1, 2, 3, 4]])
+
+    def test_stats_are_exact_not_clamped(self):
+        # A one-step fill of a single masked position: forwards==1 and mean is
+        # the true generated/forwards ratio, not a max(1, ...) fabrication.
+        model = _DreamStub()
+        inputs = mx.array([[1, 2, 3]])
+        _, stats = diffusion_generate(
+            model, inputs, max_length=4, steps=1, alg="maskgit_plus",
+            return_stats=True,
+        )
+        self.assertEqual(stats["forwards"], 1)
+        self.assertEqual(stats["tokens_per_step_mean"], 1.0)
 
 
 class TestDreamRemasking(unittest.TestCase):
