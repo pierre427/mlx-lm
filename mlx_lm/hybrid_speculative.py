@@ -748,6 +748,7 @@ def self_mtp_generate_step(
     max_tokens: int = 256,
     prefill_step_size: int = 512,
     sampling_temp: float = 0.0,
+    persistent_mtp: bool = False,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
@@ -765,6 +766,14 @@ def self_mtp_generate_step(
     distributions. This is exact for temperature-only sampling; top-p/top-k need
     a shared distribution transform before they can be made exact here.
 
+    ``persistent_mtp=True`` keeps ONE MTP KV cache in sync with the committed
+    sequence (teacher-forced from trunk hiddens during prefill and after each
+    verify) instead of a fresh empty cache per draft cycle. The head then
+    drafts with full context and real RoPE positions — the regime it was
+    trained in — which can lift acceptance dramatically (Hy3-REAP50: 33% ->
+    ~80% on code). Costs one extra (single-layer) MTP forward per cycle plus
+    ~1 layer-equivalent of prefill; requires the MTP cache to be trimmable.
+
     Yields ``(token, logprobs, from_draft)``.
     """
     if getattr(model, "mtp", None) is None:
@@ -777,15 +786,31 @@ def self_mtp_generate_step(
         return
 
     cache = make_prompt_cache(model)
+    mtp_cache = model.make_mtp_cache() if persistent_mtp else None
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
+        prev_h = None  # trunk hidden of the previous chunk's last position
         while y.size > 1:  # leave one token to produce the seed hidden
             n = min(prefill_step_size, y.size - 1)
-            model.model(y[:n][None], cache=cache)
+            h_chunk = model.model(y[:n][None], cache=cache)
+            if persistent_mtp:
+                # Teacher-force the MTP over pairs (hidden_i, token_{i+1}) so
+                # its KV covers the prompt with real positions.
+                if prev_h is None:
+                    hs, ts = h_chunk[:, :-1], y[1:n][None]
+                else:
+                    hs = mx.concatenate([prev_h, h_chunk[:, :-1]], axis=1)
+                    ts = y[:n][None]
+                if ts.size > 0:
+                    model.mtp_step(hs, ts, mtp_cache)
+                prev_h = h_chunk[:, -1:, :]
+                mx.eval([c.state for c in mtp_cache])
             mx.eval([c.state for c in cache])
             y = y[n:]
             mx.clear_cache()
+        if persistent_mtp and prev_h is not None:
+            model.mtp_step(prev_h, y[None], mtp_cache)  # pair (h_{L-2}, t_{L-1})
         hidden = model.model(y[None], cache=cache)   # [1, 1, H] post-final-norm
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
         first_lp = _temperature_logprobs(model.logits(seed_h)[0, -1], sampling_temp)
@@ -805,7 +830,16 @@ def self_mtp_generate_step(
         stats.plain_tokens += 1
         yield cur, first_lp, False
         yield from _mtp_draft_verify_loop(
-            model, cache, cur, seed_h, 1, max_tokens, num_draft, stats, sampling_temp
+            model,
+            cache,
+            cur,
+            seed_h,
+            1,
+            max_tokens,
+            num_draft,
+            stats,
+            sampling_temp,
+            mtp_cache=mtp_cache,
         )
     finally:
         _stop_all_speculation(cache)
@@ -853,23 +887,42 @@ def _mtp_draft_verify_loop(
     num_draft,
     stats,
     sampling_temp: float = 0.0,
+    mtp_cache=None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
     committed-but-uncached token and ``seed_h`` the trunk hidden that predicted
-    it. Yields (token, logprobs, from_draft). Does NOT start/stop speculation."""
+    it. Yields (token, logprobs, from_draft). Does NOT start/stop speculation.
+
+    When ``mtp_cache`` is given it is a PERSISTENT context cache covering the
+    committed pairs (hidden_i, token_{i+1}), so the head drafts with full
+    context at real RoPE positions (its trained regime). After each verify the
+    k draft entries are rewound; the newly committed span (with TRUNK hiddens)
+    is carried as ``pending`` pairs and teacher-forced as a prefix of the next
+    cycle's first draft call — one MTP forward per cycle, no separate
+    catch-up pass. ``None`` keeps the legacy fresh-cache-per-cycle behavior."""
+    persistent = mtp_cache is not None
+    pending_hs = None  # committed (hidden, token) pairs not yet in mtp_cache
+    pending_ts: List[int] = []
     while ntoks < max_tokens:
         stats.cycles += 1
         k = min(num_draft, max_tokens - ntoks)
 
         # ---- draft k tokens with the MTP head (chained) ----------------------
-        mtp_cache = model.make_mtp_cache()
+        if not persistent:
+            mtp_cache = model.make_mtp_cache()
         drafts: List[int] = []
         draft_logprobs: List[mx.array] = []
         h, tok = seed_h, mx.array([[cur]], mx.uint32)
         with mx.stream(generation_stream):
-            for _ in range(k):
-                d_logits, h = model.mtp_step(h, tok, mtp_cache)
+            for i in range(k):
+                if i == 0 and pending_hs is not None:
+                    hs = mx.concatenate([pending_hs, h], axis=1)
+                    ts = mx.array([pending_ts + [cur]], mx.uint32)
+                else:
+                    hs, ts = h, tok
+                d_logits, post = model.mtp_step(hs, ts, mtp_cache)
+                h = post[:, -1:, :]
                 d_lp = _temperature_logprobs(d_logits[0, -1], sampling_temp)
                 d = _sample_from_logprobs(d_lp, sampling_temp)
                 drafts.append(d)
@@ -908,6 +961,21 @@ def _mtp_draft_verify_loop(
 
         # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
         trim_prompt_cache(cache, k - n_accept)
+        if persistent:
+            # Rewind the k speculative entries: (h_p, cur) plus the k-1
+            # chained pairs built from MTP (not trunk) hiddens. The committed
+            # span — (h_p, cur), (h_{p+1}, d_1) .. (h_{p+n_accept}, d_na) with
+            # TRUNK hiddens — is carried as pending pairs and re-fed as the
+            # prefix of the next cycle's first draft call. The bonus token
+            # stays out: it becomes the next cycle's cur.
+            trim_prompt_cache(mtp_cache, k)
+            if n_accept > 0:
+                pending_hs = mx.concatenate(
+                    [seed_h, vhidden[:, :n_accept, :]], axis=1
+                )
+            else:
+                pending_hs = seed_h
+            pending_ts = [cur] + drafts[:n_accept]
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
         stats.draft_proposed += k
         stats.draft_cycles += 1
