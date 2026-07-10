@@ -1181,7 +1181,8 @@ class TestGenerate(unittest.TestCase):
         from mlx_lm.server import _measure_kv_cost
 
         fixed, per_tok, step = _measure_kv_cost(self.model)
-        # Budget fits ONE 512+8 row (rounded 768 units) plus margin, but
+        # Budget fits ONE 512+8 row (envelope 520+step-1=775 units) plus
+        # margin, but
         # not two such rows.
         one_row = fixed + per_tok * (520 + step - 1)  # envelope: final+step-1
         budget = int(1.5 * one_row)
