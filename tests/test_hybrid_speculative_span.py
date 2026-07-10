@@ -85,5 +85,53 @@ class TestAdaptivePLDCliffAwareSpan(unittest.TestCase):
         self.assertFalse(cache.speculating)
 
 
+class TestAdaptivePLDLifecycleSemantics(unittest.TestCase):
+    def test_max_tokens_zero_yields_nothing_and_does_no_work(self):
+        cache = _Cache()
+        model = _Model()
+        generator = adaptive_pld_generate_step(
+            mx.array([1, 2, 3]),
+            model,
+            prompt_cache=[cache],
+            max_tokens=0,
+        )
+        self.assertEqual(list(generator), [])
+        self.assertEqual(model.input_lengths, [])
+        self.assertFalse(cache.speculating)
+        self.assertEqual(cache.offset, 0)
+
+    def test_early_close_counts_only_delivered_tokens(self):
+        # The suffix [1,2,3] recurs, so retrieval proposes the zeros that
+        # followed its first occurrence — which the zero-predicting model
+        # accepts. The consumer closes after the FIRST delivered token
+        # (e.g. EOS): telemetry must count exactly one accepted token and
+        # no bonus.
+        history = [1, 2, 3] + [0] * 6 + [1, 2, 3]
+        cache = _Cache()
+        model = _Model()
+        stats = HybridStats()
+        generator = adaptive_pld_generate_step(
+            mx.array(history[-1:]),
+            model,
+            prompt_cache=[cache],
+            history_prompt=mx.array(history),
+            max_tokens=16,
+            min_match=2,
+            max_span=8,
+            stats=stats,
+        )
+        tok, _logprobs, from_retrieval = next(generator)
+        self.assertEqual(tok, 0)
+        self.assertTrue(from_retrieval)
+        generator.close()
+
+        self.assertGreaterEqual(stats.retrieval_proposed, 2)
+        self.assertEqual(stats.retrieval_accepted, 1)
+        self.assertEqual(stats.bonus_tokens, 0)
+        self.assertEqual(stats.plain_tokens, 0)
+        self.assertEqual(stats.total_emitted, 1)
+        self.assertFalse(cache.speculating)
+
+
 if __name__ == "__main__":
     unittest.main()

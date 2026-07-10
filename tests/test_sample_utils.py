@@ -175,5 +175,94 @@ class TestSampleUtils(unittest.TestCase):
         self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
 
 
+class TestReasoningBudgetSpeculativeRewind(unittest.TestCase):
+    """The stateful reasoning-budget processor must survive speculative
+    rewinds: when ``prev_tokens`` no longer extends the tracked history
+    (rejected draft tokens were consumed), its decisions must match a
+    sequential run over the committed tokens only."""
+
+    CLOSE = 99
+    VOCAB = 128
+
+    def _forced(self, processor, tokens):
+        out = processor(mx.array(tokens, mx.uint32), mx.zeros((1, self.VOCAB)))
+        forced = out[0, self.CLOSE].item() == 0.0 and out[0, 0].item() == float(
+            "-inf"
+        )
+        return bool(forced)
+
+    def test_rewind_of_rejected_draft_tokens_matches_sequential(self):
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        kwargs = dict(
+            think_close=self.CLOSE, max_think_tokens=20, check_every=10**6
+        )
+        seq_proc = make_reasoning_budget(**kwargs)
+        spec_proc = make_reasoning_budget(**kwargs)
+
+        committed = [1] * 8
+        for i in range(1, len(committed) + 1):
+            self.assertFalse(self._forced(seq_proc, committed[:i]))
+            self.assertFalse(self._forced(spec_proc, committed[:i]))
+
+        # Speculative verify: four draft tokens stacked on the committed
+        # history (as speculative_generate_step's _step does), all rejected.
+        drafts = [31, 32, 33, 34]
+        for j in range(1, len(drafts) + 1):
+            self.assertFalse(self._forced(spec_proc, committed + drafts[:j]))
+
+        # Rewind: the committed history continues with the target's bonus
+        # token instead. Decisions must track the sequential processor at
+        # every committed length.
+        history = committed + [7]
+        seq_forced = spec_forced = False
+        while len(history) <= 24:
+            seq_forced = self._forced(seq_proc, list(history))
+            spec_forced = self._forced(spec_proc, list(history))
+            self.assertEqual(
+                spec_forced,
+                seq_forced,
+                msg=f"decision diverged at committed length {len(history)}",
+            )
+            history.append(1)
+        # Sanity: the budget still trips once genuinely exceeded.
+        self.assertTrue(seq_forced)
+        self.assertTrue(spec_forced)
+
+    def test_equal_length_rewind_over_rejected_close_token(self):
+        # The draft proposes the channel-close token; the target rejects it
+        # and commits a different token at the SAME history length. The
+        # processor must not stay latched out of the think channel.
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        kwargs = dict(
+            think_close=self.CLOSE, max_think_tokens=8, check_every=10**6
+        )
+        seq_proc = make_reasoning_budget(**kwargs)
+        spec_proc = make_reasoning_budget(**kwargs)
+
+        committed = [1] * 5
+        for i in range(1, len(committed) + 1):
+            self.assertFalse(self._forced(seq_proc, committed[:i]))
+            self.assertFalse(self._forced(spec_proc, committed[:i]))
+
+        # Rejected draft: the close tag never becomes part of the history.
+        self.assertFalse(self._forced(spec_proc, committed + [self.CLOSE]))
+
+        history = committed + [7]
+        seq_forced = spec_forced = False
+        while len(history) <= 12:
+            seq_forced = self._forced(seq_proc, list(history))
+            spec_forced = self._forced(spec_proc, list(history))
+            self.assertEqual(
+                spec_forced,
+                seq_forced,
+                msg=f"decision diverged at committed length {len(history)}",
+            )
+            history.append(2)
+        self.assertTrue(seq_forced)
+        self.assertTrue(spec_forced)
+
+
 if __name__ == "__main__":
     unittest.main()

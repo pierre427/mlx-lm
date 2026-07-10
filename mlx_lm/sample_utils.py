@@ -449,27 +449,70 @@ def make_reasoning_budget(
     if max_think_tokens <= 0:
         raise ValueError(f"max_think_tokens must be positive, got {max_think_tokens}")
 
+    # How many trailing overlap tokens to re-verify per call. Speculative
+    # decoders rewind `prev_tokens` between calls when draft tokens are
+    # rejected; a rewind either shortens the history (caught by the length
+    # check) or replaces at most the last few tokens (caught by re-checking
+    # this window). Per-call `prev_tokens` growth is a handful of tokens, so a
+    # generous fixed margin is sound in practice and O(1) per call.
+    rewind_check_window = 32
+
     state = {
         "n": 0,  # tokens consumed from the running `tokens` array so far
+        "history": [],  # exact ids consumed so far, for rewind detection
         "in_think": think_open is None,
         "ids": [],  # ids seen inside the current channel
         "since_check": 0,
     }
 
+    def _reset_channel_state():
+        state["in_think"] = think_open is None
+        state["ids"] = []
+        state["since_check"] = 0
+
+    def _consume(tid):
+        if tid == think_close:
+            state["in_think"] = False
+            state["ids"] = []
+            state["since_check"] = 0
+        elif think_open is not None and tid == think_open:
+            state["in_think"] = True
+            state["ids"] = []
+            state["since_check"] = 0
+        elif state["in_think"]:
+            state["ids"].append(tid)
+
     def reasoning_budget_processor(tokens, logits):
-        new = tokens[state["n"] :].tolist()
-        state["n"] = len(tokens)
-        for tid in new:
-            if tid == think_close:
-                state["in_think"] = False
-                state["ids"] = []
-                state["since_check"] = 0
-            elif think_open is not None and tid == think_open:
-                state["in_think"] = True
-                state["ids"] = []
-                state["since_check"] = 0
-            elif state["in_think"]:
-                state["ids"].append(tid)
+        n = state["n"]
+        length = tokens.size
+        overlap = min(length, n)
+        window = min(overlap, max(n - length, 0) + rewind_check_window)
+        tail = tokens[overlap - window :].tolist()
+        check_pending = False
+        if length < n or tail[:window] != state["history"][overlap - window : overlap]:
+            # Speculative rewind: the committed history no longer extends what
+            # we tracked (rejected draft tokens were consumed into `ids`).
+            # Rebuild by replaying the committed sequence token-by-token so
+            # every decision matches a sequential run over the same tokens.
+            full = tokens.tolist()
+            state["history"] = full
+            state["n"] = length
+            _reset_channel_state()
+            for tid in full:
+                _consume(tid)
+                check_pending = False
+                if state["in_think"] and len(state["ids"]) < max_think_tokens:
+                    state["since_check"] += 1
+                    if state["since_check"] >= check_every:
+                        state["since_check"] = 0
+                        check_pending = True
+            new = []  # the replay consumed everything
+        else:
+            new = tail[window:]
+            state["history"].extend(new)
+            state["n"] = length
+            for tid in new:
+                _consume(tid)
 
         if not state["in_think"]:
             return logits
@@ -478,7 +521,7 @@ def make_reasoning_budget(
         trip = len(ids) >= max_think_tokens
         if not trip:
             state["since_check"] += len(new)
-            if state["since_check"] >= check_every:
+            if state["since_check"] >= check_every or check_pending:
                 state["since_check"] = 0
                 trip = _is_token_cycle(ids, max_cycle, min_cycle_span) or (
                     tokenizer is not None

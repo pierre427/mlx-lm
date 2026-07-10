@@ -5,7 +5,13 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step, speculative_generate_step
-from mlx_lm.hybrid_speculative import _start_speculation_or_cleanup
+from mlx_lm.hybrid_speculative import (
+    HybridStats,
+    _start_speculation_or_cleanup,
+    _stop_all_speculation,
+    hybrid_generate_step,
+    self_mtp_generate_step,
+)
 from mlx_lm.models import cache, llama, qwen3_next
 
 QWEN3_NEXT_ARGS = {
@@ -158,6 +164,46 @@ class TestSpeculativeRollback(unittest.TestCase):
         ]
         self.assertEqual(vanilla, spec)
 
+    def test_reasoning_budget_survives_speculative_rejections(self):
+        # A stateful reasoning-budget processor consumes the draft tokens fed
+        # during verify; forced rejections then rewind prev_tokens. Its
+        # decisions (and hence the output) must match sequential generation
+        # with an identical processor.
+        from mlx_lm.sample_utils import make_reasoning_budget
+
+        model = make_hybrid()
+        mx.random.seed(5)
+        draft = llama.Model(llama.ModelArgs.from_dict(LLAMA_ARGS))  # ~all rejected
+        prompt = mx.random.randint(10, 1000, (16,), dtype=mx.uint32)
+        n = 32
+
+        def procs():
+            return [
+                make_reasoning_budget(
+                    think_close=5, max_think_tokens=12, check_every=10**6
+                )
+            ]
+
+        vanilla = [
+            int(tok)
+            for tok, _ in generate_step(
+                prompt, model, max_tokens=n, logits_processors=procs()
+            )
+        ]
+        spec = [
+            int(tok)
+            for tok, _, _ in speculative_generate_step(
+                prompt,
+                model,
+                draft,
+                num_draft_tokens=3,
+                max_tokens=n,
+                logits_processors=procs(),
+            )
+        ]
+        self.assertEqual(vanilla, spec)
+        self.assertIn(5, vanilla)  # the budget genuinely tripped
+
     def test_cache_reusable_after_speculation(self):
         # A prompt cache used for speculative decoding must come back clean:
         # not trimmable, no dangling rollback, and usable for plain decoding
@@ -301,6 +347,198 @@ class TestSpeculativeRollback(unittest.TestCase):
         arrays = next(x for x in c if isinstance(x, cache.ArraysCache))
         with self.assertRaises(RuntimeError):
             arrays.trim(10)  # only 4 tokens of rollback recorded
+
+
+class _FakeSpecCache:
+    """Minimal trimmable prompt-cache stand-in with lifecycle accounting."""
+
+    def __init__(self, fail_stop=False):
+        self.offset = 0
+        self.speculating = False
+        self.stop_calls = 0
+        self.fail_stop = fail_stop
+
+    def start_speculation(self):
+        self.speculating = True
+
+    def stop_speculation(self):
+        self.stop_calls += 1
+        self.speculating = False
+        if self.fail_stop:
+            raise RuntimeError("stop_speculation failed")
+
+    def is_trimmable(self):
+        return self.speculating
+
+    def trim(self, n):
+        self.offset -= n
+        return n
+
+    @property
+    def state(self):
+        return mx.zeros((1,))
+
+
+class _ZeroLogitModel:
+    """Fake target model: always predicts token 0, tracks forward calls."""
+
+    VOCAB = 32
+
+    def __init__(self, caches=None):
+        self.calls = 0
+        self._caches = caches
+
+    def __call__(self, x, cache=None):
+        self.calls += 1
+        for c in cache:
+            c.offset += x.shape[-1]
+        return mx.zeros((x.shape[0], x.shape[1], self.VOCAB))
+
+    def make_cache(self):
+        return self._caches if self._caches is not None else [_FakeSpecCache()]
+
+
+class _ZeroMTPModel:
+    """Fake MTP model: trunk + head always predict token 0."""
+
+    VOCAB = 16
+    HIDDEN = 4
+
+    def __init__(self, caches=None):
+        self.mtp = object()
+        self.trunk_calls = 0
+        self._caches = caches if caches is not None else [_FakeSpecCache()]
+
+    def model(self, x, cache=None):
+        self.trunk_calls += 1
+        for c in cache:
+            c.offset += x.shape[-1]
+        return mx.zeros((x.shape[0], x.shape[1], self.HIDDEN))
+
+    def logits(self, h):
+        return mx.zeros(h.shape[:-1] + (self.VOCAB,))
+
+    def make_cache(self):
+        return self._caches
+
+    def make_mtp_cache(self):
+        return []
+
+    def mtp_step(self, h, tok, mtp_cache):
+        return mx.zeros((1, 1, self.VOCAB)), h
+
+
+class TestGeneratorLifecycleSemantics(unittest.TestCase):
+    """max_tokens=0, yield-boundary telemetry, and fail-safe cleanup."""
+
+    def test_stop_all_speculation_runs_every_hook_and_surfaces_first_error(self):
+        first = _FakeSpecCache(fail_stop=True)
+        second = _FakeSpecCache(fail_stop=True)
+        third = _FakeSpecCache()
+        with self.assertRaisesRegex(RuntimeError, "stop_speculation failed"):
+            _stop_all_speculation([first, second, third])
+        self.assertEqual([c.stop_calls for c in (first, second, third)], [1, 1, 1])
+        self.assertTrue(all(not c.speculating for c in (first, second, third)))
+
+    def test_hybrid_max_tokens_zero_yields_nothing_and_does_no_work(self):
+        model = _ZeroLogitModel()
+        gen = hybrid_generate_step(
+            mx.array([0] * 8, mx.uint32), model, max_tokens=0
+        )
+        self.assertEqual(list(gen), [])
+        self.assertEqual(model.calls, 0)
+
+    def test_self_mtp_max_tokens_zero_yields_nothing_and_does_no_work(self):
+        model = _ZeroMTPModel()
+        gen = self_mtp_generate_step(
+            mx.array([1, 2, 3], mx.uint32), model, max_tokens=0
+        )
+        self.assertEqual(list(gen), [])
+        self.assertEqual(model.trunk_calls, 0)
+
+    def test_hybrid_early_close_counts_only_delivered_tokens(self):
+        # The consumer closes after the FIRST delivered token of an accepted
+        # retrieval batch (e.g. EOS): telemetry must count exactly one
+        # accepted token and no bonus token. The suffix [1,2,3] recurs, so
+        # retrieval proposes the zeros after its first occurrence — which the
+        # zero-predicting model accepts.
+        model = _ZeroLogitModel()
+        stats = HybridStats()
+        gen = hybrid_generate_step(
+            mx.array([1, 2, 3] + [0] * 6 + [1, 2, 3], mx.uint32),
+            model,
+            max_tokens=16,
+            min_match=2,
+            max_span=8,
+            stats=stats,
+        )
+        tok, _logprobs, from_draft = next(gen)
+        self.assertEqual(tok, 0)
+        self.assertTrue(from_draft)
+        gen.close()
+
+        self.assertGreaterEqual(stats.retrieval_proposed, 2)
+        self.assertEqual(stats.retrieval_accepted, 1)
+        self.assertEqual(stats.bonus_tokens, 0)
+        self.assertEqual(stats.plain_tokens, 0)
+        self.assertEqual(stats.total_emitted, 1)
+
+    def test_self_mtp_early_close_counts_only_delivered_tokens(self):
+        # Close immediately after the first (plain) token: it was delivered,
+        # so it must be counted — and nothing else may be.
+        model = _ZeroMTPModel()
+        stats = HybridStats()
+        gen = self_mtp_generate_step(
+            mx.array([1, 2, 3], mx.uint32), model, max_tokens=8, stats=stats
+        )
+        next(gen)
+        gen.close()
+        self.assertEqual(stats.plain_tokens, 1)
+        self.assertEqual(stats.total_emitted, 1)
+
+        # Close after one accepted draft token: the cycle's bonus token was
+        # never delivered and must not be counted.
+        model = _ZeroMTPModel()
+        stats = HybridStats()
+        gen = self_mtp_generate_step(
+            mx.array([1, 2, 3], mx.uint32), model, max_tokens=8, stats=stats
+        )
+        next(gen)  # first plain token
+        tok, _lp, from_draft = next(gen)  # first accepted draft token
+        self.assertTrue(from_draft)
+        gen.close()
+        self.assertEqual(stats.plain_tokens, 1)
+        self.assertEqual(stats.draft_proposed, 1)
+        self.assertEqual(stats.draft_accepted, 1)
+        self.assertEqual(stats.bonus_tokens, 0)
+
+    def test_hybrid_close_cleans_every_cache_even_if_one_stop_raises(self):
+        failing = _FakeSpecCache(fail_stop=True)
+        healthy = _FakeSpecCache()
+        model = _ZeroLogitModel(caches=[failing, healthy])
+        gen = hybrid_generate_step(
+            mx.array([0] * 8, mx.uint32), model, max_tokens=16
+        )
+        next(gen)
+        with self.assertRaisesRegex(RuntimeError, "stop_speculation failed"):
+            gen.close()
+        self.assertEqual(failing.stop_calls, 1)
+        self.assertEqual(healthy.stop_calls, 1)
+        self.assertFalse(healthy.speculating)
+
+    def test_self_mtp_close_cleans_every_cache_even_if_one_stop_raises(self):
+        failing = _FakeSpecCache(fail_stop=True)
+        healthy = _FakeSpecCache()
+        model = _ZeroMTPModel(caches=[failing, healthy])
+        gen = self_mtp_generate_step(
+            mx.array([1, 2, 3], mx.uint32), model, max_tokens=8
+        )
+        next(gen)
+        with self.assertRaisesRegex(RuntimeError, "stop_speculation failed"):
+            gen.close()
+        self.assertEqual(failing.stop_calls, 1)
+        self.assertEqual(healthy.stop_calls, 1)
+        self.assertFalse(healthy.speculating)
 
 
 if __name__ == "__main__":

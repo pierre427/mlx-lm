@@ -14,13 +14,15 @@ _SPEC.loader.exec_module(_MODULE)
 summarize_rows = _MODULE.summarize_rows
 
 
-def _row(prompt, backend, throughput, *, accepted=0, proposed=0, latched=False):
+def _row(prompt, backend, throughput, *, accepted=0, proposed=0, latched=False, sha=None):
+    # Both arms of one prompt share an output hash by default: a summary is
+    # only meaningful when baseline and hybrid produced identical output.
     return {
         "kind": "run",
         "prompt_id": prompt,
         "backend": backend,
         "decode_tokens_per_second": throughput,
-        "output_sha256": f"{prompt}-{backend}",
+        "output_sha256": f"{prompt}-output" if sha is None else sha,
         "generation_stats": {
             "retrieval_accepted": accepted,
             "retrieval_proposed": proposed,
@@ -69,6 +71,43 @@ class TestHybridProposerSummary(unittest.TestCase):
                     _row("a", "hybrid", 1),
                 ]
             )
+
+    def test_cross_arm_hash_mismatch_fails_instead_of_reporting_a_win(self):
+        # A faster hybrid arm with DIFFERENT output than baseline must never
+        # summarize as a win — unequal hashes mean unequal work.
+        rows = [
+            _row("a", "baseline", 100, sha="AAA"),
+            _row("a", "hybrid", 200, sha="BBB"),
+        ]
+        with self.assertRaisesRegex(ValueError, "hashes differ"):
+            summarize_rows(rows)
+
+    def test_cross_arm_hash_mismatch_fails_even_when_each_arm_is_stable(self):
+        # Per-arm hash cardinality of 1 is not enough: the arms must agree
+        # with each other, not merely with themselves.
+        rows = [
+            _row("a", "baseline", 100, sha="AAA"),
+            _row("a", "baseline", 101, sha="AAA"),
+            _row("a", "hybrid", 200, sha="BBB"),
+            _row("a", "hybrid", 201, sha="BBB"),
+        ]
+        with self.assertRaisesRegex(ValueError, "hashes differ"):
+            summarize_rows(rows)
+
+    def test_missing_output_hash_fails(self):
+        no_hash = _row("a", "hybrid", 200)
+        del no_hash["output_sha256"]
+        rows = [_row("a", "baseline", 100), no_hash]
+        with self.assertRaisesRegex(ValueError, "missing output_sha256"):
+            summarize_rows(rows)
+
+    def test_equal_cross_arm_hashes_still_summarize(self):
+        rows = [
+            _row("a", "baseline", 100),
+            _row("a", "hybrid", 200, accepted=8, proposed=10),
+        ]
+        summary = summarize_rows(rows)
+        self.assertEqual(summary["win_count"], 1)
 
 
 if __name__ == "__main__":

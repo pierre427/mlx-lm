@@ -32,10 +32,18 @@ def summarize_rows(rows: Iterable[dict]) -> dict:
     deltas = []
     for prompt in prompt_ids:
         arms = {}
+        arm_hashes = {}
         for backend in ("baseline", "hybrid"):
             arm_rows = grouped.get((prompt, backend))
             if not arm_rows:
                 raise ValueError(f"prompt {prompt!r} is missing the {backend} arm")
+            hashes = {row.get("output_sha256") for row in arm_rows}
+            if not all(isinstance(h, str) and h for h in hashes):
+                raise ValueError(
+                    f"prompt {prompt!r} {backend} rows are missing output_sha256; "
+                    "cannot verify both arms produced identical output"
+                )
+            arm_hashes[backend] = hashes
             proposed = sum(
                 row.get("generation_stats", {}).get("retrieval_proposed", 0)
                 for row in arm_rows
@@ -53,13 +61,21 @@ def summarize_rows(rows: Iterable[dict]) -> dict:
                     bool(row.get("generation_stats", {}).get("latched"))
                     for row in arm_rows
                 ),
-                "output_hashes": len(
-                    {row.get("output_sha256") for row in arm_rows}
-                ),
+                "output_hashes": len(hashes),
                 "retrieval_proposed": proposed,
                 "retrieval_accepted": accepted,
                 "retrieval_acceptance": accepted / proposed if proposed else 0.0,
             }
+        # Cross-arm equality gate: a throughput "win" is only meaningful when
+        # both arms produced the same output. Unequal hashes mean the arms did
+        # different work, so the summary must fail, not report a win.
+        if arm_hashes["baseline"] != arm_hashes["hybrid"]:
+            raise ValueError(
+                f"prompt {prompt!r}: baseline and hybrid output hashes differ "
+                f"(baseline={sorted(arm_hashes['baseline'])}, "
+                f"hybrid={sorted(arm_hashes['hybrid'])}); arms did not do "
+                "equal work, refusing to summarize"
+            )
         baseline = arms["baseline"]["median_decode_tokens_per_second"]
         hybrid = arms["hybrid"]["median_decode_tokens_per_second"]
         delta = (hybrid / baseline - 1.0) * 100.0

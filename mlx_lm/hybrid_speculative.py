@@ -78,6 +78,24 @@ def _start_speculation_or_cleanup(caches, required_caches, error_message):
         raise
 
 
+def _stop_all_speculation(caches):
+    """Run ``stop_speculation`` on every cache even when one raises.
+
+    A failing cleanup hook must not leave later caches speculating (holding
+    rollback stashes and reporting trimmable state). Every hook runs; the
+    first error is re-raised only after all caches had their turn.
+    """
+    first_error = None
+    for c in caches:
+        try:
+            c.stop_speculation()
+        except BaseException as e:  # noqa: BLE001 — cleanup must reach every cache
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        raise first_error
+
+
 class SuffixAutomaton:
     """Online suffix automaton over token ids.
 
@@ -330,6 +348,10 @@ def hybrid_generate_step(
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
 
+    if max_tokens <= 0:
+        # Zero-token budget: yield nothing and do no prefill or sampling work.
+        return
+
     y = prompt.astype(mx.uint32)
     # Use each model's own cache layout so hybrid architectures get the right
     # caches (e.g. qwen3_next GatedDeltaNet layers -> ArraysCache, full-attn ->
@@ -474,31 +496,38 @@ def hybrid_generate_step(
             if source == "retrieval":
                 stats.retrieval_cycles += 1
                 stats.retrieval_proposed += n_prop
-                stats.retrieval_accepted += n_accept
-                stats.bonus_tokens += 1
             elif source == "draft":
                 stats.draft_cycles += 1
                 stats.draft_proposed += n_prop
-                stats.draft_accepted += n_accept
-                stats.bonus_tokens += 1
             else:
                 stats.plain_cycles += 1
-                stats.plain_tokens += 1
 
             # ---- 4. yield ----------------------------------------------------
+            # Delivered-token telemetry is updated exactly at each yield
+            # boundary: the consumer may close the generator at any yield
+            # (e.g. on EOS), and eager batch accounting would overstate the
+            # accepted/bonus/plain token counts.
             for i in range(n_accept):
                 ntoks += 1
+                if source == "retrieval":
+                    stats.retrieval_accepted += 1
+                else:
+                    stats.draft_accepted += 1
                 yield proposal[i], logprobs[i], True
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
                 ntoks += 1
+                if source == "plain":
+                    stats.plain_tokens += 1
+                else:
+                    stats.bonus_tokens += 1
                 yield bonus, logprobs[n_accept], False
     finally:
         # Stop recording and free rollback stashes on normal completion or when
-        # the consumer closes the generator early (e.g. on eos).
-        for c in spec_caches:
-            c.stop_speculation()
+        # the consumer closes the generator early (e.g. on eos). Every cache's
+        # hook runs even if one raises.
+        _stop_all_speculation(spec_caches)
 
 
 def adaptive_pld_generate_step(
@@ -548,6 +577,12 @@ def adaptive_pld_generate_step(
     """
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
+
+    if max_tokens <= 0:
+        # Zero-token budget: yield nothing and do no prefill or sampling work
+        # (an external prompt_cache is left untouched).
+        return
+
     external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
@@ -637,20 +672,25 @@ def adaptive_pld_generate_step(
             if n_prop:
                 stats.retrieval_cycles += 1
                 stats.retrieval_proposed += n_prop
-                stats.retrieval_accepted += n_accept
-                stats.bonus_tokens += 1
             else:
                 stats.plain_cycles += 1
-                stats.plain_tokens += 1
 
+            # Delivered-token telemetry updates exactly at each yield boundary
+            # so an early close (e.g. EOS) never overstates accepted/bonus
+            # counts (see the same pattern in prompt_lookup_generate_step).
             for i in range(n_accept):
                 ntoks += 1
                 cached_unyielded -= 1
+                stats.retrieval_accepted += 1
                 yield proposal[i], logprobs[i], True
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
                 ntoks += 1
+                if n_prop:
+                    stats.bonus_tokens += 1
+                else:
+                    stats.plain_tokens += 1
                 yield bonus, logprobs[n_accept], False
 
             # Latch to plain once we have enough evidence the work isn't copy-heavy.
@@ -674,8 +714,7 @@ def adaptive_pld_generate_step(
                     model, cache, nxt, bh[:, -1:, :], ntoks, max_tokens, num_draft, stats
                 )
             else:
-                for c in cache:
-                    c.stop_speculation()
+                _stop_all_speculation(cache)
                 for tok, lp in generate_step(
                     mx.array(pending, mx.uint32), model,
                     max_tokens=max_tokens - ntoks, prompt_cache=cache, sampler=_GREEDY,
@@ -691,13 +730,14 @@ def adaptive_pld_generate_step(
                     if ntoks == max_tokens:
                         break
     finally:
-        if cached_unyielded > 0:
-            trimmed = trim_prompt_cache(cache, cached_unyielded)
-            if external_prompt_cache:
-                stats.external_cache_reconciled = True
-                stats.external_cache_trimmed_tokens += int(trimmed or 0)
-        for c in cache:
-            c.stop_speculation()
+        try:
+            if cached_unyielded > 0:
+                trimmed = trim_prompt_cache(cache, cached_unyielded)
+                if external_prompt_cache:
+                    stats.external_cache_reconciled = True
+                    stats.external_cache_trimmed_tokens += int(trimmed or 0)
+        finally:
+            _stop_all_speculation(cache)
 
 
 def self_mtp_generate_step(
@@ -731,6 +771,11 @@ def self_mtp_generate_step(
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
+
+    if max_tokens <= 0:
+        # Zero-token budget: yield nothing and do no prefill or sampling work.
+        return
+
     cache = make_prompt_cache(model)
 
     y = prompt.astype(mx.uint32)
@@ -755,14 +800,15 @@ def self_mtp_generate_step(
     )
 
     try:
-        yield cur, first_lp, False
+        # Count the token at its yield boundary (not after): an immediate
+        # close must still account for the delivered first token.
         stats.plain_tokens += 1
+        yield cur, first_lp, False
         yield from _mtp_draft_verify_loop(
             model, cache, cur, seed_h, 1, max_tokens, num_draft, stats, sampling_temp
         )
     finally:
-        for c in cache:
-            c.stop_speculation()
+        _stop_all_speculation(cache)
 
 
 def _temperature_logprobs(logits, sampling_temp: float = 0.0):
@@ -864,17 +910,19 @@ def _mtp_draft_verify_loop(
         trim_prompt_cache(cache, k - n_accept)
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
         stats.draft_proposed += k
-        stats.draft_accepted += n_accept
         stats.draft_cycles += 1
-        stats.bonus_tokens += 1
 
+        # Delivered-token telemetry updates exactly at each yield boundary so
+        # an early close (e.g. EOS) never overstates accepted/bonus counts.
         for i in range(n_accept):
             ntoks += 1
+            stats.draft_accepted += 1
             yield drafts[i], logprobs[i], True
             if ntoks == max_tokens:
                 break
         if ntoks < max_tokens:
             ntoks += 1
+            stats.bonus_tokens += 1
             yield bonus, logprobs[n_accept], False
         cur = bonus
 

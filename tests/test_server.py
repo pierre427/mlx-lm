@@ -235,6 +235,37 @@ class TestServer(unittest.TestCase):
                 self.assertEqual(response.headers["Content-Type"], "application/json")
                 self.assertIn(name, response.json()["error"])
 
+    def test_malformed_logit_bias_returns_json_400(self):
+        # {"1": null} used to raise an uncaught TypeError inside parameter
+        # normalization, bypassing the documented JSON 400 path entirely.
+        url = f"http://localhost:{self.port}/v1/completions"
+        invalid = (
+            {"1": None},
+            {"1": "abc"},
+            {"1": [1.0]},
+            {"x": 1.0},
+            {"1.5": 1.0},
+            {"1": float("nan")},
+            {"1": float("inf")},
+        )
+        for bias in invalid:
+            with self.subTest(logit_bias=bias):
+                response = requests.post(
+                    url,
+                    data=json.dumps(
+                        {
+                            "model": "default_model",
+                            "prompt": "hello",
+                            "max_tokens": 1,
+                            "logit_bias": bias,
+                        }
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.headers["Content-Type"], "application/json")
+                self.assertIn("logit_bias", response.json()["error"])
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -712,6 +743,74 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestLogitBiasValidation(unittest.TestCase):
+    """validate_model_parameters must turn every malformed logit_bias into a
+    ValueError (the JSON 400 path), never an uncaught TypeError, and must
+    reject non-finite values."""
+
+    @staticmethod
+    def _handler(**overrides):
+        handler = APIHandler.__new__(APIHandler)
+        defaults = dict(
+            stream=False,
+            max_tokens=10,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            num_draft_tokens=3,
+            prompt_lookup_ngram=0,
+            prompt_lookup_tokens=8,
+            repetition_penalty=0.0,
+            repetition_context_size=20,
+            presence_penalty=0.0,
+            presence_context_size=20,
+            frequency_penalty=0.0,
+            frequency_context_size=20,
+            logprobs=False,
+            top_logprobs=-1,
+            xtc_probability=0.0,
+            xtc_threshold=0.0,
+            requested_model="default_model",
+            adapter=None,
+            seed=None,
+            logit_bias=None,
+        )
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(handler, key, value)
+        return handler
+
+    def test_malformed_logit_bias_raises_value_error_not_type_error(self):
+        malformed = (
+            {"1": None},
+            {"1": "abc"},
+            {"1": [1.0]},
+            {"1": {"v": 1.0}},
+            {"1": True},
+            {None: 1.0},
+            {"x": 1.0},
+            {"1.5": 1.0},
+        )
+        for bias in malformed:
+            with self.subTest(logit_bias=bias):
+                handler = self._handler(logit_bias=bias)
+                with self.assertRaises(ValueError):
+                    handler.validate_model_parameters()
+
+    def test_non_finite_logit_bias_raises_value_error(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                handler = self._handler(logit_bias={"1": value})
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    handler.validate_model_parameters()
+
+    def test_valid_logit_bias_is_normalized(self):
+        handler = self._handler(logit_bias={"5": 2, "7": -1.5, 9: 0.25})
+        handler.validate_model_parameters()
+        self.assertEqual(handler.logit_bias, {5: 2.0, 7: -1.5, 9: 0.25})
 
 
 if __name__ == "__main__":
