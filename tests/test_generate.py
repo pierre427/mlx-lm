@@ -354,6 +354,25 @@ class TestGenerate(unittest.TestCase):
 
         self.assertEqual(selected, [0, 1])
 
+    def test_prefill_admission_defaults_to_fifo(self):
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prefill_batch_size=2,
+        )
+        prompts = [
+            [0] * 100,
+            [0] * 2000,
+            [0] * 120,
+            [0] * 1900,
+        ]
+        uids = gen.insert(prompts)
+
+        batch = gen._make_batch(2)
+
+        self.assertEqual(batch.uids, uids[:2])
+        gen.close()
+
     def test_batch_unique_max_toks(self):
         prompts = [
             "Write a story about Einstein",
