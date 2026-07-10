@@ -113,6 +113,19 @@ class TestRotatingRollback(unittest.TestCase):
         c.trim(3)
         self.assertEqual(c.offset, 7)
 
+    def test_not_speculating_post_wrap_trim_fails_closed(self):
+        # Once the ring wraps, the evicted rows are gone: a plain trim would
+        # silently corrupt the window. trim() must refuse (matching
+        # is_trimmable) and leave the cache state untouched.
+        c = RotatingKVCache(max_size=W)
+        _prefill(c, W + 2, seed=0)  # wrapped: offset >= max_size
+        self.assertFalse(c.is_trimmable())
+        offset, idx = c.offset, c._idx
+        with self.assertRaises(RuntimeError):
+            c.trim(1)
+        self.assertEqual(c.offset, offset)
+        self.assertEqual(c._idx, idx)
+
 
 if __name__ == "__main__":
     unittest.main()

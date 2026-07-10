@@ -633,6 +633,15 @@ class RotatingKVCache(_BaseCache):
 
     def trim(self, n):
         if not self.speculating:
+            if self.offset >= self.max_size:
+                # Fail closed (mirrors is_trimmable): once the ring has
+                # wrapped the evicted rows are gone, so decrementing offset
+                # would silently corrupt the window.
+                raise RuntimeError(
+                    f"Cannot trim {n} tokens from RotatingKVCache: the cache "
+                    f"has wrapped (offset {self.offset} >= max_size "
+                    f"{self.max_size}) and no speculative rollback is recorded."
+                )
             n = min(self.offset, n)
             self.offset -= n
             self._idx -= n
