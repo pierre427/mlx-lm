@@ -43,7 +43,7 @@ class DummyModelProvider:
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
                 "draft_model": None,
-                "kv_budget_gb": None,
+                "state_budget_gb": None,
                 "num_draft_tokens": 3,
                 "prompt_lookup_ngram": 0,
                 "prompt_lookup_tokens": 8,
@@ -1029,7 +1029,7 @@ class TestKVBudgetProbeFailure(unittest.TestCase):
         import mlx_lm.server as server_mod
 
         provider = DummyModelProvider()
-        provider.cli_args.kv_budget_gb = 1.0  # budget mode on → probe runs
+        provider.cli_args.state_budget_gb = 1.0  # budget mode on → probe runs
         provider.cli_args.decode_concurrency = 32
         provider.cli_args.prompt_concurrency = 8
         provider.cli_args.prefill_step_size = 2048
