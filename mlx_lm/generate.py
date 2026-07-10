@@ -2500,7 +2500,7 @@ class BatchGenerator:
         prefill_batch_window: Optional[int] = None,
         max_kv_size: Optional[int] = None,
         kv_budget_bytes: Optional[int] = None,
-        kv_cost: Optional[Tuple[float, float]] = None,
+        kv_cost: Optional[Tuple[float, float, Optional[int]]] = None,
         state_budget: Optional[StateBudget] = None,
         stream=None,
         prompt_trim_rollback_tokens: int = 0,
