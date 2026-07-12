@@ -58,6 +58,14 @@ from .prompt_lookup import plan_proposal_around_verify_cliff
 
 _GREEDY = make_sampler(temp=0.0)
 
+# MTP rate gate (see _mtp_draft_verify_loop): one-shot measured keep-or-drop
+# decision for the self-spec loop. Warmup cycles gather the spec-rate sample;
+# the probe decodes that many tokens plainly (still delivered output); spec
+# must beat plain by the margin to stay on.
+_RATE_GATE_WARMUP_CYCLES = 8
+_RATE_GATE_PROBE_TOKENS = 12
+_RATE_GATE_MARGIN = 0.03
+
 
 def _start_speculation_or_cleanup(caches, required_caches, error_message):
     """Enable rollback atomically and fail without leaking cache state."""
@@ -222,6 +230,12 @@ class HybridStats(_PromptLookupStatsBase):
     draft_accepted: int = 0  # ... of which the target accepted
     external_cache_reconciled: bool = False
     external_cache_trimmed_tokens: int = 0
+    # MTP rate gate (opt-in): one inline plain probe vs the measured spec
+    # rate, then a one-way keep-or-de-latch decision.
+    rate_gate_probed: bool = False
+    rate_gate_delatched: bool = False
+    rate_gate_spec_ms_per_tok: float = 0.0
+    rate_gate_plain_ms_per_tok: float = 0.0
 
     @property
     def total_emitted(self) -> int:
@@ -543,6 +557,8 @@ def adaptive_pld_generate_step(
     gate: float = 0.12,
     mtp_tail: bool = False,
     num_draft: int = 1,
+    persistent_mtp: bool = False,
+    mtp_rate_gate: bool = False,
     prefill_step_size: int = 512,
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[Any] = None,
@@ -562,6 +578,25 @@ def adaptive_pld_generate_step(
     then it self-speculates with the head (``self_mtp_generate_step`` tail),
     giving ~1.1x on the novel code PLD can't help with. So one greedy path serves
     both regimes: copy-heavy -> PLD, novel -> MTP.
+
+    ``persistent_mtp=True`` (with ``mtp_tail``) keeps the MTP tail's KV cache in
+    sync with the full committed sequence — the drafting regime vendor-trained
+    heads need (see ``self_mtp_generate_step``). The PLD phase routes its verify
+    forwards through ``model.model``/``model.logits`` (bit-identical values) so
+    the trunk hiddens of every committed token are available, and lazily
+    accumulates the (hidden, next_token) pairs; they are teacher-forced into the
+    MTP cache in batches (and finally at the latch handoff), so copy-heavy work
+    that never latches pays no extra MTP forwards until a flush. Incompatible
+    with an external ``prompt_cache``: the cached prefix's hiddens don't exist,
+    and an MTP cache missing those positions drafts at wrong RoPE offsets — the
+    exact failure persistence exists to fix — so that combination raises.
+
+    ``mtp_rate_gate=True`` protects the MTP tail with a one-shot measured
+    break-even check (see ``_mtp_draft_verify_loop``): after a few cycles it
+    probes plain decode inline and de-latches the tail permanently if
+    speculating isn't actually faster — the tail's acceptance and verify cost
+    are workload- and context-dependent, so a config that wins on code
+    generation can lose on prose or at long context.
 
     Greedy only, draft-free; one shared prompt cache. ``prompt_cache`` may hold
     a prefilled prefix; when it is provided, ``prompt`` is the uncached tail and
@@ -586,14 +621,49 @@ def adaptive_pld_generate_step(
     external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
+    persistent = (
+        persistent_mtp and mtp_tail and getattr(model, "mtp", None) is not None
+    )
+    if persistent and external_prompt_cache:
+        raise ValueError(
+            "persistent_mtp is incompatible with an external prompt_cache: the "
+            "cached prefix's trunk hiddens are unavailable, so the MTP cache "
+            "would draft at wrong RoPE offsets. Pass the full prompt instead."
+        )
+    mtp_cache = model.make_mtp_cache() if persistent else None
+    # Committed (hidden, next_token) pairs not yet teacher-forced into
+    # mtp_cache; flushed in batches so PLD cycles stay MTP-forward-free.
+    mtp_p_hs: List[mx.array] = []
+    mtp_p_ts: List[int] = []
+    MTP_FLUSH = 256
+
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
+        prev_h = None  # trunk hidden of the previous chunk's last position
         while y.size > 1:  # leave one token for the first verify window
             n = min(prefill_step_size, y.size - 1)
-            model(y[:n][None], cache=cache)
+            if persistent:
+                # Teacher-force the MTP over pairs (hidden_i, token_{i+1}) so
+                # its KV covers the prompt with real positions (same protocol
+                # as self_mtp_generate_step's prefill).
+                h_chunk = model.model(y[:n][None], cache=cache)
+                if prev_h is None:
+                    hs, ts = h_chunk[:, :-1], y[1:n][None]
+                else:
+                    hs = mx.concatenate([prev_h, h_chunk[:, :-1]], axis=1)
+                    ts = y[:n][None]
+                if ts.size > 0:
+                    model.mtp_step(hs, ts, mtp_cache)
+                prev_h = h_chunk[:, -1:, :]
+                mx.eval([c.state for c in mtp_cache])
+            else:
+                model(y[:n][None], cache=cache)
             mx.eval([c.state for c in cache])
             y = y[n:]
             mx.clear_cache()
+        if persistent and prev_h is not None:
+            # Pair (h_{L-2}, t_{L-1}); t_{L-1} is the pending verify token.
+            model.mtp_step(prev_h, y[None], mtp_cache)
     _start_speculation_or_cleanup(
         cache,
         cache,
@@ -645,7 +715,13 @@ def adaptive_pld_generate_step(
                 stats.verify_span_hist.get(verify_rows, 0) + 1
             )
             with mx.stream(generation_stream):
-                logits = model(y_verify[None], cache=cache)
+                if persistent:
+                    # Same values as model(...) — logits = lm_head(model.model)
+                    # — but the hiddens stay visible for MTP teacher-forcing.
+                    vhidden = model.model(y_verify[None], cache=cache)
+                    logits = model.logits(vhidden)
+                else:
+                    logits = model(y_verify[None], cache=cache)
                 rel = logits[0, -(n_prop + 1) :, :]
                 logprobs = rel - mx.logsumexp(rel, axis=-1, keepdims=True)
                 choices = mx.argmax(logprobs, axis=-1)
@@ -663,6 +739,23 @@ def adaptive_pld_generate_step(
             # never reached the caller so an external cache is not over-advanced.
             cached_unyielded = n_accept
             emitted = proposal[:n_accept] + [bonus]
+            if persistent:
+                # Predecessor hiddens of the committed span: rows for
+                # pending[-1] (predicts emitted[0]) through the last accepted
+                # proposal token (predicts the bonus). Rejected rows are
+                # excluded, so only committed pairs ever reach the MTP cache.
+                pre = len(pending) - 1
+                mtp_p_hs.append(vhidden[:, pre : pre + n_accept + 1, :])
+                mtp_p_ts.extend(emitted)
+                if len(mtp_p_ts) >= MTP_FLUSH:
+                    with mx.stream(generation_stream):
+                        model.mtp_step(
+                            mx.concatenate(mtp_p_hs, axis=1),
+                            mx.array([mtp_p_ts], mx.uint32),
+                            mtp_cache,
+                        )
+                        mx.eval([c.state for c in mtp_cache])
+                    mtp_p_hs, mtp_p_ts = [], []
             history.extend(emitted)
             for t in emitted:
                 sam.extend(t)
@@ -703,6 +796,16 @@ def adaptive_pld_generate_step(
                 # Keep speculation ON (MTP verify trims on reject). Bootstrap the
                 # seed hidden by forwarding the pending token through the trunk.
                 with mx.stream(generation_stream):
+                    if persistent and mtp_p_ts:
+                        # Bring the MTP cache current: pairs end at (·, bonus);
+                        # the loop's first draft call then appends the
+                        # (h(bonus), nxt) pair with correct positions.
+                        model.mtp_step(
+                            mx.concatenate(mtp_p_hs, axis=1),
+                            mx.array([mtp_p_ts], mx.uint32),
+                            mtp_cache,
+                        )
+                        mtp_p_hs, mtp_p_ts = [], []
                     bh = model.model(mx.array(pending, mx.uint32)[None], cache=cache)
                     blp = model.logits(bh)[0, -1]
                     blp = blp - mx.logsumexp(blp)
@@ -711,7 +814,16 @@ def adaptive_pld_generate_step(
                 stats.plain_tokens += 1
                 yield nxt, blp, False
                 yield from _mtp_draft_verify_loop(
-                    model, cache, nxt, bh[:, -1:, :], ntoks, max_tokens, num_draft, stats
+                    model,
+                    cache,
+                    nxt,
+                    bh[:, -1:, :],
+                    ntoks,
+                    max_tokens,
+                    num_draft,
+                    stats,
+                    mtp_cache=mtp_cache,
+                    rate_gate=mtp_rate_gate,
                 )
             else:
                 _stop_all_speculation(cache)
@@ -749,6 +861,7 @@ def self_mtp_generate_step(
     prefill_step_size: int = 512,
     sampling_temp: float = 0.0,
     persistent_mtp: bool = False,
+    rate_gate: bool = False,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
@@ -773,6 +886,11 @@ def self_mtp_generate_step(
     trained in — which can lift acceptance dramatically (Hy3-REAP50: 33% ->
     ~80% on code). Costs one extra (single-layer) MTP forward per cycle plus
     ~1 layer-equivalent of prefill; requires the MTP cache to be trimmable.
+
+    ``rate_gate=True`` adds the one-shot measured break-even check from
+    ``_mtp_draft_verify_loop``: keep speculating only if it is actually faster
+    than an inline plain-decode probe; otherwise fall back to plain for the
+    rest of the generation.
 
     Yields ``(token, logprobs, from_draft)``.
     """
@@ -840,6 +958,7 @@ def self_mtp_generate_step(
             stats,
             sampling_temp,
             mtp_cache=mtp_cache,
+            rate_gate=rate_gate,
         )
     finally:
         _stop_all_speculation(cache)
@@ -888,6 +1007,7 @@ def _mtp_draft_verify_loop(
     stats,
     sampling_temp: float = 0.0,
     mtp_cache=None,
+    rate_gate: bool = False,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -900,11 +1020,87 @@ def _mtp_draft_verify_loop(
     k draft entries are rewound; the newly committed span (with TRUNK hiddens)
     is carried as ``pending`` pairs and teacher-forced as a prefix of the next
     cycle's first draft call — one MTP forward per cycle, no separate
-    catch-up pass. ``None`` keeps the legacy fresh-cache-per-cycle behavior."""
+    catch-up pass. ``None`` keeps the legacy fresh-cache-per-cycle behavior.
+
+    ``rate_gate=True`` adds a one-shot empirical break-even check: after
+    ``_RATE_GATE_WARMUP_CYCLES`` measured draft/verify cycles, it decodes
+    ``_RATE_GATE_PROBE_TOKENS`` tokens plainly INLINE (the probe tokens are
+    delivered output, nothing is wasted), compares wall-clock ms per delivered
+    token, and decides ONCE: keep speculating only if the spec rate beats the
+    plain rate by ``_RATE_GATE_MARGIN``; otherwise de-latch to plain decode for
+    the rest of the generation. Measured, not modeled — the verify-cost
+    break-even is target- AND context-dependent (see
+    lessons/persistent-mtp-context-cache) — and one-way, so no mid-stream
+    thrashing (the adaptive-PLD latch philosophy; per the D-Cut lesson,
+    continuous adaptivity loses to simple decisions)."""
     persistent = mtp_cache is not None
     pending_hs = None  # committed (hidden, token) pairs not yet in mtp_cache
     pending_ts: List[int] = []
+    gated_off = False
+    gate_cycles = 0
+    spec_secs = 0.0  # wall-clock over measured spec cycles
+    spec_toks = 0  # tokens those cycles delivered
+
+    def _plain_step():
+        # One width-1 trunk forward: commits `cur`, samples the next token.
+        # Keeps the pending-pair protocol intact so persistent drafting can
+        # resume seamlessly after a probe.
+        nonlocal cur, seed_h, pending_hs, pending_ts
+        with mx.stream(generation_stream):
+            h = model.model(mx.array([[cur]], mx.uint32), cache=cache)
+            lp = _temperature_logprobs(model.logits(h)[0, -1], sampling_temp)
+            nxt = _sample_from_logprobs(lp, sampling_temp)
+        if persistent and not gated_off:
+            # Pairs only matter if drafting can resume; after a permanent
+            # de-latch they would just accumulate unused memory.
+            pending_hs = (
+                seed_h if pending_hs is None
+                else mx.concatenate([pending_hs, seed_h], axis=1)
+            )
+            pending_ts.append(cur)
+        seed_h, cur = h[:, -1:, :], nxt
+        stats.cycles += 1
+        stats.plain_cycles += 1
+        stats.plain_tokens += 1
+        return nxt, lp
+
     while ntoks < max_tokens:
+        if gated_off:
+            tok_, lp = _plain_step()
+            ntoks += 1
+            yield tok_, lp, False
+            continue
+        if rate_gate and not stats.rate_gate_probed and gate_cycles >= _RATE_GATE_WARMUP_CYCLES:
+            stats.rate_gate_probed = True
+            # Honest plain reference: rollback recording (GDN/rotating-cache
+            # speculation bookkeeping) is spec-only overhead, so switch it off
+            # for the probe — and leave it off after a de-latch, which is also
+            # what makes the plain fallback run at true baseline speed. All
+            # tokens are committed at this point, so there is nothing to lose.
+            _stop_all_speculation(cache)
+            probe_t0 = time.perf_counter()
+            n_probe = 0
+            while n_probe < _RATE_GATE_PROBE_TOKENS and ntoks < max_tokens:
+                tok_, lp = _plain_step()
+                ntoks += 1
+                n_probe += 1
+                yield tok_, lp, False
+            plain_rate = (time.perf_counter() - probe_t0) * 1000.0 / max(n_probe, 1)
+            spec_rate = spec_secs * 1000.0 / max(spec_toks, 1)
+            stats.rate_gate_spec_ms_per_tok = spec_rate
+            stats.rate_gate_plain_ms_per_tok = plain_rate
+            if spec_rate > plain_rate * (1.0 - _RATE_GATE_MARGIN):
+                gated_off = True
+                stats.rate_gate_delatched = True
+            else:
+                _start_speculation_or_cleanup(
+                    cache,
+                    cache,
+                    "MTP rate-gate resume needs a trimmable prompt cache.",
+                )
+            continue
+        cycle_t0 = time.perf_counter()
+        ntoks_at_cycle_start = ntoks
         stats.cycles += 1
         k = min(num_draft, max_tokens - ntoks)
 
@@ -993,6 +1189,9 @@ def _mtp_draft_verify_loop(
             stats.bonus_tokens += 1
             yield bonus, logprobs[n_accept], False
         cur = bonus
+        spec_secs += time.perf_counter() - cycle_t0
+        spec_toks += ntoks - ntoks_at_cycle_start
+        gate_cycles += 1
 
 
 def hybrid_stream_generate(
