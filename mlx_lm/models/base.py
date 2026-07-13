@@ -128,6 +128,17 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        if n_repeats > 1 and mask.ndim == scores.ndim - 1:
+            # In the GQA branch `scores` is (B, n_kv_heads, n_repeats, L, S).
+            # A caller-supplied mask with a leading head axis is one rank short;
+            # split (broadcast singleton) that axis to (n_kv_heads, n_repeats)
+            # so it aligns instead of colliding on broadcast. Masks that are
+            # already 5D (e.g. absorbed-MLA pe_scores pre-shaped by the caller)
+            # have full rank and are left untouched. Mirrors ml-explore/mlx-lm#1558.
+            if mask.shape[-3] == 1:
+                mask = mx.expand_dims(mask, -3)
+            else:
+                mask = mx.unflatten(mask, -3, (n_kv_heads, n_repeats))
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:
