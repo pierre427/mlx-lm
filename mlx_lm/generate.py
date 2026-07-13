@@ -208,6 +208,13 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--kv-rotate",
+        action="store_true",
+        help="Hadamard-rotate the KV cache before quantization, keeping low-bit "
+        "--kv-bits near full precision (scores are preserved; head_dim must be a "
+        "supported Hadamard size).",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -296,7 +303,9 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+def maybe_quantize_kv_cache(
+    prompt_cache, quantized_kv_start, kv_group_size, kv_bits, kv_rotate=False
+):
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
@@ -312,7 +321,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 )
             try:
                 prompt_cache[e] = c.to_quantized(
-                    group_size=kv_group_size, bits=kv_bits
+                    group_size=kv_group_size, bits=kv_bits, rotate=kv_rotate
                 )
             except NotImplementedError as exc:
                 raise ValueError(
@@ -334,6 +343,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_rotate: bool = False,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -411,6 +421,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_rotate=kv_rotate,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -601,6 +612,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_rotate: bool = False,
     tokenizer: Optional[Union[PreTrainedTokenizer, TokenizerWrapper]] = None,
     relaxed_topk: Optional[int] = None,
     relaxed_delta: Optional[float] = None,
@@ -755,6 +767,7 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_rotate=kv_rotate,
     )
 
     def _process_and_sample(tokens, logits):
@@ -2835,6 +2848,7 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_rotate=args.kv_rotate,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
