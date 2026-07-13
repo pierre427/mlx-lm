@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import inspect
 import math
@@ -116,6 +116,8 @@ def quantized_scaled_dot_product_attention(
     mask: Optional[mx.array],
     group_size: int = 64,
     bits: int = 8,
+    key_bits: Optional[int] = None,
+    value_bits: Optional[int] = None,
 ) -> mx.array:
     B, n_q_heads, L, D = queries.shape
     n_kv_heads = q_keys[0].shape[-3]
@@ -138,6 +140,8 @@ def quantized_scaled_dot_product_attention(
         )
 
     queries *= scale
+    key_bits = bits if key_bits is None else key_bits
+    value_bits = bits if value_bits is None else value_bits
 
     if n_repeats > 1:
         queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
@@ -145,7 +149,7 @@ def quantized_scaled_dot_product_attention(
         q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
 
     scores = mx.quantized_matmul(
-        queries, *q_keys, transpose=True, group_size=group_size, bits=bits
+        queries, *q_keys, transpose=True, group_size=group_size, bits=key_bits
     )
     if mask is not None:
         if isinstance(mask, str):
@@ -153,13 +157,15 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        if n_repeats > 1 and mask.ndim > 3:
+            mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:
             scores += mask
     scores = mx.softmax(scores, axis=-1, precise=True)
     out = mx.quantized_matmul(
-        scores, *q_values, transpose=False, group_size=group_size, bits=bits
+        scores, *q_values, transpose=False, group_size=group_size, bits=value_bits
     )
 
     if n_repeats > 1:
@@ -185,6 +191,7 @@ def scaled_dot_product_attention(
         # scores are preserved while the stored keys quantize far more cleanly.
         if getattr(cache, "rotate", False) and hadamard_size_ok(queries.shape[-1]):
             queries = rotate_last(queries)
+        legacy_bits = cache.bits
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
@@ -192,7 +199,8 @@ def scaled_dot_product_attention(
             scale=scale,
             mask=mask,
             group_size=cache.group_size,
-            bits=cache.bits,
+            key_bits=getattr(cache, "key_bits", legacy_bits),
+            value_bits=getattr(cache, "value_bits", legacy_bits),
         )
     else:
         return mx.fast.scaled_dot_product_attention(

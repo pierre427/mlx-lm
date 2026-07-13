@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import json
@@ -10,8 +10,7 @@ import socket
 import time
 import uuid
 import warnings
-from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -35,16 +34,29 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
-    SequenceStateMachine,
+    StopSequenceMatcher,
+    TextStateMachine,
+    validate_kv_quantization_args,
+    make_stop_matcher,
+    make_text_state_machine,
     stream_generate,
 )
-from .models.cache import (
-    LRUPromptCache,
-    make_prompt_cache,
-)
+from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+def validate_kv_args(args):
+    """Fail at server startup for incomplete per-side KV precision flags."""
+    return validate_kv_quantization_args(
+        args.kv_bits,
+        args.kv_key_bits,
+        args.kv_value_bits,
+        args.kv_group_size,
+        args.quantized_kv_start,
+    )
 
 
 def get_system_fingerprint():
@@ -214,7 +226,8 @@ class GenerationContext:
     has_thinking: bool
     tool_parser: Callable[[str, Any], Dict]
 
-    sequences: Dict[Tuple[int], str]
+    text_sm: TextStateMachine
+    initial_state: str
 
     prompt: List[int]
     prompt_cache_count: int = -1
@@ -229,27 +242,9 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    state: str
-    match: Tuple[int]
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
-
-
-def _process_control_tokens(ctx, token_stream):
-    buffer_size = max(len(s) for s in ctx.sequences)
-    buffered_stream = deque()
-
-    for tok in token_stream:
-        buffered_stream.append(tok)
-        if tok.match is not None:
-            popped = [buffered_stream.pop() for _ in tok.match]
-            for t in reversed(popped):
-                buffered_stream.append(replace(t, text=""))
-        if len(buffered_stream) >= buffer_size:
-            yield buffered_stream.popleft()
-    while len(buffered_stream) > 0:
-        yield buffered_stream.popleft()
 
 
 class TimeBudget:
@@ -374,6 +369,16 @@ class ModelProvider:
         is_batchable = draft_model is None
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
+        )
+        # QuantizedKVCache does not implement batched merge/extract. Keep
+        # quantized-cache serving on the supported sequential generation path.
+        is_batchable = is_batchable and all(
+            bits is None
+            for bits in (
+                getattr(self.cli_args, "kv_bits", None),
+                getattr(self.cli_args, "kv_key_bits", None),
+                getattr(self.cli_args, "kv_value_bits", None),
+            )
         )
 
         # Update the member variables
@@ -626,64 +631,21 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
-    def _make_state_machine(
-        self, model_key, tokenizer, stop_words, initial_state="normal"
-    ):
-        """Make a new SequenceStateMachine or fetch it if we 've made it before.
-
-        Return also a dictionary that maps the token sequences in the state
-        machine to their strings.
-        """
-        cache_key = (model_key, tuple(stop_words), initial_state)
+    def _make_state_machine(self, model_key, tokenizer, stop_words):
+        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        # Will hold the state machine transitions and the sequences map to
-        # strings.
-        transitions = {}
-        sequences = {}
+        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        text_sm = make_text_state_machine(tokenizer, stop_words)
 
-        # Add all the stop sequences
-        common_stops = []
-        for t in tokenizer.eos_token_ids:
-            sequences[(t,)] = tokenizer.convert_ids_to_tokens(t)
-            common_stops.append(((t,), None))
-        for w in stop_words:
-            t = tuple(tokenizer.encode(w, add_special_tokens=False))
-            sequences[t] = w
-            common_stops.append((t, None))
-
-        # From normal to stop
-        transitions["normal"] = list(common_stops)
-
-        # Reasoning related transitions
-        if tokenizer.has_thinking:
-            ts = tokenizer.think_start_tokens
-            te = tokenizer.think_end_tokens
-            transitions["normal"].append((ts, "reasoning"))
-            transitions["reasoning"] = [(te, "normal")]
-            transitions["reasoning"].extend(common_stops)
-            sequences[ts] = tokenizer.think_start
-            sequences[te] = tokenizer.think_end
-
-        # Tool calling relating transitions
-        if tokenizer.has_tool_calling:
-            ts = tokenizer.tool_call_start_tokens
-            te = tokenizer.tool_call_end_tokens
-            transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")] if te else []
-            transitions["tool"].extend(common_stops)
-            sequences[ts] = tokenizer.tool_call_start
-            if te:
-                sequences[te] = tokenizer.tool_call_end
-
-        sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (sm, sequences)
+        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
 
-        return sm, sequences
+        return stop_matcher, text_sm
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -753,11 +715,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    sm, sequences = self._make_state_machine(
+                    stop_matcher, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
-                        initial_state,
                     )
 
                     self._log_cache_stats()
@@ -778,7 +739,8 @@ class ResponseGenerator:
                         has_tool_calling=tokenizer.has_tool_calling,
                         has_thinking=tokenizer.has_thinking,
                         tool_parser=tokenizer.tool_parser,
-                        sequences=sequences,
+                        text_sm=text_sm,
+                        initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
                     )
@@ -791,7 +753,7 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        state_machines=[sm],
+                        stop_matchers=[stop_matcher],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -892,13 +854,23 @@ class ResponseGenerator:
 
                     for r in gen_responses:
                         result = batch_results[r.uid]
-                        result["detokenizer"].add_token(r.token)
+
+                        # Don't decode the final stop token
+                        if r.finish_reason == "stop":
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        elif r.finish_reason == "length":
+                            result["detokenizer"].add_token(r.token)
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        else:
+                            result["detokenizer"].add_token(r.token)
+                            text = result["detokenizer"].last_segment
+
                         result["rqueue"].put(
                             Response(
-                                result["detokenizer"].last_segment,
+                                text,
                                 r.token,
-                                r.current_state,
-                                r.match_sequence,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
                                 _format_top_logprobs(
@@ -945,20 +917,19 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            sm, sequences = self._make_state_machine(
+            stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
-                initial_state=initial_state,
             )
-            sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
                 has_thinking=tokenizer.has_thinking,
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_parser=tokenizer.tool_parser,
-                sequences=sequences,
+                text_sm=text_sm,
+                initial_state=initial_state,
                 prompt=prompt,
             )
             rqueue.put(ctx)
@@ -984,6 +955,7 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1004,17 +976,29 @@ class ResponseGenerator:
                 ),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=getattr(self.cli_args, "kv_bits", None),
+                kv_key_bits=getattr(self.cli_args, "kv_key_bits", None),
+                kv_value_bits=getattr(self.cli_args, "kv_value_bits", None),
+                kv_group_size=getattr(self.cli_args, "kv_group_size", 64),
+                quantized_kv_start=getattr(
+                    self.cli_args,
+                    "quantized_kv_start",
+                    DEFAULT_QUANTIZED_KV_START,
+                ),
             ):
                 finish_reason = gen.finish_reason
-                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
-                if match_sequence is not None and current_state is None:
+
+                # Token-level stop word detection
+                stop_state, matched = StopSequenceMatcher.match(
+                    stop_state, stop_matcher._trie, gen.token
+                )
+                if matched:
                     finish_reason = "stop"
+
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
-                        current_state,
-                        match_sequence,
                         gen.logprobs[gen.token].item(),
                         finish_reason,
                         _format_top_logprobs(
@@ -1068,7 +1052,7 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
-        return ctx, _process_control_tokens(ctx, _inner())
+        return ctx, _inner()
 
     @property
     def cli_args(self):
@@ -1493,8 +1477,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
+        # Initialize the text state machine
+        sm_state = ctx.text_sm.make_state(ctx.initial_state)
+
         # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = None
+        prev_state = ctx.initial_state
         finish_reason = "stop"
         reasoning_text = ""
         made_tool_call = False
@@ -1509,18 +1496,32 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Collect the text according to our current state and state
-                # transitions. Reasoning or tool or normal text.
-                if gen.state == "reasoning":
-                    reasoning_text += gen.text
-                elif gen.state == "tool":
-                    tool_text += gen.text
-                elif gen.state == "normal":
+                # Advance the text state machine to strip control sequences
+                if gen.finish_reason == "stop":
+                    sm_state, current_state = TextStateMachine.discard(sm_state)
+                    clean_text = ""
+                elif gen.finish_reason == "length":
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
+                    clean_text += flushed
+                else:
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+
+                # Collect the clean text by state: reasoning, tool, or normal
+                if current_state == "reasoning":
+                    reasoning_text += clean_text
+                elif current_state == "tool":
+                    tool_text += clean_text
+                elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
                         tool_text = ""
                         made_tool_call = True
-                    text += gen.text
+                    text += clean_text
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1531,7 +1532,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if (
                     self.stream
-                    and gen.state != "tool"
+                    and current_state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
                     resp = self.generate_response(
@@ -1549,7 +1550,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
-                prev_state = gen.state
+                prev_state = current_state
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
@@ -1802,7 +1803,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -1947,11 +1948,50 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        help="Number of bits for KV cache quantization. Defaults to no quantization.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-key-bits",
+        type=int,
+        help="Number of bits for key-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=int,
+        help="Number of bits for value-cache quantization. Overrides --kv-bits.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        help="Group size for KV cache quantization.",
+        default=64,
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        help="When KV bits are set, start quantizing the cache from this step.",
+        default=DEFAULT_QUANTIZED_KV_START,
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = setup_arg_parser()
     args = parser.parse_args()
+    try:
+        validate_kv_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
