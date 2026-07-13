@@ -34,6 +34,17 @@ def rotate_last(x: mx.array) -> mx.array:
     return mx.hadamard_transform(x, scale=1.0 / math.sqrt(x.shape[-1]))
 
 
+def _expand_kv_scale(scale: mx.array, n_q_heads: int) -> mx.array:
+    """Broadcast a per-kv-head channel scale ``(B, n_kv_heads, 1, D)`` up to the
+    query heads. Under grouped-query attention several query heads share one kv
+    head, so each kv-head scale is repeated ``n_q_heads // n_kv_heads`` times
+    along the head axis to line up with a ``(B, n_q_heads, L, D)`` tensor."""
+    n_repeats = n_q_heads // scale.shape[1]
+    if n_repeats > 1:
+        scale = mx.repeat(scale, n_repeats, axis=1)
+    return scale
+
+
 @dataclass
 class BaseModelArgs:
     @classmethod
@@ -192,8 +203,17 @@ def scaled_dot_product_attention(
         # scores are preserved while the stored keys quantize far more cleanly.
         if getattr(cache, "rotate", False) and hadamard_size_ok(queries.shape[-1]):
             queries = rotate_last(queries)
+        # KVarN normalization: stored keys are (R k) ⊘ s_k, so undo the diagonal
+        # rescale on the *query* side — (R q ⊙ s_k)·((R k) ⊘ s_k) = (R q)·(R k)
+        # — leaving the scores exact up to (smaller) quant error. Values are
+        # stored v ⊘ s_v; that undo is applied to the attention output below.
+        normalize = getattr(cache, "normalize", False)
+        key_scale = getattr(cache, "key_scale", None)
+        value_scale = getattr(cache, "value_scale", None)
+        if normalize and key_scale is not None:
+            queries = queries * _expand_kv_scale(key_scale, queries.shape[1])
         legacy_bits = cache.bits
-        return quantized_scaled_dot_product_attention(
+        out = quantized_scaled_dot_product_attention(
             queries,
             keys,
             values,
@@ -203,6 +223,12 @@ def scaled_dot_product_attention(
             key_bits=getattr(cache, "key_bits", legacy_bits),
             value_bits=getattr(cache, "value_bits", legacy_bits),
         )
+        if normalize and value_scale is not None:
+            # softmax @ (v ⊘ s_v) = (softmax @ v) ⊘ s_v, so recover the true
+            # output by re-applying s_v per value channel (broadcast over the
+            # query heads that share each kv head).
+            out = out * _expand_kv_scale(value_scale, out.shape[1])
+        return out
     else:
         return mx.fast.scaled_dot_product_attention(
             queries,

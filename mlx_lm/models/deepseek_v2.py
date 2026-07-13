@@ -9,7 +9,13 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    hadamard_size_ok,
+    rotate_last,
+    scaled_dot_product_attention,
+)
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
@@ -233,6 +239,37 @@ class DeepseekV2Attention(nn.Module):
         # A QuantizedKVCache returns (weight, scales, biases) tuples for the
         # cached latent and rope keys.
         quantized = not isinstance(k_pe, mx.array)
+
+        # Hadamard-rotated latent (PR #1555 on the absorbed MLA path). The cache
+        # stores the kv_lora_rank(512)+qk_rope_head_dim(64)=576 latent as two
+        # separate tensors: the 512 latent as the cache "keys" and the 64 rope
+        # as the cache "values". 576 is not a Hadamard-supported width, but 512
+        # (=2^9) is, so rotation targets the 512 latent slice only; the rope
+        # slice rides in the cache values and is never rotated.
+        #
+        # The absorbed path reuses the *same* rotated latent as both the score
+        # key and the output value, so:
+        #   * scores: the generic quantized SDPA rotates q_nope (512) to match
+        #     the rotated stored keys, so (R q)·(R latent) = q·latent — exact.
+        #   * output: SDPA returns softmax @ (R latent) = R·(softmax @ latent),
+        #     so we un-rotate the latent-space output before unembed_out. The
+        #     512-Hadamard is orthonormal and self-inverse (R∘R = I), which
+        #     makes this exact up to quantization error.
+        latent_rotated = (
+            cache is not None
+            and getattr(cache, "rotate", False)
+            and hadamard_size_ok(self.kv_lora_rank)
+        )
+        if cache is not None and getattr(cache, "normalize", False):
+            # KVarN normalization is unsound on the absorbed path: the latent is
+            # normalized once (as the cache keys, with key_scale) but serves as
+            # both key and value, while the generic SDPA wrapper would undo the
+            # *rope's* value_scale on the latent output. Fail closed.
+            raise NotImplementedError(
+                "KVarN normalization is not supported on the DeepseekV2 absorbed "
+                "MLA path (the latent is both key and value; its key_scale, not "
+                "the rope value_scale, governs the output undo)."
+            )
         if quantized:
             pe_scores = mx.quantized_matmul(
                 q_pe * self.scale,
@@ -261,11 +298,19 @@ class DeepseekV2Attention(nn.Module):
             output = scaled_dot_product_attention(
                 q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
             )
+            if latent_rotated:
+                # Undo the latent rotation on the attention output (still in
+                # latent space here) before unembed_out below.
+                output = rotate_last(output)
         else:
             if quantized:
                 kv_latent = mx.dequantize(
                     *kv_latent, group_size=cache.group_size, bits=cache.bits
                 )
+            if latent_rotated:
+                # Recover the true latent before the (non-orthogonal) embed_q /
+                # unembed_out projections, which do not commute with R.
+                kv_latent = rotate_last(kv_latent)
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
             # k/v are materialized arrays here, so use the plain SDPA path
