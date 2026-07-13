@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import copy
 import inspect
@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
-from .base import create_causal_mask
+from .base import create_causal_mask, hadamard_size_ok, rotate_last
 
 
 def make_prompt_cache(
@@ -253,13 +253,61 @@ class ConcatenateKVCache(_BaseCache):
 
 class QuantizedKVCache(_BaseCache):
     step = 256
+    _supported_bits = {2, 3, 4, 5, 6, 8}
+    _supported_group_sizes = {32, 64, 128}
 
-    def __init__(self, group_size: int = 64, bits: int = 8):
+    @classmethod
+    def _validate_config(cls, group_size, key_bits, value_bits):
+        if key_bits not in cls._supported_bits:
+            raise ValueError(f"Unsupported key bits: {key_bits}")
+        if value_bits not in cls._supported_bits:
+            raise ValueError(f"Unsupported value bits: {value_bits}")
+        if group_size not in cls._supported_group_sizes:
+            raise ValueError(f"Unsupported group size: {group_size}")
+
+    def __init__(
+        self,
+        group_size: int = 64,
+        bits: int = 8,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ):
         self.keys = None
         self.values = None
         self.offset = 0
         self.group_size = group_size
-        self.bits = bits
+        self.key_bits = bits if key_bits is None else key_bits
+        self.value_bits = bits if value_bits is None else value_bits
+        self._validate_config(group_size, self.key_bits, self.value_bits)
+        # ``bits`` is retained for callers inspecting legacy symmetric caches.
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
+        self.rotate = rotate
+        # KVarN variance normalization (vLLM RFC #46613 / arXiv 2606.03458).
+        # Orthogonal to ``rotate``. When enabled, a per-(batch, kv-head, channel)
+        # scale is frozen from the first update (the prefill block) and used to
+        # divide K/V before ``mx.quantize`` so a few outlier channels no longer
+        # dominate each group's affine range. The scales are re-applied at
+        # attention time (see ``scaled_dot_product_attention`` in base.py) so
+        # both attention scores and the attention output are preserved exactly
+        # up to (now-smaller) quantization error. See the ``update_and_fetch``
+        # comment for the exact invariant.
+        self.normalize = normalize
+        self.key_scale = None
+        self.value_scale = None
+
+    @staticmethod
+    def _channel_scale(x, eps: float = 1e-6):
+        """Per-channel scale = RMS over the sequence axis, in ``x``'s dtype.
+
+        Shape ``(B, n_kv_heads, 1, D)`` — one positive scalar per channel,
+        constant across sequence positions. RMS (not std) is used so the scale
+        is well defined even for a single-token first block and so it captures
+        both the mean and variance magnitude of an outlier channel."""
+        scale = mx.sqrt(mx.mean(x.astype(mx.float32) ** 2, axis=-2, keepdims=True))
+        return (scale + eps).astype(x.dtype)
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -267,15 +315,15 @@ class QuantizedKVCache(_BaseCache):
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            el_per_int = 8 * mx.uint32.size // self.bits
             new_steps = (self.step + num_steps - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
-            def init_quant(dim):
+            def init_quant(dim, bits, dtype):
+                packed_dim = dim * bits // (8 * mx.uint32.size)
                 return (
-                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
-                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, packed_dim), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // self.group_size), dtype=dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=dtype),
                 )
 
             def expand_quant(x):
@@ -292,12 +340,33 @@ class QuantizedKVCache(_BaseCache):
                     expand_quant, (self.keys, self.values)
                 )
             else:
-                self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+                self.keys = init_quant(k_head_dim, self.key_bits, keys.dtype)
+                self.values = init_quant(v_head_dim, self.value_bits, values.dtype)
 
         self.offset += num_steps
 
-        keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
-        values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        if self.rotate and hadamard_size_ok(keys.shape[-1]):
+            keys = rotate_last(keys)
+        if self.normalize:
+            # KVarN invariant (diagonal per-channel rescale D = diag(s), frozen
+            # at the first block so it is constant across all key positions):
+            #
+            #   stored K = quantize((R k) / s_k),   stored V = quantize(v / s_v)
+            #
+            # A single frozen scale is required because the score-preserving
+            # undo happens on the *query* side (see base.py):
+            #   (R q ⊙ s_k) · ((R k) ⊘ s_k) = (R q)·(R k) = q·k
+            # so s_k must not depend on the key position j. The value undo is a
+            # single per-channel multiply of the attention output by s_v, since
+            #   softmax @ (v ⊘ s_v) = (softmax @ v) ⊘ s_v.
+            # Freezing at the prefill block keeps this calibration-free.
+            if self.key_scale is None:
+                self.key_scale = self._channel_scale(keys)
+                self.value_scale = self._channel_scale(values)
+            keys = keys / self.key_scale
+            values = values / self.value_scale
+        keys = mx.quantize(keys, group_size=self.group_size, bits=self.key_bits)
+        values = mx.quantize(values, group_size=self.group_size, bits=self.value_bits)
         for i in range(len(self.keys)):
             self.keys[i][..., prev : self.offset, :] = keys[i]
             self.values[i][..., prev : self.offset, :] = values[i]
@@ -307,23 +376,106 @@ class QuantizedKVCache(_BaseCache):
     @property
     def state(self):
         if self.offset == self.keys[0].shape[2]:
-            return self.keys, self.values
+            keys, values = self.keys, self.values
         else:
-            return tree_map(
+            keys, values = tree_map(
                 lambda x: x[..., : self.offset, :], (self.keys, self.values)
             )
+        if self.normalize:
+            # Carry the frozen per-channel scales so a normalized cache
+            # round-trips through save/load (they cannot live in meta_state,
+            # which is stringified integers).
+            return keys, values, self.key_scale, self.value_scale
+        return keys, values
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        if len(v) == 4:
+            self.keys, self.values, self.key_scale, self.value_scale = v
+        else:
+            self.keys, self.values = v
+            self.key_scale = self.value_scale = None
+
+    def _validate_state_geometry(self):
+        for name, state, bits in (
+            ("keys", self.keys, self.key_bits),
+            ("values", self.values, self.value_bits),
+        ):
+            if state is None:
+                continue
+            if len(state) != 3:
+                raise ValueError(f"Invalid quantized {name} state: expected 3 arrays")
+            packed, scales, biases = state
+            if packed.dtype != mx.uint32 or scales.dtype != biases.dtype:
+                raise ValueError(f"Invalid quantized {name} state dtypes")
+            if scales.shape != biases.shape or packed.shape[:-1] != scales.shape[:-1]:
+                raise ValueError(f"Invalid quantized {name} state geometry")
+            if packed.shape[-1] * 32 != scales.shape[-1] * self.group_size * bits:
+                raise ValueError(
+                    f"Quantized {name} state does not match {bits}-bit metadata"
+                )
+            if packed.shape[-2] != self.offset:
+                raise ValueError(
+                    f"Quantized {name} state length does not match cache offset"
+                )
+        if self.keys is not None and self.values is not None:
+            if self.keys[0].shape[:-1] != self.values[0].shape[:-1]:
+                raise ValueError("Quantized key/value batch, head, or length mismatch")
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+        if (
+            self.key_bits == self.value_bits
+            and not self.rotate
+            and not self.normalize
+        ):
+            return tuple(map(str, (self.offset, self.group_size, self.key_bits)))
+        # Versioned layout. Trailing optional flags (rotate, normalize) are
+        # emitted only when needed so the common asymmetric case stays a 5-tuple
+        # (older readers ignore fields they lack; the setter defaults them off).
+        fields = [
+            2,
+            self.offset,
+            self.group_size,
+            self.key_bits,
+            self.value_bits,
+        ]
+        if self.rotate or self.normalize:
+            fields.append(int(self.rotate))
+        if self.normalize:
+            fields.append(int(self.normalize))
+        return tuple(map(str, fields))
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        if len(v) == 3:
+            # Legacy symmetric cache metadata: offset, group_size, bits.
+            self.offset, self.group_size, bits = map(int, v)
+            self.key_bits = self.value_bits = self.bits = bits
+            self.rotate = False
+            self.normalize = False
+            self._validate_config(self.group_size, self.key_bits, self.value_bits)
+            self._validate_state_geometry()
+            return
+
+        if len(v) not in (5, 6, 7):
+            raise ValueError(
+                "Invalid QuantizedKVCache metadata: expected 3 legacy fields "
+                "or 5-7 versioned fields."
+            )
+
+        vals = list(map(int, v))
+        version, self.offset, self.group_size, self.key_bits, self.value_bits = vals[:5]
+        if version != 2:
+            raise ValueError(
+                f"Unsupported QuantizedKVCache metadata version: {version}"
+            )
+        # Caches saved before `rotate`/`normalize` existed carry 5 fields.
+        self.rotate = bool(vals[5]) if len(vals) > 5 else False
+        self.normalize = bool(vals[6]) if len(vals) > 6 else False
+        self._validate_config(self.group_size, self.key_bits, self.value_bits)
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
+        self._validate_state_geometry()
 
     def is_trimmable(self):
         return True
@@ -402,13 +554,40 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ) -> QuantizedKVCache:
+        quant_cache = QuantizedKVCache(
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotate=rotate,
+            normalize=normalize,
+        )
         quant_cache.offset = self.offset
         if self.keys is not None:
-            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            keys = self.keys
+            values = self.values
+            if rotate and hadamard_size_ok(keys.shape[-1]):
+                keys = rotate_last(keys)
+            if normalize:
+                quant_cache.key_scale = quant_cache._channel_scale(keys)
+                quant_cache.value_scale = quant_cache._channel_scale(values)
+                keys = keys / quant_cache.key_scale
+                values = values / quant_cache.value_scale
+            quant_cache.keys = mx.quantize(
+                keys, group_size=group_size, bits=quant_cache.key_bits
+            )
             quant_cache.values = mx.quantize(
-                self.values, group_size=group_size, bits=bits
+                values, group_size=group_size, bits=quant_cache.value_bits
             )
         return quant_cache
 
