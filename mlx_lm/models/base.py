@@ -128,20 +128,21 @@ def quantized_scaled_dot_product_attention(
         if n_repeats == 1
         else _QUANT_SDPA_FLASH_MIN_L_GQA
     )
+    key_bits = bits if key_bits is None else key_bits
+    value_bits = bits if value_bits is None else value_bits
+
     if L >= flash_min_l:
         # Large-L (prefill-shaped) case: the transient fp16 K/V costs
         # S * n_kv_heads * D * 4 bytes but avoids the O(L*S) scores
         # round-trip; measured 1.3-2.5x faster than the decomposed path
         # beyond the crossover on all repeat/bits combinations.
-        keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits)
-        values = mx.dequantize(*q_values, group_size=group_size, bits=bits)
+        keys = mx.dequantize(*q_keys, group_size=group_size, bits=key_bits)
+        values = mx.dequantize(*q_values, group_size=group_size, bits=value_bits)
         return mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=scale, mask=mask
         )
 
     queries *= scale
-    key_bits = bits if key_bits is None else key_bits
-    value_bits = bits if value_bits is None else value_bits
 
     if n_repeats > 1:
         queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
