@@ -240,6 +240,25 @@ class DeepseekV2Attention(nn.Module):
         # cached latent and rope keys.
         quantized = not isinstance(k_pe, mx.array)
 
+        if quantized and getattr(cache, "key_bits", None) != getattr(
+            cache, "value_bits", None
+        ):
+            # Absorbed MLA caches the compressed latent once and reuses it as
+            # BOTH the attention key (q_nope · latent) and the value
+            # (softmax @ latent); the rope key rides in the cache's value slot.
+            # There is therefore no independent value tensor to carry a distinct
+            # value_bits, and the generic SDPA would try to dequantize the
+            # key-quantized latent with value_bits (a packed-shape/scale
+            # mismatch). Asymmetric K/V bits are undefined on this path.
+            raise NotImplementedError(
+                "Asymmetric key/value KV-cache bits are not supported on the "
+                "DeepSeek absorbed-MLA path: the compressed latent is cached "
+                "once and serves as both the attention key and value, so a "
+                "value_bits distinct from key_bits is undefined. Use a single "
+                "symmetric --kv-bits for absorbed-MLA models (the non-absorbed "
+                "attention path supports asymmetric bits)."
+            )
+
         # Hadamard-rotated latent (PR #1555 on the absorbed MLA path). The cache
         # stores the kv_lora_rank(512)+qk_rope_head_dim(64)=576 latent as two
         # separate tensors: the 512 latent as the cache "keys" and the 64 rope
