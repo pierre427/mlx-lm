@@ -1,4 +1,5 @@
-# Copyright © 2026 Pierre Lamy
+# Copyright © 2026 raullenchai and the Rapid-MLX contributors (original work)
+# Copyright © 2026 Pierre Lamy (mlx-uag port and adaptation)
 # SPDX-License-Identifier: Apache-2.0
 """macOS Unified Buffer Cache (UBC) eviction helper.
 

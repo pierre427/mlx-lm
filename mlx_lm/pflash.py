@@ -1,4 +1,6 @@
-# Copyright © 2026 Pierre Lamy
+# Copyright © 2026 raullenchai and the Rapid-MLX contributors (original work)
+# Original PFlash design © 2026 @michaelasper (Rapid-MLX #287)
+# Copyright © 2026 Pierre Lamy (mlx-uag port and adaptation)
 # SPDX-License-Identifier: Apache-2.0
 """PFlash-style token-statistical prompt compression for prefill.
 
