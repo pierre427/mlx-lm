@@ -446,6 +446,20 @@ def load_model(
 
     if not lazy:
         mx.eval(model.parameters())
+        # Opt-in macOS UBC eviction: after weights are materialised into MLX's
+        # own Metal buffers, the safetensors mmap is a redundant Unified Buffer
+        # Cache shadow. Evicting it eagerly reclaims that footprint (measured
+        # ~41 GB on Llama-3.3-70B-8bit) for KV cache / long context on near-OOM
+        # large-model loads. Bit-exact + decode-neutral (see
+        # wiki/docs/experiments/ubc-evict-pflash-eval-2026-07-13.md). Default
+        # off; the file staying on disk means eviction can never corrupt values.
+        if os.environ.get("MLX_LM_UBC_EVICT") == "1":
+            try:
+                from .ubc_evict import ubc_evict_paths
+
+                ubc_evict_paths(weight_files)
+            except Exception:  # never let eviction block a load
+                pass
 
     return model, config
 
