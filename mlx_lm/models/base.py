@@ -152,6 +152,11 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    bucketed_attention = getattr(cache, "bucketed_attention", None)
+    if bucketed_attention is not None:
+        output = bucketed_attention(queries, scale, mask, sinks=sinks)
+        if output is not None:
+            return output
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")

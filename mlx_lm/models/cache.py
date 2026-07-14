@@ -2,6 +2,8 @@
 
 import copy
 import inspect
+import math
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1117,10 +1119,21 @@ def dynamic_roll(x, shifts, axis):
     return rolled
 
 
+@dataclass
+class _BucketedAttentionGroup:
+    indices: tuple[int, ...]
+    index_array: mx.array
+    cache: "BatchKVCache"
+
+
 class BatchKVCache(_BaseCache):
     step = 256
 
-    def __init__(self, left_padding: List[int]):
+    def __init__(
+        self,
+        left_padding: List[int],
+        attention_backend: Optional[str] = None,
+    ):
         """
         The BatchKV cache expects inputs to be left-padded.
 
@@ -1146,8 +1159,161 @@ class BatchKVCache(_BaseCache):
         self._idx = 0
 
         self._right_padding = None
+        self._configure_attention_backend(attention_backend)
+
+    def _configure_attention_backend(self, attention_backend=None):
+        backend = attention_backend
+        if backend is None:
+            backend = os.environ.get("MLX_LM_BATCH_ATTENTION_BACKEND", "sdpa")
+        backend = backend.strip().lower()
+        if backend not in {"sdpa", "bucketed"}:
+            raise ValueError(
+                "MLX_LM_BATCH_ATTENTION_BACKEND must be 'sdpa' or 'bucketed'"
+            )
+        max_tax = float(os.environ.get("MLX_LM_BUCKETED_SDPA_MAX_TAX", "1.25"))
+        min_dense_tax = float(
+            os.environ.get("MLX_LM_BUCKETED_SDPA_MIN_DENSE_TAX", "1.25")
+        )
+        lookahead = int(os.environ.get("MLX_LM_BUCKETED_SDPA_LOOKAHEAD", "32"))
+        if (
+            not math.isfinite(max_tax)
+            or not math.isfinite(min_dense_tax)
+            or max_tax < 1.0
+            or min_dense_tax < 1.0
+            or lookahead <= 0
+        ):
+            raise ValueError("invalid bucketed SDPA policy configuration")
+        self.attention_backend = backend
+        self._bucket_max_tax = max_tax
+        self._bucket_min_dense_tax = min_dense_tax
+        self._bucket_lookahead = lookahead
+        self._bucket_groups: Optional[List[_BucketedAttentionGroup]] = None
+        self._attention_backend_stats = {
+            "attempts": 0,
+            "bucketed_calls": 0,
+            "dense_fallbacks": 0,
+            "group_builds": 0,
+            "group_invalidations": 0,
+            "fallback_reasons": {},
+            "last_dense_traffic_tax": 1.0,
+            "last_bucketed_traffic_tax": 1.0,
+            "last_group_count": 0,
+        }
+
+    def set_attention_backend(self, backend: str):
+        """Select the backend for this cache group.
+
+        Existing state remains authoritative in the dense mirror. Switching
+        invalidates derived groups and rebuilds them losslessly on the next
+        supported decode call.
+        """
+        backend = backend.strip().lower()
+        if backend not in {"sdpa", "bucketed"}:
+            raise ValueError("attention backend must be 'sdpa' or 'bucketed'")
+        if backend != self.attention_backend:
+            self._invalidate_attention_groups()
+            self.attention_backend = backend
+
+    @property
+    def attention_backend_metrics(self):
+        metrics = dict(self._attention_backend_stats)
+        metrics["fallback_reasons"] = dict(metrics["fallback_reasons"])
+        metrics["backend"] = self.attention_backend
+        return metrics
+
+    def _fallback(self, reason: str):
+        stats = self._attention_backend_stats
+        stats["dense_fallbacks"] += 1
+        reasons = stats["fallback_reasons"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+        return None
+
+    def _invalidate_attention_groups(self):
+        if self._bucket_groups is not None:
+            self._attention_backend_stats["group_invalidations"] += 1
+            self._bucket_groups = None
+
+    def _plan_attention_groups(self, lengths: List[int]):
+        remaining = list(range(len(lengths)))
+        groups = []
+        while remaining:
+            anchor = remaining[0]
+            candidates = remaining[1 : self._bucket_lookahead]
+            candidates.sort(
+                key=lambda index: (
+                    abs(lengths[index].bit_length() - lengths[anchor].bit_length()),
+                    abs(lengths[index] - lengths[anchor]) / lengths[anchor],
+                    index,
+                )
+            )
+            chosen = [anchor]
+            for index in candidates:
+                proposed = chosen + [index]
+                useful = sum(lengths[i] for i in proposed)
+                dense = len(proposed) * max(lengths[i] for i in proposed)
+                if dense / useful <= self._bucket_max_tax:
+                    chosen.append(index)
+            chosen_set = set(chosen)
+            remaining = [index for index in remaining if index not in chosen_set]
+            groups.append(chosen)
+        return groups
+
+    def _build_attention_groups(self):
+        if self.keys is None or self._idx <= 0:
+            return self._fallback("empty_cache")
+        lengths = [int(length) for length in self.offset.tolist()]
+        if len(lengths) < 2:
+            return self._fallback("batch_one")
+        if any(length <= 0 for length in lengths):
+            return self._fallback("non_positive_length")
+        useful = sum(lengths)
+        dense = len(lengths) * max(lengths)
+        dense_tax = dense / useful
+        self._attention_backend_stats["last_dense_traffic_tax"] = dense_tax
+        if dense_tax < self._bucket_min_dense_tax:
+            return self._fallback("dense_tax")
+
+        planned = self._plan_attention_groups(lengths)
+        if len(planned) <= 1:
+            return self._fallback("single_group")
+
+        dense_keys = self.keys[..., : self._idx, :]
+        dense_values = self.values[..., : self._idx, :]
+        groups = []
+        bucketed_dense = 0
+        for indices in planned:
+            group_lengths = [lengths[index] for index in indices]
+            width = max(group_lengths)
+            left_padding = [width - length for length in group_lengths]
+            index_array = mx.array(indices)
+            keys = mx.contiguous(
+                mx.take(dense_keys, index_array, axis=0)[..., self._idx - width :, :]
+            )
+            values = mx.contiguous(
+                mx.take(dense_values, index_array, axis=0)[
+                    ..., self._idx - width :, :
+                ]
+            )
+            group_cache = BatchKVCache(left_padding, attention_backend="sdpa")
+            group_cache.keys = keys
+            group_cache.values = values
+            group_cache.offset = mx.array(group_lengths)
+            group_cache.left_padding = mx.array(left_padding)
+            group_cache._idx = width
+            groups.append(
+                _BucketedAttentionGroup(tuple(indices), index_array, group_cache)
+            )
+            bucketed_dense += len(indices) * width
+
+        self._bucket_groups = groups
+        stats = self._attention_backend_stats
+        stats["group_builds"] += 1
+        stats["last_group_count"] = len(groups)
+        stats["last_bucketed_traffic_tax"] = bucketed_dense / useful
+        return groups
 
     def update_and_fetch(self, keys, values):
+        new_keys, new_values = keys, values
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
@@ -1170,9 +1336,71 @@ class BatchKVCache(_BaseCache):
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
+        if self._bucket_groups is not None:
+            for group in self._bucket_groups:
+                group.cache.update_and_fetch(
+                    mx.take(new_keys, group.index_array, axis=0),
+                    mx.take(new_values, group.index_array, axis=0),
+                )
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
 
+    def bucketed_attention(self, queries, scale, mask, sinks=None):
+        """Run exact length-shaped decode attention when capability-gated.
+
+        Returns ``None`` for an observable dense fallback. Only single-token
+        decode on this full, unquantized batch cache is supported initially.
+        """
+        if self.attention_backend != "bucketed":
+            return None
+        stats = self._attention_backend_stats
+        stats["attempts"] += 1
+        if queries.shape[2] != 1:
+            return self._fallback("not_decode")
+        if queries.shape[0] != self.offset.shape[0]:
+            return self._fallback("batch_mismatch")
+        if self._right_padding is not None:
+            return self._fallback("right_padding")
+        if isinstance(mask, str):
+            return self._fallback("string_mask")
+        if mask is not None and mask.dtype != mx.bool_:
+            return self._fallback("additive_mask")
+
+        groups = self._bucket_groups or self._build_attention_groups()
+        if not groups:
+            return None
+
+        outputs = []
+        for group in groups:
+            group_queries = mx.take(queries, group.index_array, axis=0)
+            group_keys = group.cache.keys[..., : group.cache._idx, :]
+            group_values = group.cache.values[..., : group.cache._idx, :]
+            if mask is None:
+                group_mask = None
+            else:
+                group_mask = mx.take(mask, group.index_array, axis=0)[
+                    ..., -group.cache._idx :
+                ]
+            output = mx.fast.scaled_dot_product_attention(
+                group_queries,
+                group_keys,
+                group_values,
+                scale=scale,
+                mask=group_mask,
+                sinks=sinks,
+            )
+            outputs.append((group.indices, output))
+
+        rows = [None] * queries.shape[0]
+        for indices, output in outputs:
+            for local_index, original_index in enumerate(indices):
+                rows[original_index] = output[local_index : local_index + 1]
+        if any(row is None for row in rows):
+            raise RuntimeError("bucketed attention lost a batch row")
+        stats["bucketed_calls"] += 1
+        return mx.concatenate(rows, axis=0)
+
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        self._invalidate_attention_groups()
         if left_padding is not None:
             if self.keys is not None:
                 raise ValueError(
@@ -1186,6 +1414,7 @@ class BatchKVCache(_BaseCache):
             self._right_padding = mx.array(right_padding)
 
     def finalize(self):
+        self._invalidate_attention_groups()
         if self._right_padding is not None:
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
@@ -1204,13 +1433,17 @@ class BatchKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
+        backend = getattr(self, "attention_backend", None)
         self.keys, self.values, self.offset, self.left_padding = v
         self._idx = self.keys.shape[2]
+        self._right_padding = None
+        self._configure_attention_backend(backend)
 
     def is_trimmable(self):
         return True
 
     def trim(self, n):
+        self._invalidate_attention_groups()
         n = min(self._idx, n)
         self._idx -= n
         self.offset -= n
@@ -1225,6 +1458,7 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        self._invalidate_attention_groups()
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
@@ -1244,6 +1478,7 @@ class BatchKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        self._invalidate_attention_groups()
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
@@ -1335,7 +1570,9 @@ class BatchKVCache(_BaseCache):
     def nbytes(self):
         if self.keys is None:
             return 0
-        return self.keys.nbytes + self.values.nbytes
+        dense = self.keys.nbytes + self.values.nbytes
+        grouped = sum(group.cache.nbytes for group in self._bucket_groups or [])
+        return dense + grouped
 
 
 class BatchRotatingKVCache(_BaseCache):
