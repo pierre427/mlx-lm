@@ -10,14 +10,16 @@ import unittest
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
+    CompletionRequest,
     LRUPromptCache,
     Response,
     ResponseGenerator,
-    _process_control_tokens,
 )
+from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
 from mlx_lm.utils import load
 
 
@@ -94,69 +96,262 @@ class MockCache:
         return n
 
 
-class TestProcessControlTokens(unittest.TestCase):
+class TestTextStateMachine(unittest.TestCase):
+    """Test the TextStateMachine buffering and stripping behavior."""
+
+    def test_strips_control_sequences(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, s = sm.flush(state)
+        full = text + rest
+        self.assertEqual(full, "hi body bye")
+
+    def test_back_to_back_tool_calls(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, s = sm.flush(state)
+        full = t1 + t2 + rest
+        self.assertEqual(full, "call1call2")
+
+    def test_partial_match_buffered_then_flushed(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        # First enter tool state
+        state = sm.make_state()
+        state, text, s = sm.step(state, "<tool_call>body</")
+        self.assertEqual(s, "tool")
+        # 'body' is emitted, '</' is buffered (partial match of '</tool_call>')
+        self.assertEqual(text, "body")
+        # flush releases the buffered text
+        state, rest, s = sm.flush(state)
+        self.assertEqual(rest, "</")
+
+    def test_discard_drops_buffer(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello ST")
+        self.assertEqual(text, "hello ")
+        # discard drops the buffered 'ST'
+        state, s = sm.discard(state)
+        self.assertEqual(s, "normal")
+
+    def test_stop_words_stripped(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello STOP world")
+        state, rest, s = sm.flush(state)
+        self.assertEqual(text + rest, "hello  world")
+
+    def test_reasoning_to_tool_transition(self):
+        # A tool call started inside a reasoning block must enter "tool".
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool>", "tool")],
+                "reasoning": [("</think>", "normal"), ("<tool>", "tool")],
+                "tool": [("</tool>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, _, s = sm.step(state, "<think>hmm")
+        self.assertEqual(s, "reasoning")
+        state, _, s = sm.step(state, "<tool>")
+        self.assertEqual(s, "tool")
+        state, _, s = sm.step(state, "</tool>")
+        self.assertEqual(s, "normal")
+
+    def test_empty_end_marker_stays_in_tool_on_discard(self):
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";
+        # discard on stop must preserve the state so the tool call is flushed.
+        sm = TextStateMachine(
+            {
+                "normal": [("[TOOL_CALLS]", "tool")],
+                "tool": [],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "[TOOL_CALLS]f[ARGS]{}")
+        self.assertEqual(s, "tool")
+        self.assertEqual(text, "f[ARGS]{}")
+        state, s = sm.discard(state)
+        self.assertEqual(s, "tool")
+
+
+class _AssemblyHarness(APIHandler):
+    """APIHandler wired to a scripted (ctx, response) so the response-assembly
+    loop in ``handle_completion`` can be exercised without a model or socket."""
+
+    def __init__(self, ctx, raw_stream, tools=None):
+        # Deliberately skip BaseHTTPRequestHandler.__init__ (no socket).
+        self.wfile = io.BytesIO()
+        self.stream = False
+        self.created = 0
+        self.system_fingerprint = "fp-test"
+        self.request_id = "req-test"
+        self.object_type = "chat.completion"
+        self.requested_model = "mistral-test"
+        self.requested_draft_model = None
+        self.adapter = None
+        self.stream_options = None
+        # Mirror production: generate() returns (ctx, raw token stream). The
+        # assembly loop drives ctx.text_sm itself to strip control sequences.
+        response = iter(raw_stream)
+        self.response_generator = types.SimpleNamespace(
+            generate=lambda *a, **k: (ctx, response),
+            cli_args=types.SimpleNamespace(allowed_origins=["*"]),
+        )
+        self._request_tools = tools
+        # Everything below only feeds GenerationArguments, which the stubbed
+        # generate() ignores; values are irrelevant but must exist.
+        self.__dict__.update(
+            {
+                k: v
+                for k, v in dict(
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=0,
+                    min_p=0.0,
+                    xtc_probability=0.0,
+                    xtc_threshold=0.0,
+                    logit_bias=None,
+                    repetition_penalty=1.0,
+                    repetition_context_size=20,
+                    presence_penalty=0.0,
+                    presence_context_size=20,
+                    frequency_penalty=0.0,
+                    frequency_context_size=20,
+                    max_tokens=16,
+                    num_draft_tokens=0,
+                    prompt_lookup_ngram=0,
+                    prompt_lookup_tokens=8,
+                    logprobs=False,
+                    top_logprobs=0,
+                    seed=None,
+                    chat_template_kwargs=None,
+                ).items()
+            }
+        )
+
+    # No-op the socket-backed header plumbing.
+    def _set_completion_headers(self, status_code=200):
+        pass
+
+    def send_header(self, *args, **kwargs):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def run(self):
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[],
+            tools=self._request_tools,
+            role_mapping=None,
+        )
+        self.handle_completion(request, stop_words=[])
+        return json.loads(self.wfile.getvalue().decode())
+
+
+class TestToolCallAssembly(unittest.TestCase):
+    """Regression tests for surfacing tool calls in the assembled response.
+
+    Guards the empty-tool_call_end (Mistral-format) case: the "tool" state is
+    only left by a stop transition, so on EOS the assembly loop must
+    ``discard`` (preserving current_state="tool") and flush the tool call.
+    Post-#1501 architecture: the raw stream carries decoded text (markers
+    included); ``ctx.text_sm`` strips them inside ``handle_completion``.
+    """
+
     @staticmethod
-    def _r(text, state, match=None):
-        return Response(text, 0, state, match, 0.0, None, ())
+    def _r(text, token, finish_reason=None):
+        return Response(text, token, 0.0, finish_reason, ())
 
-    def test_single_tool_call_passes_body_with_open_and_close_crossings(self):
-        r = self._r
-        stream = [
-            r("hi ", "normal"),
-            r("<tool_call>", "tool", match=(0,)),
-            r("body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
-            r(" bye", "normal"),
-        ]
+    def test_mistral_empty_end_token_flushes_tool_call_at_eos(self):
+        # Mistral-format: "[TOOL_CALLS]NAME[ARGS]{json}" then EOS, empty
+        # tool_call_end -> the "tool" state has no exit transition.
         ctx = types.SimpleNamespace(
-            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+            tool_parser=mistral_parse_tool_call,
+            text_sm=TextStateMachine(
+                {"normal": [("[TOOL_CALLS]", "tool")], "tool": []}
+            ),
+            initial_state="normal",
+            prompt=[1, 2, 3],
+            prompt_cache_count=0,
+            stop=lambda: None,
         )
-        out = list(_process_control_tokens(ctx, iter(stream)))
-
-        self.assertEqual("".join(t.text for t in out), "hi body bye")
-        states = [t.state for t in out]
-        self.assertEqual(sum(1 for a, b in zip(states, states[1:]) if a != b), 2)
-
-    def test_back_to_back_tool_calls_emit_state_crossings(self):
-        r = self._r
-        stream = [
-            r("<tool_call>", "tool", match=(0,)),
-            r("call1_body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
-            r("<tool_call>", "tool", match=(0,)),
-            r("call2_body", "tool"),
-            r("</tool_call>", "normal", match=(1,)),
+        raw_stream = [
+            self._r("[TOOL_CALLS]", 9),
+            self._r('get_weather[ARGS]{"city": "Paris"}', 42),
+            self._r("", 2, finish_reason="stop"),  # EOS: text discarded
         ]
-        ctx = types.SimpleNamespace(
-            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
-        )
-        out = list(_process_control_tokens(ctx, iter(stream)))
 
-        self.assertEqual("".join(t.text for t in out), "call1_bodycall2_body")
-        states = [t.state for t in out]
-        crossings = sum(
-            1 for a, b in zip(states, states[1:]) if a == "tool" and b == "normal"
-        )
-        self.assertEqual(crossings, 2)
+        resp = _AssemblyHarness(ctx, raw_stream).run()
 
-    def test_multi_token_match_preserves_order(self):
-        r = self._r
-        match = (10, 11, 12)
-        stream = [
-            r("body", "tool"),
-            r("</", "tool"),
-            r("tool", "tool"),
-            r("_call>", "normal", match=match),
-            r(" ok", "normal"),
-        ]
-        ctx = types.SimpleNamespace(sequences={match: "</tool_call>"})
-        out = list(_process_control_tokens(ctx, iter(stream)))
-
-        self.assertEqual([t.text for t in out], ["body", "", "", "", " ok"])
+        message = resp["choices"][0]["message"]
+        self.assertEqual(resp["choices"][0]["finish_reason"], "tool_calls")
+        self.assertNotIn("content", message)  # no stray text
+        tool_calls = message["tool_calls"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "get_weather")
         self.assertEqual(
-            [t.state for t in out],
-            ["tool", "tool", "tool", "normal", "normal"],
+            json.loads(tool_calls[0]["function"]["arguments"]), {"city": "Paris"}
         )
+
+    def test_non_empty_end_token_tool_call_still_works(self):
+        # Guardrail: models whose tool_call_end is a real marker exit "tool"
+        # via a tool->normal transition before EOS; that path must keep working.
+        ctx = types.SimpleNamespace(
+            tool_parser=mistral_parse_tool_call,
+            text_sm=TextStateMachine(
+                {
+                    "normal": [("[TOOL_CALLS]", "tool")],
+                    "tool": [("[/TOOL_CALLS]", "normal")],
+                }
+            ),
+            initial_state="normal",
+            prompt=[1, 2, 3],
+            prompt_cache_count=0,
+            stop=lambda: None,
+        )
+        raw_stream = [
+            self._r("[TOOL_CALLS]", 9),
+            self._r('get_weather[ARGS]{"city": "Paris"}', 42),
+            self._r("[/TOOL_CALLS]", 10),
+            self._r("", 2, finish_reason="stop"),
+        ]
+
+        resp = _AssemblyHarness(ctx, raw_stream).run()
+
+        message = resp["choices"][0]["message"]
+        self.assertEqual(resp["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(len(message["tool_calls"]), 1)
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "get_weather")
 
 
 class TestServer(unittest.TestCase):
@@ -352,19 +547,26 @@ class TestServer(unittest.TestCase):
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
 
-        sm, _ = self.response_generator._make_state_machine(
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        stop_matcher, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
         )
-        state = sm.make_state()
-        state, _, s = sm.match(state, 100)
+
+        # Verify the text state machine strips tool call markers
+        text_state = text_sm.make_state()
+        text_state, clean_text, s = text_sm.step(text_state, "hello[TOOL_CALLS]body")
         self.assertEqual(s, "tool")
-        for tok in [42, 43, 44]:
-            state, _, s = sm.match(state, tok)
-            self.assertEqual(s, "tool")
-        state, _, s = sm.match(state, 2)
-        self.assertIsNone(s)
+        # 'hello' is before the match, 'body' flows through (no tool_call_end)
+        self.assertEqual(clean_text, "hellobody")
+
+        # Verify EOS stops via the stop matcher
+        stop_state = stop_matcher.make_state()
+        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
+        self.assertTrue(matched)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
