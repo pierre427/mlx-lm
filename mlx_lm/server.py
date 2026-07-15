@@ -468,6 +468,17 @@ class ResponseGenerator:
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
+        recurrent_stats = self.prompt_cache.recurrent_state_stats()
+        if recurrent_stats["path_cap"] is not None:
+            logging.info(
+                "- Recurrent state: %d device checkpoints (%.2f GB), "
+                "%d host checkpoints (%.2f GB), %d soft-overflow paths",
+                recurrent_stats["device_checkpoints"],
+                recurrent_stats["device_recurrent_bytes"] / 1e9,
+                recurrent_stats["host_checkpoints"],
+                recurrent_stats["host_recurrent_bytes"] / 1e9,
+                recurrent_stats["soft_overflow_paths"],
+            )
 
     def _next_request(self, timeout=None):
         request = None
@@ -1740,7 +1751,14 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        recurrent_state_path_cap=getattr(
+            model_provider.cli_args,
+            "prompt_cache_recurrent_state_path_cap",
+            None,
+        ),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1878,6 +1896,15 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-recurrent-state-path-cap",
+        type=int,
+        help=(
+            "Maximum device-resident recurrent-state checkpoints per prompt-cache "
+            "path. Disabled by default; protected checkpoints may produce a "
+            "reported soft overflow."
+        ),
     )
     parser.add_argument(
         "--pipeline",

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
@@ -16,6 +17,7 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    LRUPromptCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -313,6 +315,154 @@ class TestPromptCache(unittest.TestCase):
 
         self.assertTrue(mx.allclose(old_cache[0].keys[..., 10:11, :], y))
         self.assertTrue(mx.allclose(cache[0].keys[..., 10:11, :], z))
+
+    @staticmethod
+    def _hybrid_checkpoint(value):
+        recurrent = ArraysCache(size=2)
+        recurrent[0] = mx.full((1, 2, 4), value, dtype=mx.float32)
+        recurrent[1] = mx.full((1, 2, 4, 4), value + 1, dtype=mx.bfloat16)
+        kv = KVCache()
+        keys = mx.full((1, 2, 3, 4), value + 2, dtype=mx.float32)
+        values = mx.full((1, 2, 3, 4), value + 3, dtype=mx.float32)
+        kv.update_and_fetch(keys, values)
+        mx.eval(recurrent.state, kv.state)
+        return [recurrent, kv]
+
+    def test_recurrent_path_cap_is_opt_in(self):
+        with self.assertRaisesRegex(ValueError, "must be at least 1"):
+            LRUPromptCache(recurrent_state_path_cap=0)
+
+        prompt_cache = LRUPromptCache(max_size=10)
+        model = ("hybrid", None, None)
+        for end in (2, 3, 4):
+            prompt_cache.insert_cache(
+                model, list(range(1, end + 1)), self._hybrid_checkpoint(end)
+            )
+
+        stats = prompt_cache.recurrent_state_stats()
+        self.assertIsNone(stats["path_cap"])
+        self.assertEqual(stats["device_checkpoints"], 3)
+        self.assertEqual(stats["host_checkpoints"], 0)
+        self.assertEqual(stats["offloads_total"], 0)
+
+    def test_recurrent_path_cap_offloads_state_but_preserves_kv_and_restores(self):
+        prompt_cache = LRUPromptCache(max_size=10, recurrent_state_path_cap=2)
+        model = ("hybrid", None, None)
+        expected = self._hybrid_checkpoint(2)
+        expected_recurrent = [mx.array(array) for array in expected[0].state]
+        expected_kv = [mx.array(array) for array in expected[1].state]
+        prompt_cache.insert_cache(model, [1, 2], expected)
+        prompt_cache.insert_cache(model, [1, 2, 3], self._hybrid_checkpoint(3))
+        prompt_cache.insert_cache(model, [1, 2, 3, 4], self._hybrid_checkpoint(4))
+
+        entry = prompt_cache._trie.get(model, [1, 2])
+        self.assertTrue(entry.prompt_cache[0].empty())
+        self.assertIsNotNone(entry.recurrent_backup)
+        for actual, before in zip(entry.prompt_cache[1].state, expected_kv):
+            self.assertTrue(mx.array_equal(actual, before))
+
+        restored, remaining = prompt_cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(remaining, [])
+        for actual, before in zip(restored[0].state, expected_recurrent):
+            self.assertTrue(mx.array_equal(actual, before))
+        for actual, before in zip(restored[1].state, expected_kv):
+            self.assertTrue(mx.array_equal(actual, before))
+
+        stats = prompt_cache.recurrent_state_stats()
+        self.assertEqual(stats["device_checkpoints"], 2)
+        self.assertEqual(stats["host_checkpoints"], 1)
+        self.assertEqual(stats["offloads_total"], 1)
+        self.assertEqual(stats["restores_total"], 1)
+        self.assertEqual(stats["soft_overflow_paths"], 0)
+        self.assertGreater(stats["host_recurrent_bytes"], 0)
+        self.assertEqual(
+            stats["logical_cache_bytes"],
+            stats["device_cache_bytes"] + stats["host_recurrent_bytes"],
+        )
+
+    def test_recurrent_path_cap_protected_overflow_is_telemetry_not_corruption(self):
+        prompt_cache = LRUPromptCache(max_size=10, recurrent_state_path_cap=1)
+        model = ("hybrid-fork", None, None)
+        # Create both leaves before inserting the value-bearing fork node, so
+        # it is protected as a fork as soon as it becomes a checkpoint.
+        prompt_cache.insert_cache(model, [1, 2, 3], self._hybrid_checkpoint(3))
+        prompt_cache.insert_cache(model, [1, 2, 4], self._hybrid_checkpoint(4))
+        prompt_cache.insert_cache(model, [1, 2], self._hybrid_checkpoint(2))
+        prompt_cache.insert_cache(
+            model,
+            [1],
+            self._hybrid_checkpoint(1),
+            recurrent_state_locked=True,
+        )
+
+        stats = prompt_cache.recurrent_state_stats()
+        self.assertEqual(stats["device_checkpoints"], 4)
+        self.assertEqual(stats["host_checkpoints"], 0)
+        self.assertEqual(stats["offloads_total"], 0)
+        self.assertEqual(stats["soft_overflow_paths"], 2)
+        self.assertGreater(stats["soft_overflow_events"], 0)
+
+    def test_recurrent_path_cap_qwen3_next_continuation_equivalence(self):
+        from mlx_lm.models import qwen3_next
+
+        mx.random.seed(7)
+        args = qwen3_next.ModelArgs(
+            model_type="qwen3_next",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            vocab_size=1000,
+            linear_num_value_heads=4,
+            linear_num_key_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=3,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            shared_expert_intermediate_size=128,
+            mlp_only_layers=[0],
+            moe_intermediate_size=128,
+            rms_norm_eps=1e-5,
+            head_dim=64,
+            rope_theta=1000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1000,
+        )
+        model = qwen3_next.Model(args)
+        mx.eval(model.parameters())
+        tokens = list(range(1, 13))
+
+        def checkpoint(length):
+            state = model.make_cache()
+            logits = model(mx.array([tokens[:length]]), cache=state)
+            mx.eval(logits, [cache.state for cache in state])
+            return state
+
+        baseline = checkpoint(4)
+        model_key = ("tiny-qwen3-next", None, None)
+        prompt_cache = LRUPromptCache(max_size=10, recurrent_state_path_cap=2)
+        prompt_cache.insert_cache(model_key, tokens[:4], copy.deepcopy(baseline))
+        prompt_cache.insert_cache(model_key, tokens[:8], checkpoint(8))
+        prompt_cache.insert_cache(model_key, tokens[:12], checkpoint(12))
+        self.assertEqual(prompt_cache.recurrent_state_stats()["host_checkpoints"], 1)
+        restored, remaining = prompt_cache.fetch_nearest_cache(model_key, tokens[:4])
+        self.assertEqual(remaining, [])
+
+        reference = copy.deepcopy(baseline)
+        continuation = mx.array([tokens[4:8]])
+        expected_logits = model(continuation, cache=reference)
+        actual_logits = model(continuation, cache=restored)
+        mx.eval(expected_logits, actual_logits)
+        self.assertTrue(mx.array_equal(expected_logits, actual_logits))
+        for expected_cache, actual_cache in zip(reference, restored):
+            for (_, expected), (_, actual) in zip(
+                tree_flatten(expected_cache.state),
+                tree_flatten(actual_cache.state),
+            ):
+                self.assertTrue(mx.array_equal(expected, actual))
 
     def test_save_load_quantized_cache(self):
         cache = [QuantizedKVCache(bits=4, group_size=32) for _ in range(4)]

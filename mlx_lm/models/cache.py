@@ -1,12 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
@@ -1619,6 +1621,118 @@ class PromptTrie:
             longer = tokens[:index] + best
         return PromptTrieResult(model, None, shorter, longer, common_prefix)
 
+    def iter_values(self, model: Any = None):
+        """Yield ``(model, tokens, value, is_fork)`` for value-bearing nodes."""
+        roots = (
+            [(model, self._trie[model])]
+            if model in self._trie
+            else ([] if model is not None else list(self._trie.items()))
+        )
+        for model_key, root in roots:
+            stack = [(root, [])]
+            while stack:
+                node, tokens = stack.pop()
+                children = [key for key in node if key != "__value__"]
+                if "__value__" in node:
+                    yield model_key, tokens, node["__value__"], len(children) > 1
+                for token in reversed(children):
+                    stack.append((node[token], tokens + [token]))
+
+    def models(self):
+        return tuple(self._trie)
+
+    def value_paths(self, model: Any):
+        """Return value-bearing root-to-leaf paths for one model trie."""
+        if model not in self._trie:
+            return []
+        paths = []
+
+        def visit(node, tokens, values):
+            children = [key for key in node if key != "__value__"]
+            if "__value__" in node:
+                values = values + [(tokens, node["__value__"], len(children) > 1)]
+            if not children:
+                if values:
+                    paths.append(values)
+                return
+            for token in children:
+                visit(node[token], tokens + [token], values)
+
+        visit(self._trie[model], [], [])
+        return paths
+
+
+@dataclass(frozen=True)
+class _HostArrayBackup:
+    """Exact CPU byte copy of one MLX array, including bfloat16 payloads."""
+
+    shape: Tuple[int, ...]
+    byte_shape: Tuple[int, ...]
+    dtype: Any
+    payload: bytes
+
+    @classmethod
+    def capture(cls, array: mx.array):
+        mx.eval(array)
+        raw = np.array(array.view(mx.uint8), copy=True)
+        return cls(tuple(array.shape), tuple(raw.shape), array.dtype, raw.tobytes())
+
+    @property
+    def nbytes(self):
+        return len(self.payload)
+
+    def restore(self):
+        raw = mx.array(np.frombuffer(self.payload, dtype=np.uint8))
+        return raw.reshape(self.byte_shape).view(self.dtype).reshape(self.shape)
+
+
+@dataclass
+class _RecurrentStateBackup:
+    """Host-owned recurrent tensors for ``ArraysCache`` layers in one entry."""
+
+    layers: Dict[int, Tuple[Optional[_HostArrayBackup], ...]]
+
+    @classmethod
+    def offload(cls, prompt_cache: List[Any]):
+        recurrent_layers = {}
+        for index, cache in enumerate(prompt_cache):
+            if not isinstance(cache, ArraysCache):
+                continue
+            if cache.left_padding is not None or cache.lengths is not None:
+                # Batched transient state is not a request-level checkpoint.
+                return None
+            state = tuple(cache.state)
+            if not any(array is not None for array in state):
+                continue
+            recurrent_layers[index] = tuple(
+                None if array is None else _HostArrayBackup.capture(array)
+                for array in state
+            )
+
+        if not recurrent_layers:
+            return None
+        for index, state in recurrent_layers.items():
+            prompt_cache[index].state = [None] * len(state)
+        return cls(recurrent_layers)
+
+    @property
+    def nbytes(self):
+        return sum(
+            array.nbytes
+            for state in self.layers.values()
+            for array in state
+            if array is not None
+        )
+
+    def restore_into(self, prompt_cache: List[Any]):
+        restored = []
+        for index, state in self.layers.items():
+            arrays = [None if array is None else array.restore() for array in state]
+            prompt_cache[index].state = arrays
+            restored.extend(array for array in arrays if array is not None)
+        if restored:
+            mx.eval(*restored)
+
 
 class LRUPromptCache:
     @dataclass
@@ -1626,6 +1740,8 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        recurrent_state_locked: bool = False
+        recurrent_backup: Optional[_RecurrentStateBackup] = None
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1656,13 +1772,26 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        recurrent_state_path_cap: Optional[int] = None,
+    ):
+        if recurrent_state_path_cap is not None and recurrent_state_path_cap < 1:
+            raise ValueError("recurrent_state_path_cap must be at least 1 or None")
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self.recurrent_state_path_cap = recurrent_state_path_cap
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self._recurrent_offloads_total = 0
+        self._recurrent_restores_total = 0
+        self._recurrent_restore_ms_total = 0.0
+        self._recurrent_soft_overflow_events = 0
+        self._recurrent_soft_overflow_paths = 0
 
     def __len__(self):
         return len(self._lru)
@@ -1671,17 +1800,125 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
+    @staticmethod
+    def _recurrent_device_nbytes(entry):
+        return sum(
+            cache.nbytes
+            for cache in entry.prompt_cache
+            if isinstance(cache, ArraysCache)
+        )
+
+    def _copy_entry_cache(self, entry):
+        prompt_cache = copy.deepcopy(entry.prompt_cache)
+        if entry.recurrent_backup is not None:
+            start = time.perf_counter()
+            entry.recurrent_backup.restore_into(prompt_cache)
+            self._recurrent_restores_total += 1
+            self._recurrent_restore_ms_total += 1000 * (time.perf_counter() - start)
+        return prompt_cache
+
+    def _enforce_recurrent_state_path_cap(self, model):
+        cap = self.recurrent_state_path_cap
+        if cap is None:
+            self._recurrent_soft_overflow_paths = 0
+            return
+
+        paths = self._trie.value_paths(model)
+        tails = {id(path[-1][1]) for path in paths if path}
+        forks = {id(entry) for path in paths for _, entry, is_fork in path if is_fork}
+
+        while True:
+            violating = []
+            candidates = {}
+            for path in paths:
+                resident = [
+                    item for item in path if self._recurrent_device_nbytes(item[1]) > 0
+                ]
+                if len(resident) <= cap:
+                    continue
+                violating.append(path)
+                for tokens, entry, _ in resident:
+                    if (
+                        id(entry) in tails
+                        or id(entry) in forks
+                        or entry.recurrent_state_locked
+                    ):
+                        continue
+                    candidates[id(entry)] = (tuple(tokens), entry)
+            if not violating or not candidates:
+                break
+
+            _, victim = min(
+                candidates.values(), key=lambda item: (len(item[0]), item[0])
+            )
+            backup = _RecurrentStateBackup.offload(victim.prompt_cache)
+            if backup is None:
+                # The candidate cannot be safely host-backed. Lock it so a
+                # correctness-preserving soft overflow is reported instead of
+                # repeatedly selecting it.
+                victim.recurrent_state_locked = True
+                continue
+            victim.recurrent_backup = backup
+            self._recurrent_offloads_total += 1
+
+        overflow_paths = self._count_recurrent_soft_overflow_paths()
+        self._recurrent_soft_overflow_paths = overflow_paths
+        if overflow_paths:
+            self._recurrent_soft_overflow_events += 1
+
+    def _count_recurrent_soft_overflow_paths(self):
+        cap = self.recurrent_state_path_cap
+        if cap is None:
+            return 0
+        return sum(
+            sum(self._recurrent_device_nbytes(item[1]) > 0 for item in path) > cap
+            for model in self._trie.models()
+            for path in self._trie.value_paths(model)
+        )
+
+    def recurrent_state_stats(self):
+        entries = [entry for _, _, entry, _ in self._trie.iter_values()]
+        device_recurrent_bytes = sum(
+            self._recurrent_device_nbytes(entry) for entry in entries
+        )
+        host_recurrent_bytes = sum(
+            entry.recurrent_backup.nbytes
+            for entry in entries
+            if entry.recurrent_backup is not None
+        )
+        device_cache_bytes = sum(
+            sum(cache.nbytes for cache in entry.prompt_cache) for entry in entries
+        )
+        return {
+            "path_cap": self.recurrent_state_path_cap,
+            "device_checkpoints": sum(
+                self._recurrent_device_nbytes(entry) > 0 for entry in entries
+            ),
+            "host_checkpoints": sum(
+                entry.recurrent_backup is not None for entry in entries
+            ),
+            "device_recurrent_bytes": device_recurrent_bytes,
+            "host_recurrent_bytes": host_recurrent_bytes,
+            "device_cache_bytes": device_cache_bytes,
+            "logical_cache_bytes": self._n_bytes,
+            "offloads_total": self._recurrent_offloads_total,
+            "restores_total": self._recurrent_restores_total,
+            "restore_ms_total": self._recurrent_restore_ms_total,
+            "soft_overflow_paths": self._count_recurrent_soft_overflow_paths(),
+            "soft_overflow_events": self._recurrent_soft_overflow_events,
+        }
+
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            return self._copy_entry_cache(cache_entry), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = self._copy_entry_cache(cache_entry)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
@@ -1689,7 +1926,7 @@ class LRUPromptCache:
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return self._copy_entry_cache(cache_entry), tokens[short_length:]
 
         return None, tokens
 
@@ -1700,10 +1937,15 @@ class LRUPromptCache:
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        recurrent_state_locked: bool = False,
     ):
+        inserted_model = model
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache,
+            sum(c.nbytes for c in prompt_cache),
+            cache_type,
+            recurrent_state_locked,
         )
 
         # Insert into the trie and update the byte counter and lru position
@@ -1735,6 +1977,8 @@ class LRUPromptCache:
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
+        self._enforce_recurrent_state_path_cap(inserted_model)
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
