@@ -307,6 +307,40 @@ class TestServer(unittest.TestCase):
         state, _, s = sm.match(state, 2)
         self.assertIsNone(s)
 
+    def test_make_state_machine_multitoken_think_end_is_incremental(self):
+        """A split ``</think>`` transition must survive streaming steps."""
+
+        class FakeTokenizer:
+            has_thinking = True
+            has_tool_calling = False
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_tokens = (10, 11)
+            think_end_tokens = (12, 13, 14)
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, token):
+                return f"<eos{token}>"
+
+        sm, _ = self.response_generator._make_state_machine(
+            ("fake-split-think-end", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+        state = sm.make_state()
+        for token in (10, 11):
+            state, _, current = sm.match(state, token)
+        self.assertEqual(current, "reasoning")
+
+        for token in (12, 13):
+            state, match, current = sm.match(state, token)
+            self.assertIsNone(match)
+            self.assertEqual(current, "reasoning")
+
+        state, match, current = sm.match(state, 14)
+        self.assertEqual(match, (12, 13, 14))
+        self.assertEqual(current, "normal")
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
