@@ -1,12 +1,48 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import inspect
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map
+
+_HADAMARD_BASES = (1, 12, 20, 28)
+
+
+def hadamard_size_ok(n: int) -> bool:
+    """True if ``mx.hadamard_transform`` supports a last-dim of size ``n``
+    (i.e. ``n = m * 2**k`` for ``m`` in {1, 12, 20, 28})."""
+    for m in _HADAMARD_BASES:
+        if n % m == 0 and ((n // m) & (n // m - 1)) == 0:
+            return True
+    return False
+
+
+def rotate_last(x: mx.array) -> mx.array:
+    """Orthonormal Walsh–Hadamard transform along the last axis.
+
+    Normalized by ``1/sqrt(D)`` so the transform is orthonormal (``R^T R = I``).
+    Applying it to *both* queries and keys leaves every ``q·k`` inner product —
+    and hence the attention scores — unchanged in exact arithmetic, while
+    spreading per-channel outliers into a near-Gaussian marginal that low-bit
+    affine quantization handles far more gracefully. Only orthonormality is
+    relied on here; the transform is additionally self-inverse only for
+    power-of-two ``D``."""
+    return mx.hadamard_transform(x, scale=1.0 / math.sqrt(x.shape[-1]))
+
+
+def _expand_kv_scale(scale: mx.array, n_q_heads: int) -> mx.array:
+    """Broadcast a per-kv-head channel scale ``(B, n_kv_heads, 1, D)`` up to the
+    query heads. Under grouped-query attention several query heads share one kv
+    head, so each kv-head scale is repeated ``n_q_heads // n_kv_heads`` times
+    along the head axis to line up with a ``(B, n_q_heads, L, D)`` tensor."""
+    n_repeats = n_q_heads // scale.shape[1]
+    if n_repeats > 1:
+        scale = mx.repeat(scale, n_repeats, axis=1)
+    return scale
 
 
 @dataclass
@@ -91,6 +127,8 @@ def quantized_scaled_dot_product_attention(
     mask: Optional[mx.array],
     group_size: int = 64,
     bits: int = 8,
+    key_bits: Optional[int] = None,
+    value_bits: Optional[int] = None,
 ) -> mx.array:
     B, n_q_heads, L, D = queries.shape
     n_kv_heads = q_keys[0].shape[-3]
@@ -101,13 +139,16 @@ def quantized_scaled_dot_product_attention(
         if n_repeats == 1
         else _QUANT_SDPA_FLASH_MIN_L_GQA
     )
+    key_bits = bits if key_bits is None else key_bits
+    value_bits = bits if value_bits is None else value_bits
+
     if L >= flash_min_l:
         # Large-L (prefill-shaped) case: the transient fp16 K/V costs
         # S * n_kv_heads * D * 4 bytes but avoids the O(L*S) scores
         # round-trip; measured 1.3-2.5x faster than the decomposed path
         # beyond the crossover on all repeat/bits combinations.
-        keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits)
-        values = mx.dequantize(*q_values, group_size=group_size, bits=bits)
+        keys = mx.dequantize(*q_keys, group_size=group_size, bits=key_bits)
+        values = mx.dequantize(*q_values, group_size=group_size, bits=value_bits)
         return mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=scale, mask=mask
         )
@@ -120,7 +161,7 @@ def quantized_scaled_dot_product_attention(
         q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
 
     scores = mx.quantized_matmul(
-        queries, *q_keys, transpose=True, group_size=group_size, bits=bits
+        queries, *q_keys, transpose=True, group_size=group_size, bits=key_bits
     )
     if mask is not None:
         if isinstance(mask, str):
@@ -128,13 +169,15 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        if n_repeats > 1 and mask.ndim > 3:
+            mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:
             scores += mask
     scores = mx.softmax(scores, axis=-1, precise=True)
     out = mx.quantized_matmul(
-        scores, *q_values, transpose=False, group_size=group_size, bits=bits
+        scores, *q_values, transpose=False, group_size=group_size, bits=value_bits
     )
 
     if n_repeats > 1:
@@ -160,15 +203,37 @@ def scaled_dot_product_attention(
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
-        return quantized_scaled_dot_product_attention(
+        # Rotated KV: keys were Hadamard-rotated before quantization, so rotate
+        # the queries by the same orthonormal transform. (R q)·(R k) = q·k, so
+        # scores are preserved while the stored keys quantize far more cleanly.
+        if getattr(cache, "rotate", False) and hadamard_size_ok(queries.shape[-1]):
+            queries = rotate_last(queries)
+        # KVarN normalization: stored keys are (R k) ⊘ s_k, so undo the diagonal
+        # rescale on the *query* side — (R q ⊙ s_k)·((R k) ⊘ s_k) = (R q)·(R k)
+        # — leaving the scores exact up to (smaller) quant error. Values are
+        # stored v ⊘ s_v; that undo is applied to the attention output below.
+        normalize = getattr(cache, "normalize", False)
+        key_scale = getattr(cache, "key_scale", None)
+        value_scale = getattr(cache, "value_scale", None)
+        if normalize and key_scale is not None:
+            queries = queries * _expand_kv_scale(key_scale, queries.shape[1])
+        legacy_bits = cache.bits
+        out = quantized_scaled_dot_product_attention(
             queries,
             keys,
             values,
             scale=scale,
             mask=mask,
             group_size=cache.group_size,
-            bits=cache.bits,
+            key_bits=getattr(cache, "key_bits", legacy_bits),
+            value_bits=getattr(cache, "value_bits", legacy_bits),
         )
+        if normalize and value_scale is not None:
+            # softmax @ (v ⊘ s_v) = (softmax @ v) ⊘ s_v, so recover the true
+            # output by re-applying s_v per value channel (broadcast over the
+            # query heads that share each kv head).
+            out = out * _expand_kv_scale(value_scale, out.shape[1])
+        return out
     else:
         return mx.fast.scaled_dot_product_attention(
             queries,
