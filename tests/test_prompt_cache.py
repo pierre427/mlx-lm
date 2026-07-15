@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
@@ -131,6 +132,38 @@ class TestPromptCache(unittest.TestCase):
                 self.assertEqual(c.offset, lc.offset)
                 self.assertTrue(mx.array_equal(k, lk))
                 self.assertTrue(mx.array_equal(v, lv))
+
+    def test_save_load_quantized_hybrid_cache_preserves_topology_and_codec(self):
+        """A warm hybrid restore must reproduce every live cache layer exactly.
+
+        In particular, a leading recurrent-state cache must not hide quantized
+        attention layers later in the stack, and those layers must retain their
+        per-layer codec parameters rather than restoring as generic float KV.
+        """
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+        cache = [
+            ArraysCache(size=2),
+            QuantizedKVCache(bits=4, group_size=32),
+            ArraysCache(size=1),
+            QuantizedKVCache(bits=8, group_size=64),
+        ]
+        cache[0][0] = mx.random.uniform(shape=(1, 4, 8))
+        cache[0][1] = mx.random.uniform(shape=(1, 4, 8))
+        cache[2][0] = mx.random.uniform(shape=(1, 2, 8))
+        for c in (cache[1], cache[3]):
+            x = mx.random.uniform(shape=(1, 2, 7, 64))
+            c.update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        restored = load_prompt_cache(cache_file)
+
+        self.assertEqual([type(c) for c in restored], [type(c) for c in cache])
+        for expected, actual in zip(cache, restored):
+            self.assertEqual(expected.meta_state, actual.meta_state)
+            for expected_array, actual_array in zip(
+                tree_flatten(expected.state), tree_flatten(actual.state)
+            ):
+                self.assertTrue(mx.array_equal(expected_array[1], actual_array[1]))
 
     def test_save_load_cache_list(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
