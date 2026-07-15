@@ -219,6 +219,11 @@ class HybridStats:
     span_extend_tokens: int = 0
     verify_span_hist: dict[int, int] = field(default_factory=dict)
     latched: bool = False
+    # measured-rate gate (rate_gate=True)
+    rate_gate_probed: bool = False
+    rate_gate_delatched: bool = False
+    rate_gate_spec_ms_per_tok: float = 0.0
+    rate_gate_plain_ms_per_tok: float = 0.0
 
     @property
     def total_emitted(self) -> int:
@@ -233,3 +238,9 @@ class HybridStats:
             f"({self.retrieval_accepted / tot:.0%}) + bonus {self.bonus_tokens} + plain {self.plain_tokens} | "
             f"retrieval acceptance {acc:.0%} | latched={self.latched}"
         )
+
+
+# Canonical/upstream name for the per-run prompt-lookup accounting struct.
+# Our tree renamed it to ``HybridStats``; keep the original name as an alias so
+# upstream code and tests (e.g. the rate-gate suite) resolve against it.
+PromptLookupStats = HybridStats

@@ -1061,6 +1061,9 @@ def prompt_lookup_generate_step(
     cliff_aware_span: bool = False,
     warmup: int = 48,
     gate: float = 0.12,
+    rate_gate: bool = False,
+    rate_gate_probe: int = 32,
+    rate_gate_margin: float = 0.0,
     stats: Optional[Any] = None,
     history_prompt: Optional[mx.array] = None,
     **_ignored,
@@ -1152,6 +1155,8 @@ def prompt_lookup_generate_step(
     latched = False
     prompt_len = len(seq)
     last_snap = None  # snapshot before the most recent proposal forward
+    rate_probed = False  # measured-rate gate is one-shot
+    spec_t0 = time.perf_counter()  # wall-clock window for the speculative rate
     # Begin recording recurrent/rotating rollback state only after prompt
     # prefill. Starting earlier retains prompt-sized replay closures in
     # ArraysCache and can cause a large transient memory spike.
@@ -1245,6 +1250,52 @@ def prompt_lookup_generate_step(
                 yield tok, row, from_draft
                 if max_tokens >= 0 and generated >= max_tokens:
                     return
+
+            # Measured never-slower-than-plain gate: after warmup, time a short
+            # plain-decode probe against the observed speculative rate and latch
+            # to the plain tail if speculation isn't actually faster. Unlike the
+            # acceptance-fraction heuristic below, this measures the real
+            # wall-clock break-even (model- and context-dependent). One-shot; its
+            # probe tokens are ordinary committed output, so the run stays lossless.
+            if (
+                rate_gate
+                and not rate_probed
+                and generated >= warmup
+                and (max_tokens < 0 or max_tokens - generated > 1)
+            ):
+                rate_probed = True
+                stats.rate_gate_probed = True
+                spec_ms = (time.perf_counter() - spec_t0) * 1000.0 / max(generated, 1)
+                budget = rate_gate_probe
+                if max_tokens >= 0:
+                    budget = min(budget, max_tokens - generated)
+                p0 = time.perf_counter()
+                n_probe = 0
+                while n_probe < budget:
+                    with mx.stream(generation_stream):
+                        logits = model(mx.array(pending)[None], cache=prompt_cache)[0]
+                        last = logits[-1]
+                        row = last - mx.logsumexp(last, keepdims=True)
+                        mx.eval(row)
+                    s = int(sampler(row[None])[0].item())
+                    seq.append(s)
+                    history_seq.append(s)
+                    proposer.observe(s)
+                    pending = [s]
+                    generated += 1
+                    n_probe += 1
+                    stats.plain_tokens += 1
+                    yield s, row, False
+                    if max_tokens >= 0 and generated >= max_tokens:
+                        return
+                plain_ms = (time.perf_counter() - p0) * 1000.0 / max(n_probe, 1)
+                stats.rate_gate_spec_ms_per_tok = spec_ms
+                stats.rate_gate_plain_ms_per_tok = plain_ms
+                if spec_ms > plain_ms * (1.0 - rate_gate_margin):
+                    latched = True
+                    stats.rate_gate_delatched = True
+                else:
+                    spec_t0 = time.perf_counter()  # reset window; keep speculating
 
             # One-way never-lose latch: once we have enough evidence the work
             # isn't copy-heavy, switch to a plain generate_step tail (bit-exact,
@@ -1373,6 +1424,9 @@ def stream_generate(
             cliff_aware_span=prompt_lookup.get("cliff_aware_span", False),
             warmup=prompt_lookup.get("warmup", 48),
             gate=prompt_lookup.get("gate", 0.12),
+            rate_gate=prompt_lookup.get("rate_gate", False),
+            rate_gate_probe=prompt_lookup.get("rate_gate_probe", 32),
+            rate_gate_margin=prompt_lookup.get("rate_gate_margin", 0.0),
             stats=prompt_lookup.get("stats"),
             history_prompt=prompt_lookup.get("history_prompt"),
             **kwargs,
