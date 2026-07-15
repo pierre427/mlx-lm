@@ -8,6 +8,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
 from .convert import convert
 from .generate import batch_generate, generate, stream_generate
+from .steer import CommitSteerer
 from .utils import load
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "batch_generate",
     "generate",
     "stream_generate",
+    "CommitSteerer",
     "load",
 ]
