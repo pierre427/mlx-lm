@@ -132,13 +132,10 @@ def run_worker(model_path, cap, checkpoints, stride, repeats, decode_tokens):
         max_size=checkpoints + 1,
         recurrent_state_path_cap=cap,
     )
-    reference = None
     build_start = time.perf_counter()
     for index in range(1, checkpoints + 1):
         prefix = token_stream[: index * stride]
         state = checkpoint(model, prefix)
-        if reference is None:
-            reference = copy.deepcopy(state)
         store.insert_cache(model_key, prefix, state)
     mx.synchronize()
     gc.collect()
@@ -151,6 +148,10 @@ def run_worker(model_path, cap, checkpoints, stride, repeats, decode_tokens):
     target = token_stream[:stride]
     first_token = token_stream[stride]
 
+    # Construct the correctness reference only after taking store memory
+    # measurements. Retaining the first checkpoint here would keep its MLX
+    # recurrent arrays alive and mask one host offload in every capped cell.
+    reference = checkpoint(model, target)
     restored, remaining = store.fetch_nearest_cache(model_key, target)
     if remaining:
         raise RuntimeError("target prefix was not an exact cache hit")
