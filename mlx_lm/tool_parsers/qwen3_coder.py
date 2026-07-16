@@ -1,4 +1,4 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2025-2026 Apple Inc.
 
 """
 Modified from:
@@ -11,7 +11,12 @@ from typing import Any, Optional
 
 import regex as re
 
-_function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
+from ._schema import infer_type_from_json_schema
+
+# Match each <function=...>...</function> block individually (no trailing `$`
+# anchor, which would otherwise merge several blocks into one greedy match and
+# drop calls 2..n).
+_function_regex = re.compile(r"<function=(.*?)</function>", re.DOTALL)
 _parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
@@ -41,10 +46,10 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     if not (param := param_config.get(param_name, False)):
         return param_value
 
-    if "type" in param:
-        param_type = str(param["type"]).strip().lower()
-    else:
-        param_type = "string"
+    # Resolve anyOf/oneOf/list-form unions to a concrete non-null type; an
+    # unresolved schema is treated as a string (values returned verbatim).
+    inferred = infer_type_from_json_schema(param)
+    param_type = inferred.strip().lower() if inferred else "string"
     if param_type in _string_types:
         return param_value
     elif (
@@ -74,9 +79,19 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             try:
                 return json.loads(param_value)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                return _safe_literal_eval(param_value)
 
+        # Unknown / unresolved type: try a literal, but never let a malformed
+        # value raise (e.g. SyntaxError) — fall back to the raw string.
+        return _safe_literal_eval(param_value)
+
+
+def _safe_literal_eval(param_value: str) -> Any:
+    """ast.literal_eval that returns the raw string instead of raising."""
+    try:
         return ast.literal_eval(param_value)
+    except (ValueError, SyntaxError):
+        return param_value
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
@@ -109,7 +124,8 @@ def parse_tool_call(
     model_output: str,
     tools: Optional[Any] = None,
 ):
-    match = _function_regex.findall(model_output)
-    if not match:
+    matches = _function_regex.findall(model_output)
+    if not matches:
         raise ValueError("No function provided.")
-    return _parse_xml_function_call(match[0], tools)
+    calls = [_parse_xml_function_call(m, tools) for m in matches]
+    return calls[0] if len(calls) == 1 else calls

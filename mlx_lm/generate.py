@@ -1999,12 +1999,15 @@ class PromptProcessingBatch:
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
         if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
+            # Invariant: empty processor lanes are always [] (an iterable),
+            # never None -- the GenerationBatch._step consumer iterates each
+            # lane. Build an independent list per lane (never a shared object).
+            self.logits_processors = [[] for _ in range(len(self.uids))]
         samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
         logits_processors = (
             batch.logits_processors
             if any(batch.logits_processors)
-            else [None] * len(batch.uids)
+            else [[] for _ in range(len(batch.uids))]
         )
 
         self.uids.extend(batch.uids)
@@ -2060,7 +2063,9 @@ class PromptProcessingBatch:
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         else:
-            self.logits_processors = [[]] * len(keep)
+            # Independent [] per lane -- [[]] * n would share one list object
+            # so an in-place append on one lane would mutate all of them.
+            self.logits_processors = [[] for _ in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
         # Lane indices changed; recorded rollbacks refer to the old lanes.
@@ -2342,9 +2347,15 @@ class GenerationBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
+        # Always keep samplers/logits_processors index-aligned with uids. A
+        # per-lane list (len == old uids) must be filtered even when every
+        # lane is falsy (all-None samplers / all-[] processors); otherwise it
+        # stays longer than uids and a later extend appends at the wrong index,
+        # silently binding lanes to the wrong sampler/processor. An empty []
+        # (no per-lane info) is left untouched.
+        if self.samplers:
             self.samplers = [self.samplers[idx] for idx in keep]
-        if any(self.logits_processors):
+        if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]

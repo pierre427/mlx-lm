@@ -431,6 +431,35 @@ def _make_logits_processors(args):
     )
 
 
+def _segment_by_state(sm_state, text):
+    """Advance a ``TextStateMachine`` one character at a time so emitted text is
+    attributed to the state it was actually produced in, rather than to the
+    chunk's single final state.
+
+    A decoded token can merge body bytes with a control marker (e.g. a token
+    that decodes to ``"}</tool_call>"``). ``TextStateMachine.step`` returns the
+    whole chunk's emittable text plus one final-state label, so the ``"}"``
+    would be labelled ``normal`` and leak to content while going missing from
+    the tool text. Feeding the machine char by char preserves the same total
+    emittable text and buffer semantics, but splits it into per-state segments
+    and also surfaces state transitions that emit no text.
+
+    Returns ``(new_sm_state, segments)`` where ``segments`` is a list of
+    ``(emitted_text, state_name)``; a segment may carry empty text when it only
+    marks a transition (so callers can flush per-state buffers on the boundary).
+    """
+    segments = []
+    prev = sm_state[0]
+    for ch in text:
+        sm_state, emitted, cur = TextStateMachine.step(sm_state, ch)
+        if emitted or cur != prev:
+            segments.append((emitted, cur))
+        prev = cur
+        if sm_state[0] is None:
+            break
+    return sm_state, segments
+
+
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     """Returns info dicts for the top `top_n` tokens from `logprobs`"""
     if top_n <= 0:
@@ -1496,32 +1525,35 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Advance the text state machine to strip control sequences
+                # Advance the text state machine to strip control sequences.
+                # Attribute emitted text per state segment (a decoded token can
+                # merge body bytes with a marker, e.g. "}</tool_call>"), rather
+                # than routing the whole chunk by its single final state.
                 if gen.finish_reason == "stop":
-                    sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
+                    sm_state, _ = TextStateMachine.discard(sm_state)
+                    segments = []
                 elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
-                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
+                    sm_state, segments = _segment_by_state(sm_state, gen.text)
+                    sm_state, flushed, flush_state = TextStateMachine.flush(sm_state)
+                    if flushed:
+                        segments.append((flushed, flush_state))
                 else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    sm_state, segments = _segment_by_state(sm_state, gen.text)
+                current_state = sm_state[0]
 
-                # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
+                # Collect the clean text by state: reasoning, tool, or normal.
+                for seg_text, seg_state in segments:
+                    if seg_state == "reasoning":
+                        reasoning_text += seg_text
+                    elif seg_state == "tool":
+                        tool_text += seg_text
+                    elif seg_state == "normal":
+                        if prev_state == "tool":
+                            tool_calls.append(tool_text)
+                            tool_text = ""
+                            made_tool_call = True
+                        text += seg_text
+                    prev_state = seg_state
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)

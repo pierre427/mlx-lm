@@ -190,7 +190,8 @@ class Qwen3MoeModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
+        aux_layer_ids: Optional[List[int]] = None,
+    ):
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -201,10 +202,19 @@ class Qwen3MoeModel(nn.Module):
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        # Optional aux hidden-state capture for the DFlash speculator: collect the
+        # post-layer hidden state at the requested layer indices (matches z-lab
+        # DFlash's hidden_states[layer_id + 1] = output of that layer). Purely
+        # additive; the default path returns just the normed hidden state.
+        aux = None if aux_layer_ids is None else []
+        want = set(aux_layer_ids or [])
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c)
+            if i in want:
+                aux.append(h)
 
-        return self.norm(h)
+        out = self.norm(h)
+        return (out, aux) if aux_layer_ids is not None else out
 
 
 class Model(nn.Module):
