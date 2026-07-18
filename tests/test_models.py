@@ -370,6 +370,41 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_quantized_sdpa_gqa_float_mask(self):
+        # Additive float masks handed to the quantized-SDPA GQA branch must have
+        # their head axis split to (n_kv_heads, n_repeats) to align with the
+        # (B, n_kv_heads, n_repeats, L, S) scores, not collide on broadcast.
+        # Regression guard for the ml-explore/mlx-lm#1558 shape bug. The
+        # absorbed-MLA path (n_kv_heads==1) pre-shapes its mask to full rank and
+        # must stay untouched; here we cover the general GQA n_kv_heads>1 case.
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+
+        group_size, bits = 64, 8
+        for B, n_q, n_kv in [(1, 8, 2), (2, 8, 2), (1, 8, 1)]:
+            L, S, D = 4, 64, 64
+            mx.random.seed(0)
+            q = mx.random.normal((B, n_q, L, D))
+            k = mx.random.normal((B, n_kv, S, D))
+            v = mx.random.normal((B, n_kv, S, D))
+            for mask_shape in [(B, n_q, L, S), (B, 1, L, S)]:
+                mask = 0.1 * mx.random.normal(mask_shape)
+                q_k = mx.quantize(k, group_size=group_size, bits=bits)
+                q_v = mx.quantize(v, group_size=group_size, bits=bits)
+                out = quantized_scaled_dot_product_attention(
+                    q, q_k, q_v, scale=1.0, mask=mask,
+                    group_size=group_size, bits=bits,
+                )
+                self.assertEqual(out.shape, (B, n_q, L, D))
+
+                kd = mx.dequantize(*q_k, group_size=group_size, bits=bits)
+                vd = mx.dequantize(*q_v, group_size=group_size, bits=bits)
+                nr = n_q // n_kv
+                kd = mx.repeat(kd, nr, axis=1)
+                vd = mx.repeat(vd, nr, axis=1)
+                scores = q @ kd.swapaxes(-1, -2) + mask
+                ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+                self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
