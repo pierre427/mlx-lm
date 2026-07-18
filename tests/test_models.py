@@ -374,9 +374,8 @@ class TestModels(unittest.TestCase):
         # Additive float masks handed to the quantized-SDPA GQA branch must have
         # their head axis split to (n_kv_heads, n_repeats) to align with the
         # (B, n_kv_heads, n_repeats, L, S) scores, not collide on broadcast.
-        # Regression guard for the ml-explore/mlx-lm#1558 shape bug. The
-        # absorbed-MLA path (n_kv_heads==1) pre-shapes its mask to full rank and
-        # must stay untouched; here we cover the general GQA n_kv_heads>1 case.
+        # Regression guard for the ml-explore/mlx-lm#1558 shape bug. The n_kv=1
+        # case is the absorbed-MLA shape (pe_scores with a n_q_heads head axis).
         from mlx_lm.models.base import quantized_scaled_dot_product_attention
 
         group_size, bits = 64, 8
@@ -391,8 +390,13 @@ class TestModels(unittest.TestCase):
                 q_k = mx.quantize(k, group_size=group_size, bits=bits)
                 q_v = mx.quantize(v, group_size=group_size, bits=bits)
                 out = quantized_scaled_dot_product_attention(
-                    q, q_k, q_v, scale=1.0, mask=mask,
-                    group_size=group_size, bits=bits,
+                    q,
+                    q_k,
+                    q_v,
+                    scale=1.0,
+                    mask=mask,
+                    group_size=group_size,
+                    bits=bits,
                 )
                 self.assertEqual(out.shape, (B, n_q, L, D))
 
@@ -404,6 +408,55 @@ class TestModels(unittest.TestCase):
                 scores = q @ kd.swapaxes(-1, -2) + mask
                 ref = mx.softmax(scores, axis=-1, precise=True) @ vd
                 self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+
+    def test_glm4_moe_lite_quantized_kv_decode(self):
+        # Regression: absorbed-MLA decode (L == 1) with a QuantizedKVCache
+        # passes a 4D additive pe_scores mask (head axis n_q_heads, cache has
+        # n_kv_heads == 1) into the quantized-SDPA GQA branch. The mask
+        # expansion in base.py must unflatten that head axis; a blind
+        # expand_dims mis-broadcasts the scores and crashes the output reshape
+        # (ValueError: cannot reshape ... into (B, n_heads, 1, D)).
+        from mlx_lm.models import glm4_moe_lite
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        args = glm4_moe_lite.ModelArgs(
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_group=1,
+            topk_group=1,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=32,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            first_k_dense_replace=1,
+            num_nextn_predict_layers=0,
+        )
+        model = glm4_moe_lite.Model(args)
+        mx.eval(model.parameters())
+
+        for B in (1, 2):
+            caches = [
+                QuantizedKVCache(group_size=32, bits=8)
+                for _ in range(args.num_hidden_layers)
+            ]
+            prompt = mx.random.randint(0, args.vocab_size, (B, 8))
+            logits = model(prompt, cache=caches)
+            self.assertEqual(logits.shape, (B, 8, args.vocab_size))
+            for _ in range(2):
+                step = mx.random.randint(0, args.vocab_size, (B, 1))
+                logits = model(step, cache=caches)
+                mx.eval(logits)
+                self.assertEqual(logits.shape, (B, 1, args.vocab_size))
+                self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
