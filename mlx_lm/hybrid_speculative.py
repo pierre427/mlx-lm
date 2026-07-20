@@ -41,6 +41,7 @@ from transformers import PreTrainedTokenizer
 
 from .generate import (
     GenerationResponse,
+    draft_tokens_for_budget,
     generate_step,
     generation_stream,
     wired_limit,
@@ -1101,9 +1102,13 @@ def _mtp_draft_verify_loop(
             continue
         cycle_t0 = time.perf_counter()
         ntoks_at_cycle_start = ntoks
+        k = draft_tokens_for_budget(num_draft, max_tokens - ntoks)
+        if k == 0:
+            tok_, lp = _plain_step()
+            ntoks += 1
+            yield tok_, lp, False
+            continue
         stats.cycles += 1
-        k = min(num_draft, max_tokens - ntoks)
-
         # ---- draft k tokens with the MTP head (chained) ----------------------
         if not persistent:
             mtp_cache = model.make_mtp_cache()

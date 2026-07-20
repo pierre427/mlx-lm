@@ -111,10 +111,10 @@ class TestGenerate(unittest.TestCase):
             results.append(generation_result)
 
         self.assertEqual(len(results), 5)
-        # since num_draft_tokens is 2 and draft model is the same, the
-        # first 2 generations should be drafts, the third should come
-        # from the target model, and last two should be drafts
-        self.assertEqual(drafted, [True, True, False, True, True])
+        # Each verify cycle reserves one output slot for the target bonus.
+        # At the two-token tail only one useful draft remains, followed by
+        # the final target token.
+        self.assertEqual(drafted, [True, True, False, True, False])
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
