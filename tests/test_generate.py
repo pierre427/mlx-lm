@@ -30,6 +30,14 @@ class TestGenerate(unittest.TestCase):
         cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
         cls.model.set_dtype(mx.float32)
 
+    def tearDown(self):
+        # Rotating-cache tests shadow the model's class method on this shared
+        # setUpClass instance.  Always remove that override, even when an
+        # assertion fails before the test's normal cleanup line, so one failure
+        # cannot change every later test's cache topology.
+        if "make_cache" in vars(self.model):
+            del self.model.make_cache
+
     def test_generate(self):
         # Simple test that generation runs
         text = generate(
@@ -273,6 +281,7 @@ class TestGenerate(unittest.TestCase):
         gen.prefill_step_size = 2048
         gen.prefill_batch_size = 2
         gen.prefill_batch_window = 4
+        gen.prompt_trim_rollback_tokens = 0
         gen._currently_processing = []
         gen._old_wired_limit = None
 
