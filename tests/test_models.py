@@ -1,7 +1,15 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import os
 import unittest
+
+# mlx >= 0.32 runs float32 GEMMs at TF32-class precision on M5 neural
+# accelerators unless MLX_ENABLE_TF32=0. The kernel-vs-reference checks in
+# this file (ssm, gated delta) compare exact elementwise kernels against
+# matmul-based references at 1e-4 tolerances, which TF32 (~2e-3 relative
+# error) breaks. Pin it off; the flag latches process-wide on first matmul.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 import mlx.core as mx
 import mlx.nn as nn
