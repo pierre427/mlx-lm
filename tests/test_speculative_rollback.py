@@ -4,7 +4,11 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step, speculative_generate_step
+from mlx_lm.generate import (
+    draft_tokens_for_budget,
+    generate_step,
+    speculative_generate_step,
+)
 from mlx_lm.hybrid_speculative import (
     HybridStats,
     _start_speculation_or_cleanup,
@@ -370,6 +374,9 @@ class _FakeSpecCache:
     def is_trimmable(self):
         return self.speculating
 
+    def record_rollback(self, *args, **kwargs):
+        pass
+
     def trim(self, n):
         self.offset -= n
         return n
@@ -383,13 +390,16 @@ class _ZeroLogitModel:
     """Fake target model: always predicts token 0, tracks forward calls."""
 
     VOCAB = 32
+    supports_speculative_rollback = True
 
     def __init__(self, caches=None):
         self.calls = 0
+        self.input_lengths = []
         self._caches = caches
 
     def __call__(self, x, cache=None):
         self.calls += 1
+        self.input_lengths.append(x.shape[-1])
         for c in cache:
             c.offset += x.shape[-1]
         return mx.zeros((x.shape[0], x.shape[1], self.VOCAB))
@@ -407,6 +417,7 @@ class _ZeroMTPModel:
     def __init__(self, caches=None):
         self.mtp = object()
         self.trunk_calls = 0
+        self.mtp_calls = 0
         self._caches = caches if caches is not None else [_FakeSpecCache()]
 
     def model(self, x, cache=None):
@@ -425,6 +436,7 @@ class _ZeroMTPModel:
         return []
 
     def mtp_step(self, h, tok, mtp_cache):
+        self.mtp_calls += 1
         return mx.zeros((1, 1, self.VOCAB)), h
 
 
@@ -448,6 +460,38 @@ class TestGeneratorLifecycleSemantics(unittest.TestCase):
         self.assertEqual(list(gen), [])
         self.assertEqual(model.calls, 0)
 
+    def test_draft_budget_reserves_target_bonus_slot(self):
+        self.assertEqual(draft_tokens_for_budget(4, 0), 0)
+        self.assertEqual(draft_tokens_for_budget(4, 1), 0)
+        self.assertEqual(draft_tokens_for_budget(4, 2), 1)
+        self.assertEqual(draft_tokens_for_budget(4, 5), 4)
+        self.assertEqual(draft_tokens_for_budget(4, -1), 4)
+
+    def test_speculative_zero_budget_does_no_model_work(self):
+        target = _ZeroLogitModel()
+        draft = _ZeroLogitModel()
+        gen = speculative_generate_step(
+            mx.array([1, 2, 3], mx.uint32), target, draft, max_tokens=0
+        )
+        self.assertEqual(list(gen), [])
+        self.assertEqual(target.calls, 0)
+        self.assertEqual(draft.calls, 0)
+
+    def test_speculative_one_token_budget_skips_drafting(self):
+        target = _ZeroLogitModel()
+        draft = _ZeroLogitModel()
+        result = list(speculative_generate_step(
+            mx.array([1, 2, 3], mx.uint32),
+            target,
+            draft,
+            num_draft_tokens=4,
+            max_tokens=1,
+        ))
+        self.assertEqual(len(result), 1)
+        # The draft sees the prompt prefill only; no autoregressive proposal.
+        self.assertEqual(draft.input_lengths, [2])
+        self.assertEqual(target.input_lengths, [2, 1])
+
     def test_self_mtp_max_tokens_zero_yields_nothing_and_does_no_work(self):
         model = _ZeroMTPModel()
         gen = self_mtp_generate_step(
@@ -455,6 +499,22 @@ class TestGeneratorLifecycleSemantics(unittest.TestCase):
         )
         self.assertEqual(list(gen), [])
         self.assertEqual(model.trunk_calls, 0)
+
+    def test_self_mtp_one_token_tail_uses_plain_target_step(self):
+        model = _ZeroMTPModel()
+        stats = HybridStats()
+        result = list(self_mtp_generate_step(
+            mx.array([1, 2, 3], mx.uint32),
+            model,
+            num_draft=4,
+            max_tokens=2,
+            stats=stats,
+        ))
+        self.assertEqual(len(result), 2)
+        self.assertEqual([from_draft for _, _, from_draft in result], [False, False])
+        self.assertEqual(model.mtp_calls, 0)
+        self.assertEqual(stats.draft_proposed, 0)
+        self.assertEqual(stats.plain_tokens, 2)
 
     def test_hybrid_early_close_counts_only_delivered_tokens(self):
         # The consumer closes after the FIRST delivered token of an accepted
