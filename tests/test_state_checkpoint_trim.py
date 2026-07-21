@@ -24,6 +24,7 @@ from mlx_lm.models.cache import (
     ArraysCache,
     KVCache,
     LRUPromptCache,
+    RotatingKVCache,
     achievable_trim,
     can_trim_prompt_cache,
     load_prompt_cache,
@@ -266,6 +267,78 @@ class TestStateCheckpointTrim(unittest.TestCase):
         self.assertEqual(loaded[1]._checkpoints, [])
         for got, want in zip([loaded[1][0], loaded[1][1]], state_before):
             self.assertTrue(mx.allclose(got, want).item())
+
+    # ---------------- rotating (sliding-window) caches ----------------
+
+    def _rotating_hybrid(self, window, boundaries):
+        """KVCache + RotatingKVCache advanced through the given boundaries,
+        recording checkpoints. Returns the caches plus reference window
+        copies (temporal order) captured at every boundary."""
+        kv = KVCache()
+        rot = RotatingKVCache(max_size=window)
+        cache = [kv, rot]
+        refs = {}
+        pos = 0
+        for b in boundaries:
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            rot.update_and_fetch(k, k)
+            pos = b
+            record_state_checkpoints(cache, [pos])
+            refs[pos] = (
+                mx.array(rot._temporal_order(rot.keys)),
+                mx.array(rot._temporal_order(rot.values)),
+            )
+        record_state_checkpoints(cache, [pos], force=True)
+        return cache, refs
+
+    def test_rotating_hybrid_partial_trim(self):
+        cache, refs = self._rotating_hybrid(32, [32, 64, 96, 113])
+        kv, rot = cache
+        # The ring has wrapped: not trimmable, so the strict path is closed.
+        self.assertFalse(can_trim_prompt_cache(cache))
+        # size() saturates at the window; the coordinator must use the
+        # absolute position (113), not min(offset, max_size).
+        self.assertEqual(achievable_trim(cache, 18), (64, 49))
+
+        n = trim_prompt_cache(cache, 18, allow_partial=True)
+        self.assertEqual(n, 49)
+        self.assertEqual(kv.offset, 64)
+        self.assertEqual(rot.offset, 64)
+        self.assertTrue(mx.array_equal(rot.keys, refs[64][0]).item())
+        self.assertTrue(mx.array_equal(rot.values, refs[64][1]).item())
+
+        # The restored cache keeps working: advance again and re-trim.
+        k = mx.random.normal((1, 2, 10, 4))
+        kv.update_and_fetch(k, k)
+        rot.update_and_fetch(k, k)
+        n = trim_prompt_cache(cache, 42, allow_partial=True)
+        self.assertEqual(n, 42)  # target 32 is an exact checkpoint
+        self.assertEqual(rot.offset, 32)
+        self.assertTrue(mx.array_equal(rot.keys, refs[32][0]).item())
+
+    def test_rotating_wrapped_without_checkpoints_lands_at_zero(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            cache, _ = self._rotating_hybrid(32, [64])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+        kv, rot = cache
+        # Only the empty state is reachable; the whole cache is trimmed.
+        self.assertEqual(achievable_trim(cache, 10), (0, 64))
+        n = trim_prompt_cache(cache, 10, allow_partial=True)
+        self.assertEqual(n, 64)
+        self.assertEqual(kv.offset, 0)
+        self.assertIsNone(rot.keys)
+        self.assertEqual(rot.offset, 0)
+
+    def test_rotating_unwrapped_stays_natively_trimmable(self):
+        cache, _ = self._rotating_hybrid(256, [32, 64])
+        kv, rot = cache
+        self.assertTrue(can_trim_prompt_cache(cache))
+        self.assertEqual(trim_prompt_cache(cache, 10), 10)
+        self.assertEqual(rot.offset, 54)
 
     # ---------------- batch lanes ----------------
 
