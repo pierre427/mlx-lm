@@ -527,7 +527,9 @@ def generate_step(
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
-        checkpoint_base = max((c.size() for c in prompt_cache), default=0)
+        checkpoint_base = max(
+            (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+        )
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
@@ -906,7 +908,7 @@ def speculative_generate_step(
                 return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
-        base = max((c.size() for c in cache), default=0)
+        base = max((c.size() for c in cache if hasattr(c, "size")), default=0)
         processed = 0
         while y.size > 1:
             n_to_process = min(prefill_step_size, y.size - 1)
