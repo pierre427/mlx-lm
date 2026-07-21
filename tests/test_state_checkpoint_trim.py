@@ -11,6 +11,7 @@ LRUPromptCache reuse path the server drives.
 import copy
 import importlib
 import os
+import tempfile
 import unittest
 
 # See tests/test_models.py: pin fp32 GEMMs off the TF32 path so
@@ -25,8 +26,10 @@ from mlx_lm.models.cache import (
     LRUPromptCache,
     achievable_trim,
     can_trim_prompt_cache,
+    load_prompt_cache,
     make_prompt_cache,
     record_state_checkpoints,
+    save_prompt_cache,
     trim_prompt_cache,
 )
 
@@ -229,6 +232,40 @@ class TestStateCheckpointTrim(unittest.TestCase):
         # The original is untouched.
         self.assertEqual(cache[0].offset, 96)
         self.assertEqual(cache[1].snap_trim_position(1000), 96)
+
+    def test_save_load_roundtrip_preserves_checkpoints(self):
+        cache, states = self._synthetic_hybrid([32, 64, 96])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+        kv, ar = loaded
+        self.assertEqual([p for p, _ in ar._checkpoints[0]], [32, 64, 96])
+        # Live state survives alongside the checkpoints.
+        for got, want in zip([ar[0], ar[1]], states[96]):
+            self.assertTrue(mx.allclose(got, want).item())
+        # Trims work on the loaded cache exactly as on the live one.
+        n = trim_prompt_cache(loaded, 40, allow_partial=True)
+        self.assertEqual(n, 64)
+        self.assertEqual(kv.offset, 32)
+        for got, want in zip([ar[0], ar[1]], states[32]):
+            self.assertTrue(mx.allclose(got, want).item())
+
+    def test_save_load_without_checkpoints_is_legacy_shape(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            cache, _ = self._synthetic_hybrid([32, 64])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+        ar = cache[1]
+        state_before = [mx.array(ar[0]), mx.array(ar[1])]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+        self.assertEqual(loaded[1]._checkpoints, [])
+        for got, want in zip([loaded[1][0], loaded[1][1]], state_before):
+            self.assertTrue(mx.allclose(got, want).item())
 
     # ---------------- batch lanes ----------------
 
