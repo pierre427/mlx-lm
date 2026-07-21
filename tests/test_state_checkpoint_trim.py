@@ -268,6 +268,56 @@ class TestStateCheckpointTrim(unittest.TestCase):
         for got, want in zip([loaded[1][0], loaded[1][1]], state_before):
             self.assertTrue(mx.allclose(got, want).item())
 
+    def _assert_state_trees_equal(self, a, b):
+        if isinstance(a, mx.array):
+            self.assertTrue(mx.array_equal(a, b).item())
+        elif isinstance(a, (list, tuple)):
+            self.assertEqual(len(a), len(b))
+            for x, y in zip(a, b):
+                self._assert_state_trees_equal(x, y)
+        else:
+            self.assertEqual(a, b)
+
+    def test_save_load_full_hybrid_with_wrapped_rotating(self):
+        """A wrapped RotatingKVCache must persist its window checkpoints
+        too — losing them drags the loaded hybrid's landing to 0 (silent
+        full reprocess) via the trim fixpoint. Parity contract:
+        restore-from-disk-then-trim equals pure-in-memory-trim over the
+        full state tree of every cache."""
+        mx.random.seed(4)
+        kv, ar = KVCache(), ArraysCache(size=2)
+        rot = RotatingKVCache(max_size=64, keep=4)
+        cache = [kv, ar, rot]
+        pos = 0
+        for b in (32, 64, 96, 113):
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            rot.update_and_fetch(k, k)
+            ar[0] = mx.random.normal((1, 3))
+            ar[1] = mx.random.normal((1, 5))
+            pos = b
+            record_state_checkpoints(cache, [pos])
+        record_state_checkpoints(cache, [pos], force=True)
+
+        size = max(c.size() for c in cache)
+        self.assertEqual(achievable_trim(cache, size - 96), (96, 17))
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hybrid.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+
+        lsize = max(c.size() for c in loaded)
+        self.assertEqual(lsize, size)
+        self.assertEqual(achievable_trim(loaded, lsize - 96), (96, 17))
+
+        self.assertEqual(trim_prompt_cache(loaded, lsize - 96, allow_partial=True), 17)
+        self.assertEqual(trim_prompt_cache(cache, size - 96, allow_partial=True), 17)
+        for cl, cm in zip(loaded, cache):
+            self.assertEqual(cl.size(), cm.size())
+            self._assert_state_trees_equal(cl.state, cm.state)
+
     # ---------------- rotating (sliding-window) caches ----------------
 
     def _rotating_hybrid(self, window, boundaries):

@@ -989,20 +989,53 @@ class RotatingKVCache(_BaseCache):
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+            live = [self.keys[..., : self.offset, :], self.values[..., : self.offset, :]]
         else:
-            return self.keys, self.values
+            live = [self.keys, self.values]
+        if self._checkpoints:
+            snaps = []
+            for _, k, v in self._checkpoints:
+                snaps.extend([k, v])
+            return [live, snaps]
+        return live[0], live[1]
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        # New-format state is [[keys, values], [ck_k, ck_v, ...]] (nested
+        # lists); legacy state is the flat (keys, values) pair. Checkpoint
+        # positions arrive in meta_state, whose setter runs after this one.
+        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
+            self.keys, self.values = v[0]
+            self._pending_checkpoint_snapshots = list(v[1])
+        else:
+            self.keys, self.values = v
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        base = tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        if self._checkpoints:
+            return base + tuple(
+                ["ckptv1"] + [str(p) for p, _, _ in self._checkpoints]
+            )
+        return base
 
     @meta_state.setter
     def meta_state(self, v):
+        pending = getattr(self, "_pending_checkpoint_snapshots", None)
+        self._pending_checkpoint_snapshots = None
+        v = list(v)
+        if "ckptv1" in v:
+            i = v.index("ckptv1")
+            positions = [int(p) for p in v[i + 1 :]]
+            v = v[:i]
+            if pending is None or len(pending) != 2 * len(positions):
+                raise ValueError(
+                    "RotatingKVCache checkpoint state/metadata mismatch"
+                )
+            self._checkpoints = [
+                (p, pending[2 * j], pending[2 * j + 1])
+                for j, p in enumerate(positions)
+            ]
         self.keep, self.max_size, self.offset, self._idx = map(
             int,
             v,
