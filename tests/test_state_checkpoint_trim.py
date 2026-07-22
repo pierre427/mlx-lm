@@ -278,6 +278,35 @@ class TestStateCheckpointTrim(unittest.TestCase):
         else:
             self.assertEqual(a, b)
 
+    def test_exact_hit_never_returns_empty_remainder(self):
+        """An exact-key fetch (client retrying an identical prompt) must
+        leave at least one token to re-process — the caller needs
+        last-token logits and passes ``rest`` straight to generation.
+        Trimmable caches give back the last token; hybrids land on their
+        deepest interior checkpoint."""
+        # Hybrid entry with checkpoints at 32/64/96 (+ forced end).
+        cache, _ = self._synthetic_hybrid([32, 64, 96])
+        key = list(range(96))
+        lru = LRUPromptCache()
+        lru.insert_cache("m", key, cache)
+        got, rest = lru.fetch_nearest_cache("m", key)
+        self.assertIsNotNone(got)
+        self.assertGreaterEqual(len(rest), 1)
+        landed = len(key) - len(rest)
+        self.assertEqual(landed, 64)  # deepest checkpoint <= 95
+        self.assertEqual(rest, key[64:])
+
+        # Trimmable (pure KV) entry: lands at len-1, rest = last token.
+        kv = KVCache()
+        k = mx.random.normal((1, 2, 96, 4))
+        kv.update_and_fetch(k, k)
+        lru2 = LRUPromptCache()
+        lru2.insert_cache("m", key, [kv])
+        got2, rest2 = lru2.fetch_nearest_cache("m", key)
+        self.assertIsNotNone(got2)
+        self.assertEqual(rest2, key[-1:])
+        self.assertEqual(got2[0].offset, 95)
+
     def test_save_load_full_hybrid_with_wrapped_rotating(self):
         """A wrapped RotatingKVCache must persist its window checkpoints
         too — losing them drags the loaded hybrid's landing to 0 (silent

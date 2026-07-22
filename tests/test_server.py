@@ -837,7 +837,7 @@ class TestLRUPromptCache(unittest.TestCase):
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [2])  # exact hit re-processes the last token
         c, t = cache.fetch_nearest_cache(model, [1])
         self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [1])
@@ -860,10 +860,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [3])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [4])
 
         cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
         c, t = cache.fetch_nearest_cache(model, [2, 3])
@@ -871,10 +871,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [2, 3])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [4])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [5])
 
         cache.insert_cache(model, [5, 6], [MockCache("test5")])
         cache.insert_cache(model, [6, 7], [MockCache("test6")])
@@ -883,10 +883,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [5, 6])
         c, t = cache.fetch_nearest_cache(model, [6, 7])
         self.assertEqual(c, [MockCache("test6")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [7])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [5])
 
     def test_insert_trimmable_cache_removes_immediate_prefix(self):
         cache = LRUPromptCache(max_size=10)
