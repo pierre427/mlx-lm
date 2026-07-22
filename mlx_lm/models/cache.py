@@ -101,7 +101,73 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
-def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
+def _snap_trim_position(cache: List[Any], position: int) -> Optional[int]:
+    """Largest position <= ``position`` that every cache in the list can be
+    restored to, or ``None`` if some cache cannot restore any position.
+
+    Iterates to a fixpoint: lowering the position for one cache (to its
+    nearest state checkpoint) may lower it again for another.
+    """
+    while True:
+        start = position
+        for c in cache:
+            position = c.snap_trim_position(position)
+            if position is None or position < 0:
+                return None
+        if position == start:
+            return position
+
+
+def _absolute_position(c) -> int:
+    """Absolute token position of a cache. ``RotatingKVCache.size()``
+    saturates at ``max_size``; its ``offset`` is the true count."""
+    position = getattr(c, "offset", None)
+    if isinstance(position, int):
+        return position
+    return c.size() if hasattr(c, "size") else 0
+
+
+def _thin_checkpoints(checkpoints: List, max_checkpoints: int):
+    """Drop the checkpoint with the smallest gap to its predecessor
+    (implicit predecessor at 0), never the newest: this roughly doubles the
+    effective stride over the older history while keeping the
+    end-of-prefill checkpoint exact. Entries are tuples whose first element
+    is the position."""
+    while len(checkpoints) > max_checkpoints:
+        prev = 0
+        gaps = []
+        for j, entry in enumerate(checkpoints[:-1]):
+            gaps.append((entry[0] - prev, j))
+            prev = entry[0]
+        _, drop = min(gaps)
+        del checkpoints[drop]
+
+
+def achievable_trim(cache: List[Any], num_tokens: int):
+    """Dry-run of ``trim_prompt_cache(cache, num_tokens, allow_partial=True)``.
+
+    Returns ``(position, actual_num_tokens)`` — the absolute position the
+    cache would land on and the number of tokens that would actually be
+    trimmed (``>= num_tokens`` when the landing snaps to an earlier state
+    checkpoint) — or ``None`` if the cache cannot be trimmed at all.
+    """
+    if len(cache) == 0:
+        return None
+    size = max((_absolute_position(c) for c in cache), default=0)
+    if size <= 0:
+        return None
+    target = max(0, size - num_tokens)
+    if can_trim_prompt_cache(cache):
+        return target, size - target
+    position = _snap_trim_position(cache, target)
+    if position is None:
+        return None
+    return position, size - position
+
+
+def trim_prompt_cache(
+    cache: List[Any], num_tokens: int, allow_partial: bool = False
+) -> int:
     """
     Trim the model's cache by the given number of tokens.
 
@@ -111,13 +177,60 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     Args:
         cache (List[Any]): The model's cache.
         num_tokens (int): The number of tokens to trim.
+        allow_partial (bool): If the cache is not exactly trimmable (e.g. it
+            mixes recurrent-state ``ArraysCache`` layers with KV layers),
+            allow trimming *more* than ``num_tokens`` by restoring the
+            recurrent layers to their nearest recorded state checkpoint at or
+            before the requested position. The caller must use the returned
+            count (which may exceed ``num_tokens``) to decide how many tokens
+            to re-process. Default: ``False``.
 
     Returns:
         (int): The number of tokens that were trimmed.
     """
-    if not can_trim_prompt_cache(cache) or len(cache) == 0:
+    if len(cache) == 0:
         return 0
-    return [c.trim(num_tokens) for c in cache][0]
+    if can_trim_prompt_cache(cache):
+        return [c.trim(num_tokens) for c in cache][0]
+    if not allow_partial:
+        return 0
+    landing = achievable_trim(cache, num_tokens)
+    if landing is None:
+        return 0
+    position, actual = landing
+    for c in cache:
+        c.trim_to_position(position, actual)
+    return actual
+
+
+def record_state_checkpoints(cache: List[Any], positions: List[int], force=False):
+    """Record a recurrent-state checkpoint on every cache that supports one.
+
+    Called by the prefill loops at chunk boundaries. ``positions`` gives the
+    absolute number of tokens processed per batch lane at this boundary
+    (length-1 list for unbatched caches). No-op for pure KV caches and for
+    duck-typed caches that predate this hook.
+    """
+    for c in cache:
+        record = getattr(c, "state_checkpoint", None)
+        if record is not None:
+            record(positions, force=force)
+
+
+def _state_checkpoint_max() -> int:
+    """Max recorded state checkpoints per ArraysCache (0 disables)."""
+    try:
+        return int(os.environ.get("MLX_LM_STATE_CHECKPOINT_MAX", "4"))
+    except ValueError:
+        return 4
+
+
+def _state_checkpoint_stride() -> int:
+    """Minimum token gap between recorded (non-forced) state checkpoints."""
+    try:
+        return max(1, int(os.environ.get("MLX_LM_STATE_CHECKPOINT_STRIDE", "2048")))
+    except ValueError:
+        return 2048
 
 
 def create_attention_mask(
@@ -169,6 +282,30 @@ class _BaseCache:
     def stop_speculation(self):
         """Stop recording trim state and release any temporary rollback data."""
         pass
+
+    def state_checkpoint(self, positions: List[int], force: bool = False):
+        """Record a restorable snapshot of this cache's state at the given
+        absolute per-lane positions. No-op by default: KV caches can trim to
+        any position already, so only caches with irreversible state (e.g.
+        ``ArraysCache``) record checkpoints.
+        """
+        pass
+
+    def snap_trim_position(self, position: int) -> Optional[int]:
+        """Largest absolute position <= ``position`` this cache can be
+        restored to. Exactly-trimmable caches can restore any position;
+        caches with irreversible state snap to a recorded checkpoint.
+        Returns ``None`` if no position is restorable.
+        """
+        return position if self.is_trimmable() else None
+
+    def trim_to_position(self, position: int, num_tokens: int) -> int:
+        """Restore the cache to absolute position ``position`` by trimming
+        ``num_tokens`` tokens from its end. Exactly-trimmable caches just
+        trim; checkpointed caches restore the snapshot recorded at
+        ``position`` (which ``snap_trim_position`` guaranteed exists).
+        """
+        return self.trim(num_tokens)
 
     def size(self):
         """
@@ -623,6 +760,12 @@ class RotatingKVCache(_BaseCache):
         instance.speculating = False
         instance._rollbacks = deque()
         instance._rollback_window = cls._ROLLBACK_WINDOW
+        # Prefill-time window checkpoints: (position, keys, values) with the
+        # arrays in temporal order. Once the ring wraps, evicted rows are
+        # gone and the cache cannot be trimmed backward; these are the only
+        # positions (plus the implicit empty state at 0) a trim can land on.
+        # Bounded by the window size (not the context length).
+        instance._checkpoints = []
         return instance
 
     def __init__(self, max_size, keep=0):
@@ -632,6 +775,64 @@ class RotatingKVCache(_BaseCache):
         self.offset = 0
         self.max_size = max_size
         self._idx = 0
+
+    def state_checkpoint(self, positions: List[int], force: bool = False):
+        max_checkpoints = _state_checkpoint_max()
+        if max_checkpoints <= 0 or self.keys is None or len(positions) != 1:
+            return
+        position = positions[0]
+        last = self._checkpoints[-1][0] if self._checkpoints else 0
+        if position <= last:
+            return
+        if not force and position - last < _state_checkpoint_stride():
+            return
+        # Temporal-order copies: the single-token update path mutates the
+        # ring buffers in place, so views would be corrupted later.
+        keys = self._temporal_order(self.keys)
+        values = self._temporal_order(self.values)
+        self._checkpoints.append((position, mx.array(keys), mx.array(values)))
+        _thin_checkpoints(self._checkpoints, max_checkpoints)
+
+    def snap_trim_position(self, position: int) -> Optional[int]:
+        if self.offset < self.max_size:
+            # Not wrapped yet: every position is natively reachable.
+            return position
+        best = 0  # the empty state at position 0 is always restorable
+        for p, _, _ in self._checkpoints:
+            if p <= position:
+                best = max(best, p)
+        return best
+
+    def trim_to_position(self, position: int, num_tokens: int) -> int:
+        if self.offset < self.max_size:
+            return self.trim(num_tokens)
+        if position > 0:
+            found = None
+            for p, keys, values in reversed(self._checkpoints):
+                if p == position:
+                    found = (keys, values)
+                    break
+            if found is None:
+                raise RuntimeError(
+                    f"RotatingKVCache has no window checkpoint at position "
+                    f"{position}"
+                )
+            # Copy on restore too, so the retained checkpoint stays pristine
+            # when the in-place update path later mutates the live buffers.
+            self.keys = mx.array(found[0])
+            self.values = mx.array(found[1])
+            self.offset = position
+            self._idx = self.keys.shape[2]
+        else:
+            self.keys = None
+            self.values = None
+            self.offset = 0
+            self._idx = 0
+        while self._checkpoints and self._checkpoints[-1][0] > position:
+            self._checkpoints.pop()
+        # Any speculative rollbacks describe the discarded suffix.
+        self._rollbacks.clear()
+        return num_tokens
 
     def start_speculation(self, rollback_window: Optional[int] = None):
         self.speculating = True
@@ -788,20 +989,53 @@ class RotatingKVCache(_BaseCache):
     @property
     def state(self):
         if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+            live = [self.keys[..., : self.offset, :], self.values[..., : self.offset, :]]
         else:
-            return self.keys, self.values
+            live = [self.keys, self.values]
+        if self._checkpoints:
+            snaps = []
+            for _, k, v in self._checkpoints:
+                snaps.extend([k, v])
+            return [live, snaps]
+        return live[0], live[1]
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        # New-format state is [[keys, values], [ck_k, ck_v, ...]] (nested
+        # lists); legacy state is the flat (keys, values) pair. Checkpoint
+        # positions arrive in meta_state, whose setter runs after this one.
+        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
+            self.keys, self.values = v[0]
+            self._pending_checkpoint_snapshots = list(v[1])
+        else:
+            self.keys, self.values = v
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        base = tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+        if self._checkpoints:
+            return base + tuple(
+                ["ckptv1"] + [str(p) for p, _, _ in self._checkpoints]
+            )
+        return base
 
     @meta_state.setter
     def meta_state(self, v):
+        pending = getattr(self, "_pending_checkpoint_snapshots", None)
+        self._pending_checkpoint_snapshots = None
+        v = list(v)
+        if "ckptv1" in v:
+            i = v.index("ckptv1")
+            positions = [int(p) for p in v[i + 1 :]]
+            v = v[:i]
+            if pending is None or len(pending) != 2 * len(positions):
+                raise ValueError(
+                    "RotatingKVCache checkpoint state/metadata mismatch"
+                )
+            self._checkpoints = [
+                (p, pending[2 * j], pending[2 * j + 1])
+                for j, p in enumerate(positions)
+            ]
         self.keep, self.max_size, self.offset, self._idx = map(
             int,
             v,
@@ -896,7 +1130,10 @@ class RotatingKVCache(_BaseCache):
     def nbytes(self):
         if self.keys is None:
             return 0
-        return self.keys.nbytes + self.values.nbytes
+        total = self.keys.nbytes + self.values.nbytes
+        for _, keys, values in self._checkpoints:
+            total += keys.nbytes + values.nbytes
+        return total
 
 
 class ArraysCache(_BaseCache):
@@ -913,6 +1150,15 @@ class ArraysCache(_BaseCache):
         instance.speculating = False
         instance._rollbacks = deque()
         instance._rollback_window = cls._ROLLBACK_WINDOW
+        # Prefill-time state checkpoints, stored per batch lane: one list per
+        # lane of (position, snapshot) pairs, where ``position`` is the lane's
+        # absolute token position and ``snapshot`` holds batch-size-1 copies
+        # of ``self.cache`` at that position. Recurrent state cannot be
+        # trimmed backward, so these are the only positions (plus the
+        # implicit empty state at 0) a trim can land on. Per-lane storage
+        # lets extend/filter/merge/extract carry histories across batch
+        # membership changes with plain list operations.
+        instance._checkpoints = []
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -984,6 +1230,67 @@ class ArraysCache(_BaseCache):
                 self._rollbacks.append((m, fn, snapshot))
         return n
 
+    def state_checkpoint(self, positions: List[int], force: bool = False):
+        max_checkpoints = _state_checkpoint_max()
+        if max_checkpoints <= 0 or self.empty():
+            return
+        if len(self._checkpoints) != len(positions):
+            # First record, or the lane set changed without going through
+            # extend/filter/merge: (re)start the histories.
+            self._checkpoints = [[] for _ in positions]
+        stride = _state_checkpoint_stride()
+        for i, position in enumerate(positions):
+            lane = self._checkpoints[i]
+            last = lane[-1][0] if lane else 0
+            # A lane that exhausted its prompt is frozen at ``last``; only
+            # record monotone advances.
+            if lane and position <= last:
+                continue
+            if not force and position - last < stride:
+                continue
+            # mx.array of a slice is a true copy: the snapshot neither pins
+            # the full batch buffer nor can be corrupted by later updates.
+            snapshot = [
+                None if c is None else mx.array(c[i : i + 1]) for c in self.cache
+            ]
+            lane.append((position, snapshot))
+            _thin_checkpoints(lane, max_checkpoints)
+
+    def snap_trim_position(self, position: int) -> Optional[int]:
+        # Restores are only defined for single-lane caches (batch entries are
+        # sliced apart by ``extract`` before they reach a trim).
+        if self.batch_size > 1 or len(self._checkpoints) > 1:
+            return None
+        best = 0  # the empty state at position 0 is always restorable
+        if self._checkpoints:
+            for p, _ in self._checkpoints[0]:
+                if p <= position:
+                    best = max(best, p)
+        return best
+
+    def trim_to_position(self, position: int, num_tokens: int) -> int:
+        lane = self._checkpoints[0] if self._checkpoints else []
+        if position > 0:
+            found = None
+            for p, snapshot in reversed(lane):
+                if p == position:
+                    found = snapshot
+                    break
+            if found is None:
+                raise RuntimeError(
+                    f"ArraysCache has no state checkpoint at position {position}"
+                )
+            # Copy on restore too, so the retained checkpoint stays pristine
+            # if a layer mutates its live state entries in place.
+            self.cache = [None if a is None else mx.array(a) for a in found]
+        else:
+            self.cache = [None] * len(self.cache)
+        while lane and lane[-1][0] > position:
+            lane.pop()
+        # Any speculative rollbacks describe the discarded suffix.
+        self._rollbacks.clear()
+        return num_tokens
+
     @property
     def batch_size(self):
         for c in self.cache:
@@ -1002,13 +1309,59 @@ class ArraysCache(_BaseCache):
     def __getitem__(self, idx):
         return self.cache[idx]
 
+    def _persistable_checkpoints(self):
+        """Single-lane checkpoints whose snapshots are fully materialized.
+
+        Snapshots containing ``None`` entries cannot round-trip through
+        ``save_prompt_cache`` (safetensors holds arrays only), so they are
+        skipped. Batched histories are never persisted (snapshot files hold
+        per-request caches).
+        """
+        if len(self._checkpoints) != 1:
+            return []
+        return [
+            (p, snapshot)
+            for p, snapshot in self._checkpoints[0]
+            if all(a is not None for a in snapshot)
+        ]
+
     @property
     def state(self):
+        checkpoints = self._persistable_checkpoints()
+        if checkpoints:
+            return [list(self.cache), [list(s) for _, s in checkpoints]]
         return self.cache
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        # New-format state is [live_entries, [snapshot, ...]] (nested lists);
+        # legacy state is a flat list of arrays. The positions arrive in
+        # meta_state, whose setter runs after this one (see from_state).
+        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
+            self.cache = list(v[0])
+            self._pending_checkpoint_snapshots = [list(s) for s in v[1]]
+        else:
+            self.cache = v
+
+    @property
+    def meta_state(self):
+        checkpoints = self._persistable_checkpoints()
+        if checkpoints:
+            return tuple(["ckptv1"] + [str(p) for p, _ in checkpoints])
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pending = getattr(self, "_pending_checkpoint_snapshots", None)
+        self._pending_checkpoint_snapshots = None
+        if not v:
+            return
+        if v[0] != "ckptv1":
+            raise ValueError(f"Unknown ArraysCache metadata version: {v[0]}")
+        positions = [int(p) for p in v[1:]]
+        if pending is None or len(pending) != len(positions):
+            raise ValueError("ArraysCache checkpoint state/metadata mismatch")
+        self._checkpoints = [list(zip(positions, pending))]
 
     def filter(self, batch_indices):
         """
@@ -1019,6 +1372,8 @@ class ArraysCache(_BaseCache):
             self.left_padding = self.left_padding[batch_indices]
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
+        if self._checkpoints:
+            self._checkpoints = [self._checkpoints[i] for i in batch_indices]
 
     def extend(self, other):
         """
@@ -1050,10 +1405,15 @@ class ArraysCache(_BaseCache):
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
         self.left_padding = cat(self.left_padding, other.left_padding)
         self.lengths = cat(self.lengths, other.lengths)
+        a_lanes = self._checkpoints or [[] for _ in range(a_batch)]
+        b_lanes = other._checkpoints or [[] for _ in range(b_batch)]
+        self._checkpoints = [list(l) for l in a_lanes] + [list(l) for l in b_lanes]
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
         cache.cache = [c[idx : idx + 1] for c in self.cache]
+        if idx < len(self._checkpoints):
+            cache._checkpoints = [list(self._checkpoints[idx])]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -1099,6 +1459,10 @@ class ArraysCache(_BaseCache):
                 if caches[i][e] is None:
                     continue
                 cache[e][i : i + 1] = caches[i][e]
+        cache._checkpoints = [
+            list(c._checkpoints[0]) if len(c._checkpoints) == 1 else []
+            for c in caches
+        ]
         return cache
 
     def empty(self):
@@ -1106,7 +1470,11 @@ class ArraysCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return sum(c.nbytes for c in self.cache if c is not None)
+        total = sum(c.nbytes for c in self.cache if c is not None)
+        for lane in self._checkpoints:
+            for _, snapshot in lane:
+                total += sum(a.nbytes for a in snapshot if a is not None)
+        return total
 
 
 class ChunkedKVCache(_BaseCache):
@@ -1214,6 +1582,25 @@ class CacheList(_BaseCache):
     def stop_speculation(self):
         for c in self.caches:
             c.stop_speculation()
+
+    def state_checkpoint(self, positions: List[int], force: bool = False):
+        for c in self.caches:
+            c.state_checkpoint(positions, force=force)
+
+    def snap_trim_position(self, position: int) -> Optional[int]:
+        while True:
+            start = position
+            for c in self.caches:
+                position = c.snap_trim_position(position)
+                if position is None:
+                    return None
+            if position == start:
+                return position
+
+    def trim_to_position(self, position: int, num_tokens: int) -> int:
+        for c in self.caches:
+            m = c.trim_to_position(position, num_tokens)
+        return m
 
     @property
     def state(self):
@@ -2377,19 +2764,54 @@ class LRUPromptCache:
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
-        if result.exact is not None:
+        if result.exact is not None and len(tokens) == 0:
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
+        if result.exact is not None:
+            cache_entry = self._trie.get(result.model, result.exact)
+            # Never hand back an empty remainder: the caller re-processes
+            # ``rest`` to obtain last-token logits, so an exact hit (e.g. a
+            # client retrying an identical prompt) must land at or before
+            # len(tokens) - 1. Trimmable caches give back the last token;
+            # hybrids land on their deepest interior checkpoint.
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trim_prompt_cache(cache, 1)
+                return cache, tokens[-1:]
+            landing = achievable_trim(cache_entry.prompt_cache, 1)
+            if landing is not None and landing[1] < len(tokens):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trimmed = trim_prompt_cache(cache, 1, allow_partial=True)
+                landed = len(tokens) - trimmed
+                if 0 < landed <= len(tokens) - 1:
+                    return cache, tokens[landed:]
+            # No usable landing (e.g. checkpointing disabled): fall through
+            # to the shorter/longer candidates rather than return an
+            # unusable full cache.
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
             if can_trim_prompt_cache(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
+            # A hybrid (recurrent + KV) cache can only land on a recorded
+            # state checkpoint at or before the requested position, so dry-run
+            # the trim first and only prefer this entry over an exact-prefix
+            # entry when it actually lands deeper.
+            landing = achievable_trim(cache_entry.prompt_cache, num_to_trim)
+            if landing is not None:
+                landed = len(result.longer) - landing[1]
+                if 0 < landed <= len(tokens) - 1 and landed > short_length:
+                    cache = copy.deepcopy(cache_entry.prompt_cache)
+                    trimmed = trim_prompt_cache(
+                        cache, num_to_trim, allow_partial=True
+                    )
+                    landed = len(result.longer) - trimmed
+                    return cache, tokens[landed:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)

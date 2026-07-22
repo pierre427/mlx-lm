@@ -1,0 +1,542 @@
+# Copyright © 2026 Apple Inc.
+"""Prefix-cache trim for linear-attention hybrid caches.
+
+Hybrid models (Qwen3-Next / Kimi-Linear class) mix ArraysCache (recurrent
+state, not trimmable backward) with KVCache. These tests cover the
+prefill-time state checkpoints recorded on ArraysCache and the coordinated
+partial trim that lands on a checkpoint boundary, including the
+LRUPromptCache reuse path the server drives.
+"""
+
+import copy
+import importlib
+import os
+import tempfile
+import unittest
+
+# See tests/test_models.py: pin fp32 GEMMs off the TF32 path so
+# checkpoint-restore equivalence checks stay fp32-exact on M5 NAX.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
+import mlx.core as mx
+
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    LRUPromptCache,
+    RotatingKVCache,
+    achievable_trim,
+    can_trim_prompt_cache,
+    load_prompt_cache,
+    make_prompt_cache,
+    record_state_checkpoints,
+    save_prompt_cache,
+    trim_prompt_cache,
+)
+
+QWEN3_NEXT_CONFIG = {
+    "model_type": "qwen3_next",
+    "hidden_size": 128,
+    "num_hidden_layers": 4,
+    "intermediate_size": 128,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 4,
+    "vocab_size": 1000,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 32,
+    "linear_conv_kernel_dim": 3,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "decoder_sparse_step": 1,
+    "shared_expert_intermediate_size": 128,
+    "mlp_only_layers": [0],
+    "moe_intermediate_size": 128,
+    "rms_norm_eps": 1e-5,
+    "head_dim": 64,
+    "rope_theta": 1000.0,
+    "partial_rotary_factor": 0.5,
+    "max_position_embeddings": 1000,
+}
+
+KIMI_LINEAR_CONFIG = {
+    "model_type": "kimi_linear",
+    "vocab_size": 1000,
+    "hidden_size": 128,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 4,
+    "intermediate_size": 128,
+    "head_dim": 32,
+    "rope_theta": 100.0,
+    "rms_norm_eps": 1e-6,
+    "linear_attn_config": {
+        "num_heads": 8,
+        "head_dim": 32,
+        "kda_layers": [1],
+    },
+    "model_max_length": 1000,
+    "num_experts": 2,
+    "moe_intermediate_size": 128,
+    "kv_lora_rank": 8,
+    "qk_nope_head_dim": 16,
+    "qk_rope_head_dim": 16,
+    "v_head_dim": 16,
+}
+
+
+def make_model(config):
+    arch = importlib.import_module(f"mlx_lm.models.{config['model_type']}")
+    model = arch.Model(arch.ModelArgs.from_dict(config))
+    model.eval()
+    return model
+
+
+def prefill(model, cache, tokens, chunk):
+    """Chunked prefill mirroring generate_step: record a checkpoint at every
+    chunk boundary and force one at the end. Returns the last chunk logits."""
+    base = max((c.size() for c in cache), default=0)
+    logits = None
+    processed = 0
+    for i in range(0, len(tokens), chunk):
+        seg = mx.array(tokens[i : i + chunk])[None]
+        logits = model(seg, cache=cache)
+        mx.eval(logits, [c.state for c in cache])
+        processed += seg.shape[1]
+        record_state_checkpoints(cache, [base + processed])
+    if processed > 0:
+        record_state_checkpoints(cache, [base + processed], force=True)
+    return logits
+
+
+def greedy(model, cache, last_logits, n):
+    ids = []
+    y = mx.argmax(last_logits[:, -1, :], axis=-1)
+    for _ in range(n):
+        ids.append(int(y.item()))
+        logits = model(y[None], cache=cache)
+        y = mx.argmax(logits[:, -1, :], axis=-1)
+    return ids
+
+
+class TestStateCheckpointTrim(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._env = {
+            k: os.environ.get(k)
+            for k in ("MLX_LM_STATE_CHECKPOINT_STRIDE", "MLX_LM_STATE_CHECKPOINT_MAX")
+        }
+        os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = "32"
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+
+    @classmethod
+    def tearDownClass(cls):
+        for k, v in cls._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # ---------------- synthetic caches ----------------
+
+    def _synthetic_hybrid(self, boundaries):
+        """KVCache + ArraysCache advanced through the given chunk boundaries."""
+        kv = KVCache()
+        ar = ArraysCache(size=2)
+        cache = [kv, ar]
+        states = {}
+        pos = 0
+        for b in boundaries:
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            ar[0] = mx.random.normal((1, 3))
+            ar[1] = mx.random.normal((1, 5))
+            pos = b
+            record_state_checkpoints(cache, [pos])
+            states[pos] = [mx.array(ar[0]), mx.array(ar[1])]
+        record_state_checkpoints(cache, [pos], force=True)
+        return cache, states
+
+    def test_partial_trim_lands_on_checkpoint(self):
+        cache, states = self._synthetic_hybrid([32, 64, 96, 113])
+        kv, ar = cache
+        self.assertFalse(can_trim_prompt_cache(cache))
+
+        # Requested landing 95 is between checkpoints; snaps back to 64.
+        self.assertEqual(achievable_trim(cache, 18), (64, 49))
+        # Exact-checkpoint landing stays exact.
+        self.assertEqual(achievable_trim(cache, 17), (96, 17))
+
+        n = trim_prompt_cache(cache, 18, allow_partial=True)
+        self.assertEqual(n, 49)
+        self.assertEqual(kv.offset, 64)
+        for got, want in zip([ar[0], ar[1]], states[64]):
+            self.assertTrue(mx.allclose(got, want).item())
+        # Checkpoints past the landing were dropped.
+        self.assertEqual(ar.snap_trim_position(1000), 64)
+
+    def test_partial_trim_is_opt_in(self):
+        cache, _ = self._synthetic_hybrid([32, 64])
+        kv, ar = cache
+        state_before = [mx.array(ar[0]), mx.array(ar[1])]
+        self.assertEqual(trim_prompt_cache(cache, 10), 0)
+        self.assertEqual(kv.offset, 64)
+        for got, want in zip([ar[0], ar[1]], state_before):
+            self.assertTrue(mx.allclose(got, want).item())
+
+    def test_trim_below_oldest_checkpoint_resets(self):
+        cache, _ = self._synthetic_hybrid([32, 64])
+        kv, ar = cache
+        # target 54 -> lands on the checkpoint at 32
+        n = trim_prompt_cache(cache, 10, allow_partial=True)
+        self.assertEqual(n, 32)
+        self.assertEqual(kv.offset, 32)
+        # target 12 is below every checkpoint -> full reset
+        n = trim_prompt_cache(cache, 20, allow_partial=True)
+        self.assertEqual(n, 32)
+        self.assertEqual(kv.offset, 0)
+        self.assertTrue(ar.empty())
+
+    def test_checkpoint_cap_and_thinning(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "3"
+        try:
+            cache, _ = self._synthetic_hybrid([32, 64, 96, 128, 160, 192])
+            ar = cache[1]
+            lane = ar._checkpoints[0]
+            self.assertLessEqual(len(lane), 3)
+            # The newest (end-of-prefill) checkpoint always survives.
+            self.assertEqual(lane[-1][0], 192)
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+
+    def test_disabled_via_env(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            cache, _ = self._synthetic_hybrid([32, 64])
+            ar = cache[1]
+            self.assertEqual(ar._checkpoints, [])
+            # Only the implicit empty state remains reachable.
+            self.assertEqual(achievable_trim(cache, 10), (0, 64))
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+
+    def test_deepcopy_preserves_checkpoints(self):
+        cache, states = self._synthetic_hybrid([32, 64, 96])
+        clone = copy.deepcopy(cache)
+        # target 56 -> lands on the checkpoint at 32
+        n = trim_prompt_cache(clone, 40, allow_partial=True)
+        self.assertEqual(n, 64)
+        for got, want in zip([clone[1][0], clone[1][1]], states[32]):
+            self.assertTrue(mx.allclose(got, want).item())
+        # The original is untouched.
+        self.assertEqual(cache[0].offset, 96)
+        self.assertEqual(cache[1].snap_trim_position(1000), 96)
+
+    def test_save_load_roundtrip_preserves_checkpoints(self):
+        cache, states = self._synthetic_hybrid([32, 64, 96])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+        kv, ar = loaded
+        self.assertEqual([p for p, _ in ar._checkpoints[0]], [32, 64, 96])
+        # Live state survives alongside the checkpoints.
+        for got, want in zip([ar[0], ar[1]], states[96]):
+            self.assertTrue(mx.allclose(got, want).item())
+        # Trims work on the loaded cache exactly as on the live one.
+        n = trim_prompt_cache(loaded, 40, allow_partial=True)
+        self.assertEqual(n, 64)
+        self.assertEqual(kv.offset, 32)
+        for got, want in zip([ar[0], ar[1]], states[32]):
+            self.assertTrue(mx.allclose(got, want).item())
+
+    def test_save_load_without_checkpoints_is_legacy_shape(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            cache, _ = self._synthetic_hybrid([32, 64])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+        ar = cache[1]
+        state_before = [mx.array(ar[0]), mx.array(ar[1])]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+        self.assertEqual(loaded[1]._checkpoints, [])
+        for got, want in zip([loaded[1][0], loaded[1][1]], state_before):
+            self.assertTrue(mx.allclose(got, want).item())
+
+    def _assert_state_trees_equal(self, a, b):
+        if isinstance(a, mx.array):
+            self.assertTrue(mx.array_equal(a, b).item())
+        elif isinstance(a, (list, tuple)):
+            self.assertEqual(len(a), len(b))
+            for x, y in zip(a, b):
+                self._assert_state_trees_equal(x, y)
+        else:
+            self.assertEqual(a, b)
+
+    def test_exact_hit_never_returns_empty_remainder(self):
+        """An exact-key fetch (client retrying an identical prompt) must
+        leave at least one token to re-process — the caller needs
+        last-token logits and passes ``rest`` straight to generation.
+        Trimmable caches give back the last token; hybrids land on their
+        deepest interior checkpoint."""
+        # Hybrid entry with checkpoints at 32/64/96 (+ forced end).
+        cache, _ = self._synthetic_hybrid([32, 64, 96])
+        key = list(range(96))
+        lru = LRUPromptCache()
+        lru.insert_cache("m", key, cache)
+        got, rest = lru.fetch_nearest_cache("m", key)
+        self.assertIsNotNone(got)
+        self.assertGreaterEqual(len(rest), 1)
+        landed = len(key) - len(rest)
+        self.assertEqual(landed, 64)  # deepest checkpoint <= 95
+        self.assertEqual(rest, key[64:])
+
+        # Trimmable (pure KV) entry: lands at len-1, rest = last token.
+        kv = KVCache()
+        k = mx.random.normal((1, 2, 96, 4))
+        kv.update_and_fetch(k, k)
+        lru2 = LRUPromptCache()
+        lru2.insert_cache("m", key, [kv])
+        got2, rest2 = lru2.fetch_nearest_cache("m", key)
+        self.assertIsNotNone(got2)
+        self.assertEqual(rest2, key[-1:])
+        self.assertEqual(got2[0].offset, 95)
+
+    def test_save_load_full_hybrid_with_wrapped_rotating(self):
+        """A wrapped RotatingKVCache must persist its window checkpoints
+        too — losing them drags the loaded hybrid's landing to 0 (silent
+        full reprocess) via the trim fixpoint. Parity contract:
+        restore-from-disk-then-trim equals pure-in-memory-trim over the
+        full state tree of every cache."""
+        mx.random.seed(4)
+        kv, ar = KVCache(), ArraysCache(size=2)
+        rot = RotatingKVCache(max_size=64, keep=4)
+        cache = [kv, ar, rot]
+        pos = 0
+        for b in (32, 64, 96, 113):
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            rot.update_and_fetch(k, k)
+            ar[0] = mx.random.normal((1, 3))
+            ar[1] = mx.random.normal((1, 5))
+            pos = b
+            record_state_checkpoints(cache, [pos])
+        record_state_checkpoints(cache, [pos], force=True)
+
+        size = max(c.size() for c in cache)
+        self.assertEqual(achievable_trim(cache, size - 96), (96, 17))
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hybrid.safetensors")
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+
+        lsize = max(c.size() for c in loaded)
+        self.assertEqual(lsize, size)
+        self.assertEqual(achievable_trim(loaded, lsize - 96), (96, 17))
+
+        self.assertEqual(trim_prompt_cache(loaded, lsize - 96, allow_partial=True), 17)
+        self.assertEqual(trim_prompt_cache(cache, size - 96, allow_partial=True), 17)
+        for cl, cm in zip(loaded, cache):
+            self.assertEqual(cl.size(), cm.size())
+            self._assert_state_trees_equal(cl.state, cm.state)
+
+    # ---------------- rotating (sliding-window) caches ----------------
+
+    def _rotating_hybrid(self, window, boundaries):
+        """KVCache + RotatingKVCache advanced through the given boundaries,
+        recording checkpoints. Returns the caches plus reference window
+        copies (temporal order) captured at every boundary."""
+        kv = KVCache()
+        rot = RotatingKVCache(max_size=window)
+        cache = [kv, rot]
+        refs = {}
+        pos = 0
+        for b in boundaries:
+            n = b - pos
+            k = mx.random.normal((1, 2, n, 4))
+            kv.update_and_fetch(k, k)
+            rot.update_and_fetch(k, k)
+            pos = b
+            record_state_checkpoints(cache, [pos])
+            refs[pos] = (
+                mx.array(rot._temporal_order(rot.keys)),
+                mx.array(rot._temporal_order(rot.values)),
+            )
+        record_state_checkpoints(cache, [pos], force=True)
+        return cache, refs
+
+    def test_rotating_hybrid_partial_trim(self):
+        cache, refs = self._rotating_hybrid(32, [32, 64, 96, 113])
+        kv, rot = cache
+        # The ring has wrapped: not trimmable, so the strict path is closed.
+        self.assertFalse(can_trim_prompt_cache(cache))
+        # size() saturates at the window; the coordinator must use the
+        # absolute position (113), not min(offset, max_size).
+        self.assertEqual(achievable_trim(cache, 18), (64, 49))
+
+        n = trim_prompt_cache(cache, 18, allow_partial=True)
+        self.assertEqual(n, 49)
+        self.assertEqual(kv.offset, 64)
+        self.assertEqual(rot.offset, 64)
+        self.assertTrue(mx.array_equal(rot.keys, refs[64][0]).item())
+        self.assertTrue(mx.array_equal(rot.values, refs[64][1]).item())
+
+        # The restored cache keeps working: advance again and re-trim.
+        k = mx.random.normal((1, 2, 10, 4))
+        kv.update_and_fetch(k, k)
+        rot.update_and_fetch(k, k)
+        n = trim_prompt_cache(cache, 42, allow_partial=True)
+        self.assertEqual(n, 42)  # target 32 is an exact checkpoint
+        self.assertEqual(rot.offset, 32)
+        self.assertTrue(mx.array_equal(rot.keys, refs[32][0]).item())
+
+    def test_rotating_wrapped_without_checkpoints_lands_at_zero(self):
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            cache, _ = self._rotating_hybrid(32, [64])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+        kv, rot = cache
+        # Only the empty state is reachable; the whole cache is trimmed.
+        self.assertEqual(achievable_trim(cache, 10), (0, 64))
+        n = trim_prompt_cache(cache, 10, allow_partial=True)
+        self.assertEqual(n, 64)
+        self.assertEqual(kv.offset, 0)
+        self.assertIsNone(rot.keys)
+        self.assertEqual(rot.offset, 0)
+
+    def test_rotating_unwrapped_stays_natively_trimmable(self):
+        cache, _ = self._rotating_hybrid(256, [32, 64])
+        kv, rot = cache
+        self.assertTrue(can_trim_prompt_cache(cache))
+        self.assertEqual(trim_prompt_cache(cache, 10), 10)
+        self.assertEqual(rot.offset, 54)
+
+    # ---------------- batch lanes ----------------
+
+    def test_batch_lanes_record_extract_extend(self):
+        ar = ArraysCache(size=1)
+        ar[0] = mx.random.normal((2, 3))
+        record_state_checkpoints([ar], [40, 32], force=True)
+        state0 = mx.array(ar[0])
+        ar[0] = mx.random.normal((2, 3))
+        record_state_checkpoints([ar], [80, 32], force=True)
+
+        # Lane 1 was frozen at 32: only one (monotone) record kept.
+        self.assertEqual([p for p, _ in ar._checkpoints[1]], [32])
+        self.assertEqual([p for p, _ in ar._checkpoints[0]], [40, 80])
+
+        # Batched caches never snap (extract slices them apart first).
+        self.assertIsNone(ar.snap_trim_position(100))
+
+        lane0 = ar.extract(0)
+        self.assertEqual(lane0.snap_trim_position(50), 40)
+        lane0.trim_to_position(40, 40)
+        self.assertTrue(mx.allclose(lane0[0], state0[0:1]).item())
+
+        # extend preserves both sides' histories.
+        other = ArraysCache(size=1)
+        other[0] = mx.random.normal((1, 3))
+        record_state_checkpoints([other], [16], force=True)
+        base = ar.extract(1)
+        base.extend(other)
+        self.assertEqual([p for p, _ in base._checkpoints[0]], [32])
+        self.assertEqual([p for p, _ in base._checkpoints[1]], [16])
+
+        # merge carries per-lane histories back into a batch cache.
+        merged = ArraysCache.merge([lane0, other])
+        self.assertEqual([p for p, _ in merged._checkpoints[0]], [40])
+        self.assertEqual([p for p, _ in merged._checkpoints[1]], [16])
+
+        # filter keeps the selected lanes' histories.
+        merged.filter([1])
+        self.assertEqual([p for p, _ in merged._checkpoints[0]], [16])
+
+    # ---------------- LRU prompt cache path ----------------
+
+    def _lru_roundtrip(self, config):
+        """Serving scenario: stored entry = prompt + generated tail; new
+        request repeats the prompt (regenerate). The fetch must land on a
+        checkpoint and hand back the exact suffix to re-process."""
+        mx.random.seed(0)
+        model = make_model(config)
+        chunk = 32
+        prompt = mx.random.randint(0, config["vocab_size"], (96,)).tolist()
+        tail = mx.random.randint(0, config["vocab_size"], (17,)).tolist()
+        stored_key = prompt + tail
+
+        stored_cache = make_prompt_cache(model)
+        prefill(model, stored_cache, stored_key, chunk)
+        self.assertFalse(can_trim_prompt_cache(stored_cache))
+
+        lru = LRUPromptCache()
+        lru.insert_cache("model-key", stored_key, stored_cache)
+
+        cache, rest = lru.fetch_nearest_cache("model-key", prompt)
+        self.assertIsNotNone(cache)
+        # Landing must be a checkpoint at or before len(prompt) - 1 = 95,
+        # and rest must be exactly the un-cached suffix of the prompt.
+        landed = len(prompt) - len(rest)
+        self.assertEqual(landed, 64)
+        self.assertEqual(rest, prompt[64:])
+
+        # Decode consistency: chunk-aligned landing makes the reused arm
+        # bit-comparable with a fresh prefill of the same prompt.
+        logits_reused = prefill(model, cache, rest, chunk)
+        ids_reused = greedy(model, cache, logits_reused, 5)
+
+        fresh_cache = make_prompt_cache(model)
+        logits_fresh = prefill(model, fresh_cache, prompt, chunk)
+        ids_fresh = greedy(model, fresh_cache, logits_fresh, 5)
+
+        self.assertTrue(
+            mx.allclose(
+                logits_reused[:, -1, :], logits_fresh[:, -1, :], atol=1e-5
+            ).item()
+        )
+        self.assertEqual(ids_reused, ids_fresh)
+
+    def test_lru_fetch_qwen3_next(self):
+        self._lru_roundtrip(QWEN3_NEXT_CONFIG)
+
+    def test_lru_fetch_kimi_linear(self):
+        self._lru_roundtrip(KIMI_LINEAR_CONFIG)
+
+    def test_lru_fetch_prefers_deeper_exact_prefix(self):
+        """If the longer entry's landing is shallower than an exact-prefix
+        entry, the exact-prefix entry wins."""
+        mx.random.seed(1)
+        model = make_model(QWEN3_NEXT_CONFIG)
+        chunk = 32
+        prompt = mx.random.randint(0, 1000, (96,)).tolist()
+        tail = mx.random.randint(0, 1000, (17,)).tolist()
+
+        # Longer entry recorded WITHOUT checkpoints: it can only land at 0.
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            longer_cache = make_prompt_cache(model)
+            prefill(model, longer_cache, prompt + tail, chunk)
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "8"
+
+        shorter_cache = make_prompt_cache(model)
+        prefill(model, shorter_cache, prompt[:80], chunk)
+
+        lru = LRUPromptCache()
+        lru.insert_cache("model-key", prompt + tail, longer_cache)
+        lru.insert_cache("model-key", prompt[:80], shorter_cache)
+
+        cache, rest = lru.fetch_nearest_cache("model-key", prompt)
+        self.assertIsNotNone(cache)
+        self.assertEqual(rest, prompt[80:])
+
+
+if __name__ == "__main__":
+    unittest.main()

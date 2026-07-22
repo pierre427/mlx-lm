@@ -892,8 +892,8 @@ def self_mtp_generate_step(
     sequence (teacher-forced from trunk hiddens during prefill and after each
     verify) instead of a fresh empty cache per draft cycle. The head then
     drafts with full context and real RoPE positions — the regime it was
-    trained in — which can lift acceptance dramatically (Hy3-REAP50: 33% ->
-    ~80% on code). Costs one extra (single-layer) MTP forward per cycle plus
+    trained in — which can lift acceptance dramatically (Hy3-REAP50: 36.8% ->
+    84.4% on code). Costs one extra (single-layer) MTP forward per cycle plus
     ~1 layer-equivalent of prefill; requires the MTP cache to be trimmable.
 
     ``rate_gate=True`` adds the one-shot measured break-even check from

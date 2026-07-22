@@ -1,7 +1,15 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import os
 import unittest
+
+# mlx >= 0.32 runs float32 GEMMs at TF32-class precision on M5 neural
+# accelerators unless MLX_ENABLE_TF32=0. The kernel-vs-reference checks in
+# this file (ssm, gated delta) compare exact elementwise kernels against
+# matmul-based references at 1e-4 tolerances, which TF32 (~2e-3 relative
+# error) breaks. Pin it off; the flag latches process-wide on first matmul.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -369,6 +377,171 @@ class TestModels(unittest.TestCase):
         self.assertEqual(qout.shape, (B, n_q_heads, L, D))
         self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
+    def test_quantized_sdpa_gqa_float_mask(self):
+        # Additive float masks handed to the quantized-SDPA GQA branch must have
+        # their head axis split to (n_kv_heads, n_repeats) to align with the
+        # (B, n_kv_heads, n_repeats, L, S) scores, not collide on broadcast.
+        # Regression guard for the ml-explore/mlx-lm#1558 shape bug. The n_kv=1
+        # case is the absorbed-MLA shape (pe_scores with a n_q_heads head axis).
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+
+        group_size, bits = 64, 8
+        for B, n_q, n_kv in [(1, 8, 2), (2, 8, 2), (1, 8, 1)]:
+            L, S, D = 4, 64, 64
+            mx.random.seed(0)
+            q = mx.random.normal((B, n_q, L, D))
+            k = mx.random.normal((B, n_kv, S, D))
+            v = mx.random.normal((B, n_kv, S, D))
+            for mask_shape in [(B, n_q, L, S), (B, 1, L, S)]:
+                mask = 0.1 * mx.random.normal(mask_shape)
+                q_k = mx.quantize(k, group_size=group_size, bits=bits)
+                q_v = mx.quantize(v, group_size=group_size, bits=bits)
+                out = quantized_scaled_dot_product_attention(
+                    q,
+                    q_k,
+                    q_v,
+                    scale=1.0,
+                    mask=mask,
+                    group_size=group_size,
+                    bits=bits,
+                )
+                self.assertEqual(out.shape, (B, n_q, L, D))
+
+                kd = mx.dequantize(*q_k, group_size=group_size, bits=bits)
+                vd = mx.dequantize(*q_v, group_size=group_size, bits=bits)
+                nr = n_q // n_kv
+                kd = mx.repeat(kd, nr, axis=1)
+                vd = mx.repeat(vd, nr, axis=1)
+                scores = q @ kd.swapaxes(-1, -2) + mask
+                ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+                self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+
+    def test_glm4_moe_lite_quantized_kv_decode(self):
+        # Regression: absorbed-MLA decode (L == 1) with a QuantizedKVCache
+        # passes a 4D additive pe_scores mask (head axis n_q_heads, cache has
+        # n_kv_heads == 1) into the quantized-SDPA GQA branch. The mask
+        # expansion in base.py must unflatten that head axis; a blind
+        # expand_dims mis-broadcasts the scores and crashes the output reshape
+        # (ValueError: cannot reshape ... into (B, n_heads, 1, D)).
+        from mlx_lm.models import glm4_moe_lite
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        args = glm4_moe_lite.ModelArgs(
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_group=1,
+            topk_group=1,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=32,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            first_k_dense_replace=1,
+            num_nextn_predict_layers=0,
+        )
+        model = glm4_moe_lite.Model(args)
+        mx.eval(model.parameters())
+
+        for B in (1, 2):
+            caches = [
+                QuantizedKVCache(group_size=32, bits=8)
+                for _ in range(args.num_hidden_layers)
+            ]
+            prompt = mx.random.randint(0, args.vocab_size, (B, 8))
+            logits = model(prompt, cache=caches)
+            self.assertEqual(logits.shape, (B, 8, args.vocab_size))
+            for _ in range(2):
+                step = mx.random.randint(0, args.vocab_size, (B, 1))
+                logits = model(step, cache=caches)
+                mx.eval(logits)
+                self.assertEqual(logits.shape, (B, 1, args.vocab_size))
+                self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_deepseek_absorbed_mla_quantized_kv_decode(self):
+        # Regression: absorbed-MLA decode (L == 1) with a QuantizedKVCache in
+        # deepseek_v2 / deepseek_v3 (Sarvam-105B, DeepSeek-V3, ...). The 4D
+        # additive pe_scores mask (B, n_heads, L, S) must be unflattened to
+        # (B, n_kv_heads, n_repeats, L, S) in the quantized-SDPA GQA branch; a
+        # blind expand_dims mis-broadcasts the scores and crashes the output
+        # reshape (e.g. "[reshape] Cannot reshape array of size 2097152 into
+        # shape (1,64,1,512)"). Perplexity harnesses only exercise the L > 1
+        # materialized-prefill path, so decode needs explicit coverage.
+        from mlx_lm.models import deepseek_v2, deepseek_v3
+        from mlx_lm.models.cache import QuantizedKVCache, make_prompt_cache
+
+        common = dict(
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=32,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            n_routed_experts=None,
+            first_k_dense_replace=99,
+            max_position_embeddings=2048,
+        )
+        v2_rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        }
+        configs = [
+            (
+                deepseek_v2,
+                deepseek_v2.ModelArgs(
+                    model_type="deepseek_v2",
+                    rope_scaling=v2_rope_scaling,
+                    **common,
+                ),
+            ),
+            (deepseek_v3, deepseek_v3.ModelArgs(model_type="deepseek_v3", **common)),
+        ]
+        for module, args in configs:
+            model = module.Model(args)
+            mx.eval(model.parameters())
+            for B in (1, 2):
+                prompt = mx.random.randint(0, args.vocab_size, (B, 8))
+                steps = [
+                    mx.random.randint(0, args.vocab_size, (B, 1)) for _ in range(2)
+                ]
+
+                fp_caches = make_prompt_cache(model)
+                model(prompt, cache=fp_caches)
+                q_caches = [
+                    QuantizedKVCache(group_size=32, bits=8)
+                    for _ in range(args.num_hidden_layers)
+                ]
+                logits = model(prompt, cache=q_caches)
+                self.assertEqual(logits.shape, (B, 8, args.vocab_size))
+
+                for step in steps:
+                    ref = model(step, cache=fp_caches).astype(mx.float32)
+                    out = model(step, cache=q_caches).astype(mx.float32)
+                    mx.eval(ref, out)
+                    self.assertEqual(out.shape, (B, 1, args.vocab_size))
+                    self.assertTrue(mx.all(mx.isfinite(out)).item())
+                    # kv8 decode logits should track the fp16-cache baseline
+                    rel = (mx.abs(out - ref).max() / (mx.abs(ref).max() + 1e-9)).item()
+                    self.assertLess(rel, 0.05, f"{args.model_type} B={B}: {rel=}")
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)

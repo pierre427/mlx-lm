@@ -173,11 +173,6 @@ class Glm4MoeLiteAttention(nn.Module):
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
-            if quantized and self.num_heads > 1:
-                # quantized_scaled_dot_product_attention reshapes queries to
-                # (B, n_kv_heads=1, n_heads, L, S); expand the additive
-                # pe_scores mask to match so it broadcasts correctly.
-                pe_scores = pe_scores[:, None]
             output = scaled_dot_product_attention(
                 q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
             )

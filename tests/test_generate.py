@@ -34,7 +34,7 @@ class TestGenerate(unittest.TestCase):
 
     def tearDown(self):
         # Rotating-cache tests shadow the model's class method on this shared
-        # setUpClass instance.  Always remove that override, even when an
+        # setUpClass instance. Always remove that override, even when an
         # assertion fails before the test's normal cleanup line, so one failure
         # cannot change every later test's cache topology.
         if "make_cache" in vars(self.model):
