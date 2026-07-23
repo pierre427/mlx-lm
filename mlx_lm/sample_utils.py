@@ -2,7 +2,6 @@
 
 import math
 from collections import Counter
-from functools import partial
 from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
@@ -67,7 +66,10 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
-    return sampler
+    # ``mx.random.state`` is thread-local, so a sampler compiled
+    # on the main thread (at import time) would ignore reseeding
+    # on another thread
+    return mx.compile(sampler, inputs=mx.random.state, outputs=mx.random.state)
 
 
 def make_logits_processors(
@@ -127,7 +129,6 @@ def make_logits_processors(
     return logits_processors
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_top_k(
     logprobs: mx.array,
     top_k: int,
@@ -152,7 +153,6 @@ def apply_top_k(
     return masked_logprobs
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_min_p(
     logprobs: mx.array,
     min_p: float,
@@ -202,7 +202,6 @@ def apply_min_p(
     return mx.where(tokens_to_remove, -float("inf"), logprobs)
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """
     Apply top-p (nucleus) sampling to logits.
@@ -238,7 +237,6 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     )
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
@@ -275,7 +273,6 @@ def apply_xtc(
     )
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
 

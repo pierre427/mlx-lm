@@ -350,17 +350,23 @@ def maybe_quantize_kv_cache(
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            if isinstance(c, (RotatingKVCache, BatchRotatingKVCache)):
+            symmetric = key_bits == value_bits and not kv_rotate
+            if (
+                isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
+                and not symmetric
+            ):
+                # Rotating/sliding-window quantized caches (mlx-lm#1584) support
+                # only symmetric, non-rotated quantization — their ring-layout
+                # to_quantized(group_size, bits) has no key/value-side or
+                # Hadamard-rotate extension. Symmetric --kv-bits is handled below.
                 raise ValueError(
-                    "KV cache quantization is not supported for "
-                    f"{type(c).__name__}. Sliding-window/rotating caches use a "
-                    "physical ring layout that needs a dedicated quantized "
-                    "implementation. Disable kv_bits for mixed rotating-cache "
-                    "models, or quantize only caches that are known to be "
-                    "plain KVCache instances."
+                    "Asymmetric or Hadamard-rotated KV quantization is not "
+                    f"supported for {type(c).__name__} (sliding-window/rotating "
+                    "cache). Use a symmetric --kv-bits without --kv-rotate, or "
+                    "quantize only plain KVCache instances."
                 )
             try:
-                if key_bits == value_bits and not kv_rotate:
+                if symmetric:
                     # Preserve the public duck-typed protocol used by
                     # third-party caches: to_quantized(group_size, bits).
                     # Side-specific kwargs and rotation are new extensions.
@@ -2521,9 +2527,26 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
         stream=None,
         prompt_trim_rollback_tokens: int = 0,
     ):
+        if kv_bits is not None and quantized_kv_start != 0:
+            # Validated before any state is set, so a rejected config never
+            # leaves a partially-constructed instance behind (__del__ calls
+            # close(), which needs self._old_wired_limit to already exist).
+            # Per-job caches are created once, empty (offset=0), at insertion
+            # time via _make_new_cache() — maybe_quantize_kv_cache's
+            # offset-threshold gate would never trigger later for a nonzero
+            # quantized_kv_start, since there's no per-step re-check in the
+            # batching path. Only immediate quantization is supported here.
+            raise NotImplementedError(
+                "BatchGenerator only supports quantized_kv_start=0 with kv_bits "
+                "set — delayed/threshold quantization is not implemented for "
+                "the continuous-batching path."
+            )
         self.model = model
         self.max_tokens = max_tokens
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -2533,6 +2556,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
         self.prompt_trim_rollback_tokens = max(0, int(prompt_trim_rollback_tokens))
 
         self._stream = stream or generation_stream
@@ -2568,7 +2594,10 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._old_wired_limit is not None:
+        # getattr guards against __del__ firing on an instance whose __init__
+        # raised before this attribute was ever set (e.g. an invalid kv_bits
+        # config) — a bare self._old_wired_limit would AttributeError there.
+        if getattr(self, "_old_wired_limit", None) is not None:
             mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
@@ -2669,16 +2698,27 @@ class BatchGenerator:
 
     def _make_new_cache(self):
         if self.max_kv_size is None:
-            return cache.make_prompt_cache(self.model)
+            new_cache = cache.make_prompt_cache(self.model)
+        else:
+            new_cache = [
+                (
+                    RotatingKVCache(max_size=self.max_kv_size)
+                    if isinstance(ci, KVCache)
+                    else ci
+                )
+                for ci in cache.make_prompt_cache(self.model)
+            ]
 
-        return [
-            (
-                RotatingKVCache(max_size=self.max_kv_size)
-                if isinstance(ci, KVCache)
-                else ci
+        if self.kv_bits is not None:
+            # quantized_kv_start is always 0 here (enforced in __init__), so this
+            # quantizes every layer immediately — the cache is empty (offset=0),
+            # so there's no precision to lose. All subsequent update_and_fetch
+            # calls go through the quantized cache classes from this point on;
+            # no further re-quantization is needed anywhere else.
+            maybe_quantize_kv_cache(
+                new_cache, self.quantized_kv_start, self.kv_group_size, self.kv_bits
             )
-            for ci in cache.make_prompt_cache(self.model)
-        ]
+        return new_cache
 
     def _find_uids(self, uids):
         uids = set(uids)
