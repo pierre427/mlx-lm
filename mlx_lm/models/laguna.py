@@ -25,7 +25,7 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
-    max_position_embeddings: int
+    max_position_embeddings: int = 262144
     rms_norm_eps: float = 1e-6
     qkv_bias: bool = False
     attention_bias: bool = False
@@ -39,6 +39,7 @@ class ModelArgs(BaseModelArgs):
     sliding_window: Optional[int] = None
     layer_types: Optional[List[str]] = None
     num_attention_heads_per_layer: Optional[List[int]] = None
+    mlp_layer_types: Optional[List[str]] = None
     swa_rope_parameters: Optional[Dict[str, Any]] = None
     swa_attention_sink_enabled: bool = False
     num_experts: int = 0
@@ -318,9 +319,13 @@ class DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.self_attn = Attention(args, layer_idx)
-        if (layer_idx not in args.mlp_only_layers) and (
-            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
-        ):
+        if args.mlp_layer_types is not None:
+            is_sparse = args.mlp_layer_types[layer_idx] == "sparse"
+        else:
+            is_sparse = (layer_idx not in args.mlp_only_layers) and (
+                args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+            )
+        if is_sparse:
             self.mlp = LagunaSparseMoeBlock(args)
         else:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
