@@ -567,6 +567,7 @@ def adaptive_pld_generate_step(
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[Any] = None,
     history_prompt: Optional[mx.array] = None,
+    mtp_state: Optional[Tuple[Any, Optional[mx.array]]] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Retrieval-only PLD with a one-way latch so it does not lose on no-copy
     output.
@@ -594,6 +595,16 @@ def adaptive_pld_generate_step(
     with an external ``prompt_cache``: the cached prefix's hiddens don't exist,
     and an MTP cache missing those positions drafts at wrong RoPE offsets — the
     exact failure persistence exists to fix — so that combination raises.
+
+    ``mtp_state`` lifts that restriction for snapshot restores: pass
+    ``(mtp_cache, prev_tail_hidden)`` covering EXACTLY the tokens already in
+    ``prompt_cache`` — the teacher-forced pair protocol of
+    ``self_mtp_generate_step``'s prefill, with ``prev_tail_hidden`` the trunk
+    hidden of the last cached token — and the persistent-MTP path resumes from
+    it: the uncached tail is teacher-forced on top, and the MTP tail drafts
+    with full context at real RoPE positions. The caller owns the pairing's
+    correctness: the prefix snapshot and its draft sidecar must have been
+    captured together (see prefix_snapshot_cache.attach_draft_state).
 
     ``mtp_rate_gate=True`` protects the MTP tail with a one-shot measured
     break-even check (see ``_mtp_draft_verify_loop``): after a few cycles it
@@ -645,13 +656,23 @@ def adaptive_pld_generate_step(
     persistent = (
         persistent_mtp and mtp_tail and getattr(model, "mtp", None) is not None
     )
-    if persistent and external_prompt_cache:
+    restored_seed_h = None
+    if mtp_state is not None:
+        if not (mtp_tail and getattr(model, "mtp", None) is not None):
+            raise ValueError(
+                "mtp_state requires mtp_tail=True and a model with an MTP head"
+            )
+        persistent = True
+        mtp_cache, restored_seed_h = mtp_state
+    elif persistent and external_prompt_cache:
         raise ValueError(
             "persistent_mtp is incompatible with an external prompt_cache: the "
             "cached prefix's trunk hiddens are unavailable, so the MTP cache "
-            "would draft at wrong RoPE offsets. Pass the full prompt instead."
+            "would draft at wrong RoPE offsets. Pass the full prompt instead, "
+            "or provide the matching mtp_state draft sidecar."
         )
-    mtp_cache = model.make_mtp_cache() if persistent else None
+    else:
+        mtp_cache = model.make_mtp_cache() if persistent else None
     # Committed (hidden, next_token) pairs not yet teacher-forced into
     # mtp_cache; flushed in batches so PLD cycles stay MTP-forward-free.
     mtp_p_hs: List[mx.array] = []
@@ -660,7 +681,9 @@ def adaptive_pld_generate_step(
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
-        prev_h = None  # trunk hidden of the previous chunk's last position
+        # Trunk hidden of the previous chunk's last position; a restored draft
+        # sidecar seeds it so the first tail pair lands at the right position.
+        prev_h = restored_seed_h if mtp_state is not None else None
         while y.size > 1:  # leave one token for the first verify window
             n = min(prefill_step_size, y.size - 1)
             if persistent:
