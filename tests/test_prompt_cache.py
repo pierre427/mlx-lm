@@ -889,6 +889,25 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(stepwise[0].shape, (4, 4, 8))
         self.assertEqual(stepwise[1].shape, (4, 4))
 
+    def test_batch_rotating_meta_state_rotated_roundtrip(self):
+        # bool("False") is True — a persisted un-rotated batch cache must not
+        # restore as rotated (silent ring-order corruption on restore).
+        for cls, kwargs in (
+            (BatchRotatingKVCache, {}),
+            (BatchRotatingQuantizedKVCache, {"group_size": 64, "bits": 4}),
+        ):
+            for rotated in (False, True):
+                c = cls(8, [0, 0], **kwargs)
+                c.rotated = rotated
+                restored = cls(8, [0, 0], **kwargs)
+                restored.meta_state = c.meta_state
+                self.assertIs(restored.rotated, rotated, cls.__name__)
+                # Tolerate legacy string-encoded payloads from older files.
+                legacy = list(c.meta_state)
+                legacy[3] = str(rotated)
+                restored.meta_state = tuple(legacy)
+                self.assertIs(restored.rotated, rotated, cls.__name__)
+
     def test_arrays_cache_advance_evaluates_metadata_with_state(self):
         # mlx-lm#1632/#1642: without tying metadata into the state graph,
         # every advance() leaves one dead lazy node per un-masked layer per
