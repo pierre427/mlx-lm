@@ -1222,16 +1222,6 @@ def prompt_lookup_generate_step(
     uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
     the full history, while target verification forwards only the uncached tail.
     """
-    if _ignored.get("logits_processors"):
-        # PLD has no logits-processor hook: masks would silently never be
-        # applied (grammar/constrained output would be unconstrained). The
-        # servers route constrained requests to generate_step; stream_generate's
-        # pld_safe gate does the same. Fail loud for direct callers.
-        raise ValueError(
-            "prompt_lookup_generate_step does not support logits_processors; "
-            "use generate_step (stream_generate routes constrained requests "
-            "there automatically)"
-        )
     from .prompt_lookup import (
         HybridStats,
         NgramProposer,
