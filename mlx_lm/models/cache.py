@@ -1668,7 +1668,14 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        # mx.contiguous: a plain slice is a view that pins the whole batched
+        # parent array, and extracted caches get re-inserted into later
+        # batches, so batch N would transitively retain batch N-1's state
+        # (upstream mlx-lm#1701).
+        cache.cache = [
+            None if c is None else mx.contiguous(c[idx : idx + 1])
+            for c in self.cache
+        ]
         if idx < len(self._checkpoints):
             cache._checkpoints = [list(self._checkpoints[idx])]
         return cache
@@ -1685,6 +1692,20 @@ class ArraysCache(_BaseCache):
             self.lengths -= N
         if self.left_padding is not None:
             self.left_padding -= N
+        # Tie the metadata into the state graph: only the layer whose
+        # make_mask runs evaluates these decrements, so every other layer
+        # otherwise accumulates one dead lazy node per token — each pinning
+        # a live Metal buffer object, and Metal counts objects (499k/process)
+        # not bytes, which crashes long completions on many-SSM-layer models
+        # (upstream mlx-lm#1632/#1642).
+        metadata = tuple(
+            v for v in (self.lengths, self.left_padding) if v is not None
+        )
+        if metadata:
+            for index, value in enumerate(self.cache):
+                if value is not None:
+                    self.cache[index] = mx.depends(value, metadata)
+                    break
 
     def make_mask(self, N: int):
         if self.left_padding is not None:
