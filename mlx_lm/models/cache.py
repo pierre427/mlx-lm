@@ -2639,7 +2639,9 @@ class BatchRotatingKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.max_size, self._offset, self._idx, self.rotated)))
+        return tuple(
+            map(str, (self.max_size, self._offset, self._idx, int(self.rotated)))
+        )
 
     @meta_state.setter
     def meta_state(self, v):
@@ -2647,7 +2649,9 @@ class BatchRotatingKVCache(_BaseCache):
             int,
             v[:3],
         )
-        self.rotated = bool(v[3])
+        # bool("False") is True — parse the int encoding and stay tolerant of
+        # legacy "True"/"False" strings from older persisted caches.
+        self.rotated = str(v[3]) in ("True", "true", "1")
 
     def is_trimmable(self):
         return self._offset < self.max_size
@@ -3098,7 +3102,7 @@ class BatchRotatingQuantizedKVCache(_BaseCache):
                     self.max_size,
                     self._offset,
                     self._idx,
-                    self.rotated,
+                    int(self.rotated),
                     self.group_size,
                     self.bits,
                 ),
@@ -3108,7 +3112,9 @@ class BatchRotatingQuantizedKVCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.max_size, self._offset, self._idx = map(int, v[:3])
-        self.rotated = bool(v[3])
+        # bool("False") is True — parse the int encoding and stay tolerant of
+        # legacy "True"/"False" strings from older persisted caches.
+        self.rotated = str(v[3]) in ("True", "true", "1")
         self.group_size, self.bits = map(int, v[4:6])
 
     def is_trimmable(self):

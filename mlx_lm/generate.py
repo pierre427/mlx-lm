@@ -1582,6 +1582,9 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        # max_tokens=0 (or a generator that yields nothing) must not reach
+        # the final response, which reads the loop variables.
+        token = None
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1608,6 +1611,8 @@ def stream_generate(
             )
 
         detokenizer.finalize()
+        if token is None:
+            return
         yield GenerationResponse(
             text=detokenizer.last_segment,
             token=token,
@@ -2674,6 +2679,29 @@ class BatchGenerator:
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
+            elif self.kv_bits is not None:
+                # Externally supplied (snapshot-restored / transplanted)
+                # caches must honor the generator's kv-quant config: the lane
+                # would otherwise silently run unquantized and the mixed
+                # fp/quantized cohort breaks the class-specific merges.
+                # Batched kv-quant is rotating-only in-tree (plain
+                # QuantizedKVCache has no merge), so fail loudly here instead
+                # of deferring the crash to _merge_caches.
+                maybe_quantize_kv_cache(
+                    caches[i],
+                    self.quantized_kv_start,
+                    self.kv_group_size,
+                    self.kv_bits,
+                )
+                for c in caches[i]:
+                    if not hasattr(c, "merge"):
+                        raise ValueError(
+                            f"kv_bits is set but a supplied cache quantizes "
+                            f"to {type(c).__name__}, which does not support "
+                            "batching. Batched kv-quant currently requires "
+                            "rotating caches (set max_kv_size) or an "
+                            "unquantized generator."
+                        )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
