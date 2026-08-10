@@ -53,6 +53,7 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_sampler
+from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
 from .prompt_lookup import plan_proposal_around_verify_cliff
@@ -560,6 +561,8 @@ def adaptive_pld_generate_step(
     num_draft: int = 1,
     persistent_mtp: bool = False,
     mtp_rate_gate: bool = False,
+    batch_size: int = 1,
+    depth_table: Optional[Any] = None,
     prefill_step_size: int = 512,
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[Any] = None,
@@ -599,6 +602,17 @@ def adaptive_pld_generate_step(
     are workload- and context-dependent, so a config that wins on code
     generation can lose on prose or at long context.
 
+    ``batch_size`` is a concurrency hint from the caller (a multi-lane server
+    running several single-stream generators): the MTP tail depth becomes
+    ``spec_policy.draft_depth_for(batch_size, num_draft, depth_table)`` — the
+    per-batch-size table caps how DEEP the tail drafts, then the hard M5
+    verify-width cap (drafts + bonus <= 8) applies. Defaults (``batch_size=1``,
+    no table) leave ``num_draft`` unchanged below the cap. Composes with the
+    rate gate: the gate decides IF the tail keeps speculating, the policy
+    decides HOW DEEP. ``depth_table`` accepts a ``spec_policy.DepthTable`` or
+    a ``"1:6,2-4:3,5+:2"``-style spec string; the
+    ``MLX_LM_SPEC_DEPTH_TABLE`` env var overrides the default table.
+
     Greedy only, draft-free; one shared prompt cache. ``prompt_cache`` may hold
     a prefilled prefix; when it is provided, ``prompt`` is the uncached tail and
     ``history_prompt`` must be the full prompt used to seed PLD retrieval history.
@@ -613,6 +627,12 @@ def adaptive_pld_generate_step(
     """
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
+
+    # Per-batch-size draft-depth policy + hard M5 verify-width cap. Resolved
+    # once at entry (concurrency is a per-request hint, not a per-cycle
+    # signal); the per-cycle budget clamp in _mtp_draft_verify_loop still
+    # applies on top.
+    num_draft = draft_depth_for(batch_size, num_draft, depth_table)
 
     if max_tokens <= 0:
         # Zero-token budget: yield nothing and do no prefill or sampling work
@@ -863,6 +883,8 @@ def self_mtp_generate_step(
     sampling_temp: float = 0.0,
     persistent_mtp: bool = False,
     rate_gate: bool = False,
+    batch_size: int = 1,
+    depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
@@ -893,12 +915,22 @@ def self_mtp_generate_step(
     than an inline plain-decode probe; otherwise fall back to plain for the
     rest of the generation.
 
+    ``batch_size``/``depth_table`` apply the per-batch-size draft-depth policy
+    (``spec_policy.draft_depth_for``): the table caps how deep the head drafts
+    when the caller runs multiple lanes, then the hard M5 verify-width cap
+    (drafts + bonus <= 8) applies. Defaults leave ``num_draft`` unchanged
+    below the cap; the gate decides IF, the policy decides HOW DEEP.
+
     Yields ``(token, logprobs, from_draft)``.
     """
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
+
+    # Per-batch-size draft-depth policy + hard M5 verify-width cap (resolved
+    # once at entry; the per-cycle budget clamp still applies on top).
+    num_draft = draft_depth_for(batch_size, num_draft, depth_table)
 
     if max_tokens <= 0:
         # Zero-token budget: yield nothing and do no prefill or sampling work.
