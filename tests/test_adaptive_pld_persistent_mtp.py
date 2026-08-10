@@ -176,3 +176,81 @@ class TestMTPRateGate(unittest.TestCase):
         ]
         self.assertEqual(len(toks), 96)
         self.assertTrue(stats.rate_gate_probed)
+
+
+class TestDepthPolicyWiring(unittest.TestCase):
+    """Per-batch-size draft-depth policy wired into the MTP paths.
+
+    The policy resolves the effective num_draft ONCE at generator entry, so a
+    policy-resolved depth must be decision-for-decision identical to passing
+    that depth explicitly (deterministic greedy on the same weights)."""
+
+    def setUp(self):
+        import mlx_lm.spec_policy as spol
+
+        mx.random.seed(0)
+        self.model = TextModel(tiny_args())
+        mx.eval(self.model.parameters())
+        self.prompt = mx.random.randint(0, 64, (24,)).astype(mx.uint32)
+        # Isolate the one-time cap-warning latch from test order.
+        self._latch = spol._cap_warning_emitted
+        spol._cap_warning_emitted = False
+        self.addCleanup(self._restore_latch)
+
+    def _restore_latch(self):
+        import mlx_lm.spec_policy as spol
+
+        spol._cap_warning_emitted = self._latch
+
+    def _tail(self, **kwargs):
+        return _run(
+            self.model,
+            self.prompt,
+            max_tokens=64,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            **kwargs
+        )
+
+    def test_over_cap_depth_matches_explicit_capped_run(self):
+        import warnings
+
+        base, _ = self._tail(num_draft=7)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            capped, stats = self._tail(num_draft=10)
+        self.assertEqual(capped, base)
+        self.assertLessEqual(stats.mean_draft_span_proposed, 7.0)
+
+    def test_batch_size_band_matches_explicit_shallow_run(self):
+        # bs5+ band of the default table caps the tail at 2 drafts.
+        base, _ = self._tail(num_draft=2)
+        banded, stats = self._tail(num_draft=6, batch_size=5)
+        self.assertEqual(banded, base)
+        self.assertLessEqual(stats.mean_draft_span_proposed, 2.0)
+
+    def test_depth_table_param_overrides_default(self):
+        base, _ = self._tail(num_draft=1)
+        tabled, _ = self._tail(num_draft=6, depth_table="1:1")
+        self.assertEqual(tabled, base)
+
+    def test_single_stream_no_table_is_unchanged(self):
+        # batch_size=1 with no table must be a no-op on the depth decision.
+        base, bstats = self._tail(num_draft=2)
+        hinted, hstats = self._tail(num_draft=2, batch_size=1)
+        self.assertEqual(hinted, base)
+        self.assertEqual(hstats.draft_proposed, bstats.draft_proposed)
+
+    def test_self_mtp_policy_wiring(self):
+        from mlx_lm.hybrid_speculative import self_mtp_generate_step
+
+        def run(**kwargs):
+            return [
+                int(t)
+                for t, _lp, _fd in self_mtp_generate_step(
+                    self.prompt, self.model, max_tokens=48, **kwargs
+                )
+            ]
+
+        self.assertEqual(run(num_draft=6, batch_size=5), run(num_draft=2))
