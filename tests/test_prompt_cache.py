@@ -889,6 +889,57 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(stepwise[0].shape, (4, 4, 8))
         self.assertEqual(stepwise[1].shape, (4, 4))
 
+    def test_arrays_cache_advance_evaluates_metadata_with_state(self):
+        # mlx-lm#1632/#1642: without tying metadata into the state graph,
+        # every advance() leaves one dead lazy node per un-masked layer per
+        # token, pinning a Metal buffer object each (499k/process limit).
+        cache = ArraysCache(2, left_padding=[2])
+        cache.prepare(lengths=[3])
+        cache[0] = mx.array([0])
+        cache[1] = mx.array([0])
+
+        for _ in range(256):
+            cache[0] = cache[0] + 1
+            cache.advance(1)
+            mx.eval(cache[0])
+
+        for name, metadata in (
+            ("lengths", cache.lengths),
+            ("left-padding", cache.left_padding),
+        ):
+            dot_path = os.path.join(self.test_dir, f"arrays-cache-{name}.dot")
+            mx.export_to_dot(dot_path, metadata)
+            with open(dot_path, encoding="utf-8") as graph:
+                self.assertLessEqual(graph.read().count("->"), 8)
+        self.assertEqual(cache[0].item(), 256)
+        self.assertEqual(cache.lengths.item(), 3 - 256)
+        self.assertEqual(cache.left_padding.item(), 2 - 256)
+
+    def test_arrays_cache_extract_copies(self):
+        # mlx-lm#1701: a view slice pins the whole batched parent buffer;
+        # extract must copy so re-inserted lanes don't transitively retain
+        # every previous batch's recurrent state.
+        cache = ArraysCache(1)
+        big = mx.zeros((8, 4, 512, 512))  # 8 lanes x 4 MB
+        mx.eval(big)
+        cache[0] = big
+        child = cache.extract(0)
+        mx.eval(child.cache[0])
+        self.assertEqual(child.cache[0].shape, (1, 4, 512, 512))
+        before = mx.get_active_memory()
+        del cache, big
+        import gc
+
+        gc.collect()
+        after = mx.get_active_memory()
+        # The 32 MB parent must actually free; the child holds ~4 MB.
+        self.assertLess(after, before - 16 * 1024 * 1024)
+        # None entries (post-filter) must pass through extract untouched.
+        holey = ArraysCache(2)
+        holey[0] = mx.zeros((2, 3))
+        lane = holey.extract(1)
+        self.assertIsNone(lane.cache[1])
+
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
         kv = mx.zeros((1, 1, 32, 128))
