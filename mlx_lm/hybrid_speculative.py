@@ -604,7 +604,10 @@ def adaptive_pld_generate_step(
     it: the uncached tail is teacher-forced on top, and the MTP tail drafts
     with full context at real RoPE positions. The caller owns the pairing's
     correctness: the prefix snapshot and its draft sidecar must have been
-    captured together (see prefix_snapshot_cache.attach_draft_state).
+    captured together (see prefix_snapshot_cache.attach_draft_state). The
+    structural half is validated at entry — a non-empty cached prefix with a
+    missing ``prev_tail_hidden`` or an MTP-cache offset other than
+    ``prefix_len - 1`` raises before either cache is mutated.
 
     ``mtp_rate_gate=True`` protects the MTP tail with a one-shot measured
     break-even check (see ``_mtp_draft_verify_loop``): after a few cycles it
@@ -639,16 +642,20 @@ def adaptive_pld_generate_step(
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
 
-    # Per-batch-size draft-depth policy + hard M5 verify-width cap. Resolved
-    # once at entry (concurrency is a per-request hint, not a per-cycle
-    # signal); the per-cycle budget clamp in _mtp_draft_verify_loop still
-    # applies on top.
-    num_draft = draft_depth_for(batch_size, num_draft, depth_table)
-
     if max_tokens <= 0:
         # Zero-token budget: yield nothing and do no prefill or sampling work
         # (an external prompt_cache is left untouched).
         return
+
+    # Per-batch-size draft-depth policy + hard M5 verify-width cap. Resolved
+    # once at entry (concurrency is a per-request hint, not a per-cycle
+    # signal); the per-cycle budget clamp in _mtp_draft_verify_loop still
+    # applies on top. Resolving reads MLX_LM_SPEC_DEPTH_TABLE, which raises
+    # loudly on malformed values — only pay that when an MTP tail can
+    # actually run, so pure retrieval-PLD requests never abort on a spec
+    # knob they don't use.
+    if mtp_tail:
+        num_draft = draft_depth_for(batch_size, num_draft, depth_table)
 
     external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
@@ -664,6 +671,40 @@ def adaptive_pld_generate_step(
             )
         persistent = True
         mtp_cache, restored_seed_h = mtp_state
+        # The sidecar must cover EXACTLY the cached prefix: prefix_len - 1
+        # teacher-forced pairs (h_i, t_{i+1}) plus the trunk hidden of the
+        # last cached token. Accepting a missing tail hidden would skip the
+        # boundary pair (last cached hidden -> first uncached token) in the
+        # prefill below, leaving the MTP cache one position behind (wrong
+        # RoPE positions) and silently collapsing restored-MTP acceptance —
+        # so validate BEFORE either cache is mutated. prefix_len comes from
+        # the attention layers' offsets (recurrent ArraysCache tracks none).
+        prefix_len = max((getattr(c, "offset", 0) for c in cache), default=0)
+        mtp_offset = max((getattr(c, "offset", 0) for c in mtp_cache), default=0)
+        if prefix_len > 0:
+            if restored_seed_h is None:
+                raise ValueError(
+                    "mtp_state with a non-empty prompt_cache prefix requires "
+                    "prev_tail_hidden (the trunk hidden of the last cached "
+                    "token); without it the boundary pair is skipped and the "
+                    "MTP cache drafts one position behind."
+                )
+            if mtp_offset != prefix_len - 1:
+                raise ValueError(
+                    f"mtp_state offset mismatch: MTP cache covers "
+                    f"{mtp_offset} pairs but the prompt_cache prefix has "
+                    f"{prefix_len} tokens (expected {prefix_len - 1} pairs). "
+                    "The prefix snapshot and its draft sidecar were not "
+                    "captured together."
+                )
+        elif restored_seed_h is not None or mtp_offset != 0:
+            raise ValueError(
+                "mtp_state carries a restored draft context "
+                f"({mtp_offset} pairs, prev_tail_hidden "
+                f"{'set' if restored_seed_h is not None else 'unset'}) but the "
+                "prompt_cache prefix is empty; the sidecar must cover exactly "
+                "the cached tokens."
+            )
     elif persistent and external_prompt_cache:
         raise ValueError(
             "persistent_mtp is incompatible with an external prompt_cache: the "
@@ -1066,9 +1107,12 @@ def _residual_sample(
 
 
 def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
-    target_p = mx.exp(target_logprobs[token])
-    draft_p = mx.exp(draft_logprobs[token])
-    ratio = mx.minimum(1.0, target_p / mx.maximum(draft_p, 1e-30))
+    # min(1, p/q) computed in log space: exp(min(log p - log q, 0)). A
+    # linear-space q floor (e.g. max(q, 1e-30)) would bias acceptance for
+    # representable sub-floor q — q=1e-35, p=1e-34 must accept with
+    # probability 1, not p/floor.
+    log_ratio = mx.minimum(target_logprobs[token] - draft_logprobs[token], 0.0)
+    ratio = mx.exp(log_ratio)
     u = mx.random.uniform(shape=())
     mx.eval(ratio, u)
     return float(u.item()) <= float(ratio.item())

@@ -82,6 +82,27 @@ class TestAcceptRuleKernel(unittest.TestCase):
         self.assertLess(exact_hits / n, 0.5)
         self.assertGreater(exact_hits / n, 0.2)
 
+    def test_subfloor_probabilities_accept_correctly(self):
+        # min(1, p/q) must be computed in log space: q=1e-35 and p=1e-34 are
+        # representable float32 logprobs, and p/q = 10 means CERTAIN
+        # acceptance. A linear-space clamp max(q, 1e-30) would instead give
+        # p/floor = 1e-4 and reject nearly always, biasing the committed
+        # marginal.
+        tlp = mx.log(mx.array([0.4, 0.6, 1e-34, 1e-35], dtype=mx.float32))
+        dlp = mx.log(mx.array([0.5, 0.5, 1e-35, 1e-34], dtype=mx.float32))
+        for i in range(50):
+            mx.random.seed(80_000 + i)
+            self.assertTrue(_accept_sampled_draft(tlp, dlp, 2))
+        # The sub-floor ratio must also be honored below 1: token 3 has
+        # p/q = 0.1 (clamped math would give 1e-5, i.e. ~zero accepts).
+        n = 2000
+        accepts = 0
+        for i in range(n):
+            mx.random.seed(90_000 + i)
+            accepts += _accept_sampled_draft(tlp, dlp, 3)
+        self.assertGreater(accepts / n, 0.05)
+        self.assertLess(accepts / n, 0.2)
+
     def test_residual_rule_preserves_target_distribution(self):
         # Draft from q, accept w.p. min(1, p/q), resample rejects from
         # relu(p - q): the committed token must be distributed as p, and

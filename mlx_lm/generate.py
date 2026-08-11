@@ -349,7 +349,22 @@ def maybe_quantize_kv_cache(
     if key_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        if isinstance(c, CacheList):
+            # Composite per-layer caches (hybrid attention+recurrent layers)
+            # hold their KV caches one level down; recurse so nested KV
+            # leaves honor kv_bits instead of silently staying fp.
+            leaves = list(c.caches)
+            maybe_quantize_kv_cache(
+                leaves,
+                quantized_kv_start,
+                kv_group_size,
+                kv_bits,
+                kv_key_bits=kv_key_bits,
+                kv_value_bits=kv_value_bits,
+                kv_rotate=kv_rotate,
+            )
+            c.caches = tuple(leaves)
+        elif hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             symmetric = key_bits == value_bits and not kv_rotate
             if (
                 isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
@@ -2704,14 +2719,18 @@ class BatchGenerator:
                     self.kv_bits,
                 )
                 for c in caches[i]:
-                    if not hasattr(c, "merge"):
-                        raise ValueError(
-                            f"kv_bits is set but a supplied cache quantizes "
-                            f"to {type(c).__name__}, which does not support "
-                            "batching. Batched kv-quant currently requires "
-                            "rotating caches (set max_kv_size) or an "
-                            "unquantized generator."
-                        )
+                    # CacheList.merge merges leaf-wise, so every nested leaf
+                    # must be mergeable too — check leaves, not the wrapper.
+                    leaves = c.caches if isinstance(c, CacheList) else (c,)
+                    for leaf in leaves:
+                        if not hasattr(leaf, "merge"):
+                            raise ValueError(
+                                f"kv_bits is set but a supplied cache "
+                                f"quantizes to {type(leaf).__name__}, which "
+                                "does not support batching. Batched kv-quant "
+                                "currently requires rotating caches (set "
+                                "max_kv_size) or an unquantized generator."
+                            )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,

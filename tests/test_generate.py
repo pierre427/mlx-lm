@@ -283,6 +283,64 @@ class TestGenerate(unittest.TestCase):
         finally:
             gen.close()
 
+    def test_insert_supplied_cachelist_honors_kv_bits(self):
+        # Composite CacheList layer caches (hybrid attention+recurrent
+        # layers) hold their KV caches one level down. At insert with
+        # kv_bits set, nested KV leaves must be quantized (the wrapper has
+        # merge but no to_quantized, so without recursion they silently
+        # stay fp), and a nested leaf that quantizes to a non-mergeable
+        # class must fail loudly at insert instead of crashing later in
+        # CacheList.merge.
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            CacheList,
+            RotatingQuantizedKVCache,
+        )
+
+        prompt = self.tokenizer.encode("hello there")
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            supplied = [
+                CacheList(RotatingKVCache(max_size=64), ArraysCache(size=1))
+                for _ in range(len(self.model.layers))
+            ]
+            gen.insert([prompt], caches=[supplied])
+            queued_cache = gen._unprocessed_sequences[0][3]
+            for c in queued_cache:
+                self.assertIsInstance(c, CacheList)
+                self.assertIsInstance(c.caches[0], RotatingQuantizedKVCache)
+                self.assertIsInstance(c.caches[1], ArraysCache)
+        finally:
+            gen.close()
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            # Nested plain KVCache quantizes to QuantizedKVCache, which has
+            # no merge: the leaf-level guard must reject it at insert.
+            supplied = [
+                CacheList(KVCache(), ArraysCache(size=1))
+                for _ in range(len(self.model.layers))
+            ]
+            with self.assertRaises(ValueError):
+                gen.insert([prompt], caches=[supplied])
+        finally:
+            gen.close()
+
     def test_batch_matches_single(self):
 
         prompts = [
