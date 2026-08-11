@@ -45,6 +45,7 @@ each lane's generator receives it as a hint at entry.
 """
 
 import os
+import threading
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
@@ -58,7 +59,10 @@ MAX_DRAFT_TOKENS = MAX_VERIFY_WIDTH - 1  # the bonus token takes one slot
 DEPTH_TABLE_ENV = "MLX_LM_SPEC_DEPTH_TABLE"
 
 # One-time warning latch for user-configured depths colliding with the cap.
+# Generators run on caller threads (multi-lane servers), so the test-and-set
+# is guarded by a lock to keep the warning truly one-time.
 _cap_warning_emitted = False
+_cap_warning_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -220,8 +224,10 @@ def cap_draft_tokens(num_draft: int) -> int:
     global _cap_warning_emitted
     num_draft = max(0, int(num_draft))
     if num_draft > MAX_DRAFT_TOKENS:
-        if not _cap_warning_emitted:
+        with _cap_warning_lock:
+            emit = not _cap_warning_emitted
             _cap_warning_emitted = True
+        if emit:
             warnings.warn(
                 f"speculative draft depth {num_draft} exceeds the M5 verify-width "
                 f"cap ({MAX_DRAFT_TOKENS} drafts + 1 bonus = {MAX_VERIFY_WIDTH} "
