@@ -53,6 +53,7 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_sampler
+from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
 from .prompt_lookup import plan_proposal_around_verify_cliff
@@ -566,10 +567,13 @@ def adaptive_pld_generate_step(
     persistent_mtp: bool = False,
     mtp_rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
+    batch_size: int = 1,
+    depth_table: Optional[Any] = None,
     prefill_step_size: int = 512,
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[Any] = None,
     history_prompt: Optional[mx.array] = None,
+    mtp_state: Optional[Tuple[Any, Optional[mx.array]]] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Retrieval-only PLD with a one-way latch so it does not lose on no-copy
     output.
@@ -598,12 +602,36 @@ def adaptive_pld_generate_step(
     and an MTP cache missing those positions drafts at wrong RoPE offsets — the
     exact failure persistence exists to fix — so that combination raises.
 
+    ``mtp_state`` lifts that restriction for snapshot restores: pass
+    ``(mtp_cache, prev_tail_hidden)`` covering EXACTLY the tokens already in
+    ``prompt_cache`` — the teacher-forced pair protocol of
+    ``self_mtp_generate_step``'s prefill, with ``prev_tail_hidden`` the trunk
+    hidden of the last cached token — and the persistent-MTP path resumes from
+    it: the uncached tail is teacher-forced on top, and the MTP tail drafts
+    with full context at real RoPE positions. The caller owns the pairing's
+    correctness: the prefix snapshot and its draft sidecar must have been
+    captured together (see prefix_snapshot_cache.attach_draft_state). The
+    structural half is validated at entry — a non-empty cached prefix with a
+    missing ``prev_tail_hidden`` or an MTP-cache offset other than
+    ``prefix_len - 1`` raises before either cache is mutated.
+
     ``mtp_rate_gate=True`` protects the MTP tail with a one-shot measured
     break-even check (see ``_mtp_draft_verify_loop``): after a few cycles it
     probes plain decode inline and de-latches the tail permanently if
     speculating isn't actually faster — the tail's acceptance and verify cost
     are workload- and context-dependent, so a config that wins on code
     generation can lose on prose or at long context.
+
+    ``batch_size`` is a concurrency hint from the caller (a multi-lane server
+    running several single-stream generators): the MTP tail depth becomes
+    ``spec_policy.draft_depth_for(batch_size, num_draft, depth_table)`` — the
+    per-batch-size table caps how DEEP the tail drafts, then the hard M5
+    verify-width cap (drafts + bonus <= 8) applies. Defaults (``batch_size=1``,
+    no table) leave ``num_draft`` unchanged below the cap. Composes with the
+    rate gate: the gate decides IF the tail keeps speculating, the policy
+    decides HOW DEEP. ``depth_table`` accepts a ``spec_policy.DepthTable`` or
+    a ``"1:6,2-4:3,5+:2"``-style spec string; the
+    ``MLX_LM_SPEC_DEPTH_TABLE`` env var overrides the default table.
 
     Greedy only, draft-free; one shared prompt cache. ``prompt_cache`` may hold
     a prefilled prefix; when it is provided, ``prompt`` is the uncached tail and
@@ -625,19 +653,73 @@ def adaptive_pld_generate_step(
         # (an external prompt_cache is left untouched).
         return
 
+    # Per-batch-size draft-depth policy + hard M5 verify-width cap. Resolved
+    # once at entry (concurrency is a per-request hint, not a per-cycle
+    # signal); the per-cycle budget clamp in _mtp_draft_verify_loop still
+    # applies on top. Resolving reads MLX_LM_SPEC_DEPTH_TABLE, which raises
+    # loudly on malformed values — only pay that when an MTP tail can
+    # actually run, so pure retrieval-PLD requests never abort on a spec
+    # knob they don't use.
+    if mtp_tail:
+        num_draft = draft_depth_for(batch_size, num_draft, depth_table)
+
     external_prompt_cache = prompt_cache is not None
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
 
     persistent = (
         persistent_mtp and mtp_tail and getattr(model, "mtp", None) is not None
     )
-    if persistent and external_prompt_cache:
+    restored_seed_h = None
+    if mtp_state is not None:
+        if not (mtp_tail and getattr(model, "mtp", None) is not None):
+            raise ValueError(
+                "mtp_state requires mtp_tail=True and a model with an MTP head"
+            )
+        persistent = True
+        mtp_cache, restored_seed_h = mtp_state
+        # The sidecar must cover EXACTLY the cached prefix: prefix_len - 1
+        # teacher-forced pairs (h_i, t_{i+1}) plus the trunk hidden of the
+        # last cached token. Accepting a missing tail hidden would skip the
+        # boundary pair (last cached hidden -> first uncached token) in the
+        # prefill below, leaving the MTP cache one position behind (wrong
+        # RoPE positions) and silently collapsing restored-MTP acceptance —
+        # so validate BEFORE either cache is mutated. prefix_len comes from
+        # the attention layers' offsets (recurrent ArraysCache tracks none).
+        prefix_len = max((getattr(c, "offset", 0) for c in cache), default=0)
+        mtp_offset = max((getattr(c, "offset", 0) for c in mtp_cache), default=0)
+        if prefix_len > 0:
+            if restored_seed_h is None:
+                raise ValueError(
+                    "mtp_state with a non-empty prompt_cache prefix requires "
+                    "prev_tail_hidden (the trunk hidden of the last cached "
+                    "token); without it the boundary pair is skipped and the "
+                    "MTP cache drafts one position behind."
+                )
+            if mtp_offset != prefix_len - 1:
+                raise ValueError(
+                    f"mtp_state offset mismatch: MTP cache covers "
+                    f"{mtp_offset} pairs but the prompt_cache prefix has "
+                    f"{prefix_len} tokens (expected {prefix_len - 1} pairs). "
+                    "The prefix snapshot and its draft sidecar were not "
+                    "captured together."
+                )
+        elif restored_seed_h is not None or mtp_offset != 0:
+            raise ValueError(
+                "mtp_state carries a restored draft context "
+                f"({mtp_offset} pairs, prev_tail_hidden "
+                f"{'set' if restored_seed_h is not None else 'unset'}) but the "
+                "prompt_cache prefix is empty; the sidecar must cover exactly "
+                "the cached tokens."
+            )
+    elif persistent and external_prompt_cache:
         raise ValueError(
             "persistent_mtp is incompatible with an external prompt_cache: the "
             "cached prefix's trunk hiddens are unavailable, so the MTP cache "
-            "would draft at wrong RoPE offsets. Pass the full prompt instead."
+            "would draft at wrong RoPE offsets. Pass the full prompt instead, "
+            "or provide the matching mtp_state draft sidecar."
         )
-    mtp_cache = model.make_mtp_cache() if persistent else None
+    else:
+        mtp_cache = model.make_mtp_cache() if persistent else None
     # Committed (hidden, next_token) pairs not yet teacher-forced into
     # mtp_cache; flushed in batches so PLD cycles stay MTP-forward-free.
     mtp_p_hs: List[mx.array] = []
@@ -646,7 +728,9 @@ def adaptive_pld_generate_step(
 
     y = prompt.astype(mx.uint32)
     with mx.stream(generation_stream):
-        prev_h = None  # trunk hidden of the previous chunk's last position
+        # Trunk hidden of the previous chunk's last position; a restored draft
+        # sidecar seeds it so the first tail pair lands at the right position.
+        prev_h = restored_seed_h if mtp_state is not None else None
         while y.size > 1:  # leave one token for the first verify window
             n = min(prefill_step_size, y.size - 1)
             if persistent:
@@ -868,9 +952,12 @@ def self_mtp_generate_step(
     max_tokens: int = 256,
     prefill_step_size: int = 512,
     sampling_temp: float = 0.0,
+    accept_rule: str = "residual",
     persistent_mtp: bool = False,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
+    batch_size: int = 1,
+    depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
@@ -888,6 +975,18 @@ def self_mtp_generate_step(
     distributions. This is exact for temperature-only sampling; top-p/top-k need
     a shared distribution transform before they can be made exact here.
 
+    ``accept_rule`` selects the temp>0 verification rule; greedy (temp=0)
+    decisions are rule-independent and bit-identical. ``"residual"`` (the
+    default — the incumbent behavior) is Leviathan/SpecDec rejection
+    sampling: accept draft x ~ q with probability min(1, p(x)/q(x)), resample
+    rejects from normalized relu(p - q). ``"block"`` is block verification
+    (arXiv 2403.10444): accepts draft PREFIXES by cumulative joint
+    likelihood ratio — provably accepts at least as many tokens as per-token
+    rejection sampling with the SAME output distribution. ``"exact"`` is the
+    conservative sampled-token-match rule (upstream
+    ``speculative_generate_step`` semantics: accept while the target's own
+    sample equals the draft's), kept as an A/B baseline.
+
     ``persistent_mtp=True`` keeps ONE MTP KV cache in sync with the committed
     sequence (teacher-forced from trunk hiddens during prefill and after each
     verify) instead of a fresh empty cache per draft cycle. The head then
@@ -901,12 +1000,26 @@ def self_mtp_generate_step(
     than an inline plain-decode probe; otherwise fall back to plain for the
     rest of the generation.
 
+    ``batch_size``/``depth_table`` apply the per-batch-size draft-depth policy
+    (``spec_policy.draft_depth_for``): the table caps how deep the head drafts
+    when the caller runs multiple lanes, then the hard M5 verify-width cap
+    (drafts + bonus <= 8) applies. Defaults leave ``num_draft`` unchanged
+    below the cap; the gate decides IF, the policy decides HOW DEEP.
+
     Yields ``(token, logprobs, from_draft)``.
     """
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
+    if accept_rule not in ("exact", "residual", "block"):
+        raise ValueError(
+            f"accept_rule must be 'exact', 'residual', or 'block'; got {accept_rule!r}"
+        )
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
+
+    # Per-batch-size draft-depth policy + hard M5 verify-width cap (resolved
+    # once at entry; the per-cycle budget clamp still applies on top).
+    num_draft = draft_depth_for(batch_size, num_draft, depth_table)
 
     if max_tokens <= 0:
         # Zero-token budget: yield nothing and do no prefill or sampling work.
@@ -966,6 +1079,7 @@ def self_mtp_generate_step(
             num_draft,
             stats,
             sampling_temp,
+            accept_rule=accept_rule,
             mtp_cache=mtp_cache,
             rate_gate=rate_gate,
             speculation_router=speculation_router,
@@ -987,8 +1101,12 @@ def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0) -> int:
     return int(mx.argmax(logprobs).item())
 
 
-def _residual_sample(target_logprobs, draft_logprobs, sampling_temp: float) -> int:
-    residual = mx.maximum(mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
+def _residual_sample(
+    target_logprobs, draft_logprobs, sampling_temp: float, scale: float = 1.0
+) -> int:
+    # ``scale`` is the block-verification cumulative ratio p_tau; 1.0 (the
+    # per-token rule) multiplies bit-exactly, so the default is unchanged.
+    residual = mx.maximum(scale * mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
     total = mx.sum(residual)
     mx.eval(total)
     if float(total.item()) <= 0.0:
@@ -998,12 +1116,74 @@ def _residual_sample(target_logprobs, draft_logprobs, sampling_temp: float) -> i
 
 
 def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
-    target_p = mx.exp(target_logprobs[token])
-    draft_p = mx.exp(draft_logprobs[token])
-    ratio = mx.minimum(1.0, target_p / mx.maximum(draft_p, 1e-30))
+    # min(1, p/q) computed in log space: exp(min(log p - log q, 0)). A
+    # linear-space q floor (e.g. max(q, 1e-30)) would bias acceptance for
+    # representable sub-floor q — q=1e-35, p=1e-34 must accept with
+    # probability 1, not p/floor.
+    log_ratio = mx.minimum(target_logprobs[token] - draft_logprobs[token], 0.0)
+    ratio = mx.exp(log_ratio)
     u = mx.random.uniform(shape=())
     mx.eval(ratio, u)
     return float(u.item()) <= float(ratio.item())
+
+
+def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
+    """Block verification (Sun et al., arXiv 2403.10444): accept a draft
+    PREFIX by cumulative joint likelihood ratio instead of independent
+    per-token coin flips.
+
+    ``p_cum_i = min(p_cum_{i-1} * p_i(x_i)/q_i(x_i), 1)`` tracks the joint
+    target/draft ratio of the drafted prefix ``x_1..x_i``. Each prefix length
+    ``i`` is checked against a threshold ``h_i``: the full block uses
+    ``h_k = p_cum_k``; shorter prefixes use the residual-mass form
+    ``h_i = S_i / (S_i + (1 - p_cum_i))`` with
+    ``S_i = sum(relu(p_cum_i * p_{i+1} - q_{i+1}))`` over the vocabulary.
+    The accepted length ``tau`` is the LARGEST ``i`` whose check
+    ``eta_i <= h_i`` passes — a later position can rescue an earlier
+    failure, which is why block verification provably accepts at least as
+    many tokens in expectation as per-token rejection sampling while
+    preserving the target distribution exactly. On ``tau < k`` the
+    correction token comes from the scaled residual
+    ``relu(p_cum_tau * p - q)``; on ``tau == k`` it is a plain target
+    sample (the bonus).
+
+    ``logprobs`` has ``k+1`` target rows (row ``i`` conditions on
+    ``x_1..x_i``), ``draft_logprobs`` the ``k`` draft rows that produced
+    ``drafts``. Returns ``(n_accept, bonus)``.
+    """
+    k = len(drafts)
+    etas = mx.random.uniform(shape=(k,))
+    mx.eval(etas)
+    p_cums = [1.0]
+    p_cum = 1.0
+    tau = 0
+    for i in range(k):
+        d = drafts[i]
+        log_ratio = float((logprobs[i][d] - draft_logprobs[i][d]).item())
+        p_cum = min(p_cum * math.exp(log_ratio), 1.0)
+        p_cums.append(p_cum)
+        if i == k - 1:
+            h = p_cum
+        else:
+            s = float(
+                mx.sum(
+                    mx.maximum(
+                        p_cum * mx.exp(logprobs[i + 1]) - mx.exp(draft_logprobs[i + 1]),
+                        0.0,
+                    )
+                ).item()
+            )
+            denom = s + (1.0 - p_cum)
+            h = 1.0 if denom <= 0.0 else s / denom
+        if float(etas[i].item()) <= h:
+            tau = i + 1
+    if tau == k:
+        bonus = _sample_from_logprobs(logprobs[k], sampling_temp)
+    else:
+        bonus = _residual_sample(
+            logprobs[tau], draft_logprobs[tau], sampling_temp, scale=p_cums[tau]
+        )
+    return tau, bonus
 
 
 def _mtp_draft_verify_loop(
@@ -1016,6 +1196,7 @@ def _mtp_draft_verify_loop(
     num_draft,
     stats,
     sampling_temp: float = 0.0,
+    accept_rule: str = "residual",
     mtp_cache=None,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
@@ -1180,19 +1361,31 @@ def _mtp_draft_verify_loop(
 
         n_accept = 0
         if sampling_temp and sampling_temp > 0:
-            while (
-                n_accept < k
-                and _accept_sampled_draft(
+            if accept_rule == "block":
+                n_accept, bonus = _block_verify(
+                    logprobs, draft_logprobs, drafts, sampling_temp
+                )
+            elif accept_rule == "exact":
+                # Upstream external-draft semantics: sample the target's own
+                # token at every position, accept while it equals the draft's
+                # sample; the first mismatch commits the target sample.
+                sampled = mx.random.categorical(logprobs)
+                mx.eval(sampled)
+                sampled = sampled.tolist()
+                while n_accept < k and sampled[n_accept] == drafts[n_accept]:
+                    n_accept += 1
+                bonus = int(sampled[n_accept])
+            else:  # "residual" — Leviathan/SpecDec rejection sampling
+                while n_accept < k and _accept_sampled_draft(
                     logprobs[n_accept], draft_logprobs[n_accept], drafts[n_accept]
-                )
-            ):
-                n_accept += 1
-            if n_accept < k:
-                bonus = _residual_sample(
-                    logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
-                )
-            else:
-                bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+                ):
+                    n_accept += 1
+                if n_accept < k:
+                    bonus = _residual_sample(
+                        logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+                    )
+                else:
+                    bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
         else:
             targets = targets.tolist()
             while n_accept < k and targets[n_accept] == drafts[n_accept]:

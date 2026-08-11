@@ -31,6 +31,19 @@ def _run(model, prompt, **kwargs):
     return toks, stats
 
 
+def _capture_prefix(model, prefix):
+    """Snapshot-capture protocol for a restored draft sidecar: trunk cache
+    plus an MTP cache covering EXACTLY the prefix — teacher-forced pairs
+    (h_i, t_{i+1}) for i < L-1 (offset L-1) and the trunk hidden of the last
+    cached token (prev_tail_hidden)."""
+    cache = make_prompt_cache(model)
+    mtp_cache = model.make_mtp_cache()
+    h = model.model(prefix[None], cache=cache)
+    model.mtp_step(h[:, :-1], prefix[1:][None], mtp_cache)
+    mx.eval([c.state for c in cache], [c.state for c in mtp_cache], h)
+    return cache, mtp_cache, h[:, -1:, :]
+
+
 class TestAdaptivePLDPersistentMTP(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
@@ -176,3 +189,229 @@ class TestMTPRateGate(unittest.TestCase):
         ]
         self.assertEqual(len(toks), 96)
         self.assertTrue(stats.rate_gate_probed)
+
+
+class TestDepthPolicyWiring(unittest.TestCase):
+    """Per-batch-size draft-depth policy wired into the MTP paths.
+
+    The policy resolves the effective num_draft ONCE at generator entry, so a
+    policy-resolved depth must be decision-for-decision identical to passing
+    that depth explicitly (deterministic greedy on the same weights)."""
+
+    def setUp(self):
+        import mlx_lm.spec_policy as spol
+
+        mx.random.seed(0)
+        self.model = TextModel(tiny_args())
+        mx.eval(self.model.parameters())
+        self.prompt = mx.random.randint(0, 64, (24,)).astype(mx.uint32)
+        # Isolate the one-time cap-warning latch from test order.
+        self._latch = spol._cap_warning_emitted
+        spol._cap_warning_emitted = False
+        self.addCleanup(self._restore_latch)
+
+    def _restore_latch(self):
+        import mlx_lm.spec_policy as spol
+
+        spol._cap_warning_emitted = self._latch
+
+    def _tail(self, **kwargs):
+        return _run(
+            self.model,
+            self.prompt,
+            max_tokens=64,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            **kwargs
+        )
+
+    def test_over_cap_depth_matches_explicit_capped_run(self):
+        import warnings
+
+        base, _ = self._tail(num_draft=7)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            capped, stats = self._tail(num_draft=10)
+        self.assertEqual(capped, base)
+        self.assertLessEqual(stats.mean_draft_span_proposed, 7.0)
+
+    def test_batch_size_band_matches_explicit_shallow_run(self):
+        # bs5+ band of the default table caps the tail at 2 drafts.
+        base, _ = self._tail(num_draft=2)
+        banded, stats = self._tail(num_draft=6, batch_size=5)
+        self.assertEqual(banded, base)
+        self.assertLessEqual(stats.mean_draft_span_proposed, 2.0)
+
+    def test_depth_table_param_overrides_default(self):
+        base, _ = self._tail(num_draft=1)
+        tabled, _ = self._tail(num_draft=6, depth_table="1:1")
+        self.assertEqual(tabled, base)
+
+    def test_single_stream_no_table_is_unchanged(self):
+        # batch_size=1 with no table must be a no-op on the depth decision.
+        base, bstats = self._tail(num_draft=2)
+        hinted, hstats = self._tail(num_draft=2, batch_size=1)
+        self.assertEqual(hinted, base)
+        self.assertEqual(hstats.draft_proposed, bstats.draft_proposed)
+
+    def test_self_mtp_policy_wiring(self):
+        from mlx_lm.hybrid_speculative import self_mtp_generate_step
+
+        def run(**kwargs):
+            return [
+                int(t)
+                for t, _lp, _fd in self_mtp_generate_step(
+                    self.prompt, self.model, max_tokens=48, **kwargs
+                )
+            ]
+
+        self.assertEqual(run(num_draft=6, batch_size=5), run(num_draft=2))
+
+    def test_malformed_env_table_spares_non_spec_paths(self):
+        # MLX_LM_SPEC_DEPTH_TABLE raises loudly on malformed values — but
+        # only paths that can actually speculate may resolve it. Pure
+        # retrieval-PLD requests (mtp_tail=False) and zero-token no-ops
+        # must not abort on a spec knob they never use.
+        import os
+
+        import mlx_lm.spec_policy as spol
+
+        old = os.environ.get(spol.DEPTH_TABLE_ENV)
+        os.environ[spol.DEPTH_TABLE_ENV] = "not-a-table"
+        try:
+            toks, _ = _run(
+                self.model,
+                self.prompt,
+                max_tokens=8,
+                warmup=4,
+                gate=1.0,
+                mtp_tail=False,
+            )
+            self.assertEqual(len(toks), 8)
+            toks, _ = _run(self.model, self.prompt, max_tokens=0, mtp_tail=True)
+            self.assertEqual(toks, [])
+            # The MTP-tail config still fails loudly at generator entry.
+            with self.assertRaises(ValueError):
+                _run(self.model, self.prompt, max_tokens=8, mtp_tail=True)
+        finally:
+            if old is None:
+                os.environ.pop(spol.DEPTH_TABLE_ENV, None)
+            else:
+                os.environ[spol.DEPTH_TABLE_ENV] = old
+
+
+class TestRestoredMTPState(unittest.TestCase):
+    """mtp_state restore path: the sidecar/prefix pairing is validated at
+    entry — a boundary-hidden or offset inconsistency must raise before
+    either cache is mutated, never silently draft one position behind."""
+
+    def setUp(self):
+        mx.random.seed(0)
+        self.model = TextModel(tiny_args())
+        mx.eval(self.model.parameters())
+        self.prompt = mx.random.randint(0, 64, (24,)).astype(mx.uint32)
+
+    def test_restored_state_resumes_tail(self):
+        # Correctly captured sidecar: the restored run drafts from the MTP
+        # tail and yields the same greedy stream as the uncached persistent
+        # run over the full prompt.
+        base, _ = _run(
+            self.model,
+            self.prompt,
+            max_tokens=64,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            persistent_mtp=True,
+        )
+        cache, mtp_cache, seed = _capture_prefix(self.model, self.prompt[:20])
+        toks, stats = _run(
+            self.model,
+            self.prompt[20:],
+            max_tokens=64,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            prompt_cache=cache,
+            history_prompt=self.prompt,
+            mtp_state=(mtp_cache, seed),
+        )
+        self.assertEqual(len(toks), 64)
+        self.assertGreater(stats.draft_proposed, 0)
+        self.assertEqual(toks, base)
+
+    def test_missing_boundary_hidden_raises(self):
+        # (mtp_cache, None) with a non-empty cached prefix would skip the
+        # pair connecting the last cached hidden to the first uncached
+        # token, leaving the MTP cache one position behind. Must raise
+        # before mutating either cache.
+        cache, mtp_cache, _seed = _capture_prefix(self.model, self.prompt[:20])
+        gen = adaptive_pld_generate_step(
+            self.prompt[20:],
+            self.model,
+            max_tokens=8,
+            mtp_tail=True,
+            prompt_cache=cache,
+            history_prompt=self.prompt,
+            mtp_state=(mtp_cache, None),
+        )
+        with self.assertRaisesRegex(ValueError, "prev_tail_hidden"):
+            next(gen)
+        self.assertEqual(max(getattr(c, "offset", 0) for c in cache), 20)
+        self.assertEqual(max(c.offset for c in mtp_cache), 19)
+
+    def test_offset_mismatch_raises(self):
+        cache, _mtp_cache, seed = _capture_prefix(self.model, self.prompt[:20])
+        stale = self.model.make_mtp_cache()  # offset 0, prefix needs 19
+        gen = adaptive_pld_generate_step(
+            self.prompt[20:],
+            self.model,
+            max_tokens=8,
+            mtp_tail=True,
+            prompt_cache=cache,
+            history_prompt=self.prompt,
+            mtp_state=(stale, seed),
+        )
+        with self.assertRaisesRegex(ValueError, "offset mismatch"):
+            next(gen)
+        self.assertEqual(max(getattr(c, "offset", 0) for c in cache), 20)
+
+    def test_nonempty_sidecar_on_empty_prefix_raises(self):
+        _cache, mtp_cache, seed = _capture_prefix(self.model, self.prompt[:20])
+        gen = adaptive_pld_generate_step(
+            self.prompt,
+            self.model,
+            max_tokens=8,
+            mtp_tail=True,
+            prompt_cache=make_prompt_cache(self.model),
+            history_prompt=self.prompt,
+            mtp_state=(mtp_cache, seed),
+        )
+        with self.assertRaises(ValueError):
+            next(gen)
+
+    def test_empty_prefix_restore_still_fine(self):
+        # An empty sidecar over an empty external prefix is just persistent
+        # MTP from scratch — bit-identical prefill, identical stream.
+        base, _ = _run(
+            self.model,
+            self.prompt,
+            max_tokens=48,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            persistent_mtp=True,
+        )
+        toks, _ = _run(
+            self.model,
+            self.prompt,
+            max_tokens=48,
+            warmup=4,
+            gate=1.0,
+            mtp_tail=True,
+            prompt_cache=make_prompt_cache(self.model),
+            history_prompt=self.prompt,
+            mtp_state=(self.model.make_mtp_cache(), None),
+        )
+        self.assertEqual(toks, base)

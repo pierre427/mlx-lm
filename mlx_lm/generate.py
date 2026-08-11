@@ -352,7 +352,22 @@ def maybe_quantize_kv_cache(
     if key_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        if isinstance(c, CacheList):
+            # Composite per-layer caches (hybrid attention+recurrent layers)
+            # hold their KV caches one level down; recurse so nested KV
+            # leaves honor kv_bits instead of silently staying fp.
+            leaves = list(c.caches)
+            maybe_quantize_kv_cache(
+                leaves,
+                quantized_kv_start,
+                kv_group_size,
+                kv_bits,
+                kv_key_bits=kv_key_bits,
+                kv_value_bits=kv_value_bits,
+                kv_rotate=kv_rotate,
+            )
+            c.caches = tuple(leaves)
+        elif hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             symmetric = key_bits == value_bits and not kv_rotate
             if (
                 isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
@@ -1225,6 +1240,16 @@ def prompt_lookup_generate_step(
     uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
     the full history, while target verification forwards only the uncached tail.
     """
+    if _ignored.get("logits_processors"):
+        # PLD has no logits-processor hook: masks would silently never be
+        # applied (grammar/constrained output would be unconstrained). The
+        # servers route constrained requests to generate_step; stream_generate's
+        # pld_safe gate does the same. Fail loud for direct callers.
+        raise ValueError(
+            "prompt_lookup_generate_step does not support logits_processors; "
+            "use generate_step (stream_generate routes constrained requests "
+            "there automatically)"
+        )
     from .prompt_lookup import (
         HybridStats,
         NgramProposer,
@@ -1585,6 +1610,9 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        # max_tokens=0 (or a generator that yields nothing) must not reach
+        # the final response, which reads the loop variables.
+        token = None
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1611,6 +1639,8 @@ def stream_generate(
             )
 
         detokenizer.finalize()
+        if token is None:
+            return
         yield GenerationResponse(
             text=detokenizer.last_segment,
             token=token,
@@ -2786,6 +2816,33 @@ class BatchGenerator:
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
+            elif self.kv_bits is not None:
+                # Externally supplied (snapshot-restored / transplanted)
+                # caches must honor the generator's kv-quant config: the lane
+                # would otherwise silently run unquantized and the mixed
+                # fp/quantized cohort breaks the class-specific merges.
+                # Batched kv-quant is rotating-only in-tree (plain
+                # QuantizedKVCache has no merge), so fail loudly here instead
+                # of deferring the crash to _merge_caches.
+                maybe_quantize_kv_cache(
+                    caches[i],
+                    self.quantized_kv_start,
+                    self.kv_group_size,
+                    self.kv_bits,
+                )
+                for c in caches[i]:
+                    # CacheList.merge merges leaf-wise, so every nested leaf
+                    # must be mergeable too — check leaves, not the wrapper.
+                    leaves = c.caches if isinstance(c, CacheList) else (c,)
+                    for leaf in leaves:
+                        if not hasattr(leaf, "merge"):
+                            raise ValueError(
+                                f"kv_bits is set but a supplied cache "
+                                f"quantizes to {type(leaf).__name__}, which "
+                                "does not support batching. Batched kv-quant "
+                                "currently requires rotating caches (set "
+                                "max_kv_size) or an unquantized generator."
+                            )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,

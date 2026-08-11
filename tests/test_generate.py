@@ -228,6 +228,121 @@ class TestGenerate(unittest.TestCase):
             num_embeddings / prefill_step_size < num_prompt_processing_callbacks
         )
 
+    def test_stream_generate_zero_max_tokens(self):
+        prompt = self.tokenizer.encode("hi")
+        responses = list(
+            stream_generate(self.model, self.tokenizer, prompt, max_tokens=0)
+        )
+        self.assertEqual(responses, [])
+
+    def test_insert_supplied_cache_honors_kv_bits(self):
+        # Externally supplied caches must honor the generator's kv-quant
+        # config at insert: on the supported (rotating) configuration they
+        # are quantized to match the fresh-lane cohort; on the unsupported
+        # (non-rotating) one they fail loudly instead of silently running
+        # unquantized and crashing later in the cohort merge.
+        from mlx_lm.models.cache import (
+            RotatingQuantizedKVCache,
+            make_prompt_cache,
+        )
+
+        prompt = self.tokenizer.encode("hello there")
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            supplied = [
+                RotatingKVCache(max_size=64) for _ in range(len(self.model.layers))
+            ]
+            gen.insert([prompt], caches=[supplied])
+            queued_cache = gen._unprocessed_sequences[0][3]
+            self.assertTrue(
+                all(isinstance(c, RotatingQuantizedKVCache) for c in queued_cache)
+            )
+            responses = []
+            while res := gen.next_generated():
+                responses.extend(res)
+            self.assertTrue(len(responses) > 0)
+        finally:
+            gen.close()
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            with self.assertRaises(ValueError):
+                gen.insert([prompt], caches=[make_prompt_cache(self.model)])
+        finally:
+            gen.close()
+
+    def test_insert_supplied_cachelist_honors_kv_bits(self):
+        # Composite CacheList layer caches (hybrid attention+recurrent
+        # layers) hold their KV caches one level down. At insert with
+        # kv_bits set, nested KV leaves must be quantized (the wrapper has
+        # merge but no to_quantized, so without recursion they silently
+        # stay fp), and a nested leaf that quantizes to a non-mergeable
+        # class must fail loudly at insert instead of crashing later in
+        # CacheList.merge.
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            CacheList,
+            RotatingQuantizedKVCache,
+        )
+
+        prompt = self.tokenizer.encode("hello there")
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            supplied = [
+                CacheList(RotatingKVCache(max_size=64), ArraysCache(size=1))
+                for _ in range(len(self.model.layers))
+            ]
+            gen.insert([prompt], caches=[supplied])
+            queued_cache = gen._unprocessed_sequences[0][3]
+            for c in queued_cache:
+                self.assertIsInstance(c, CacheList)
+                self.assertIsInstance(c.caches[0], RotatingQuantizedKVCache)
+                self.assertIsInstance(c.caches[1], ArraysCache)
+        finally:
+            gen.close()
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=2,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            # Nested plain KVCache quantizes to QuantizedKVCache, which has
+            # no merge: the leaf-level guard must reject it at insert.
+            supplied = [
+                CacheList(KVCache(), ArraysCache(size=1))
+                for _ in range(len(self.model.layers))
+            ]
+            with self.assertRaises(ValueError):
+                gen.insert([prompt], caches=[supplied])
+        finally:
+            gen.close()
+
     def test_batch_matches_single(self):
 
         prompts = [
