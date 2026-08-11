@@ -904,6 +904,7 @@ def self_mtp_generate_step(
     max_tokens: int = 256,
     prefill_step_size: int = 512,
     sampling_temp: float = 0.0,
+    accept_rule: str = "residual",
     persistent_mtp: bool = False,
     rate_gate: bool = False,
     batch_size: int = 1,
@@ -924,6 +925,18 @@ def self_mtp_generate_step(
     speculative rejection sampling with temperature-scaled target and draft
     distributions. This is exact for temperature-only sampling; top-p/top-k need
     a shared distribution transform before they can be made exact here.
+
+    ``accept_rule`` selects the temp>0 verification rule; greedy (temp=0)
+    decisions are rule-independent and bit-identical. ``"residual"`` (the
+    default — the incumbent behavior) is Leviathan/SpecDec rejection
+    sampling: accept draft x ~ q with probability min(1, p(x)/q(x)), resample
+    rejects from normalized relu(p - q). ``"block"`` is block verification
+    (arXiv 2403.10444): accepts draft PREFIXES by cumulative joint
+    likelihood ratio — provably accepts at least as many tokens as per-token
+    rejection sampling with the SAME output distribution. ``"exact"`` is the
+    conservative sampled-token-match rule (upstream
+    ``speculative_generate_step`` semantics: accept while the target's own
+    sample equals the draft's), kept as an A/B baseline.
 
     ``persistent_mtp=True`` keeps ONE MTP KV cache in sync with the committed
     sequence (teacher-forced from trunk hiddens during prefill and after each
@@ -948,6 +961,10 @@ def self_mtp_generate_step(
     """
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head (build with mtp_num_hidden_layers>0)")
+    if accept_rule not in ("exact", "residual", "block"):
+        raise ValueError(
+            f"accept_rule must be 'exact', 'residual', or 'block'; got {accept_rule!r}"
+        )
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
 
@@ -1013,6 +1030,7 @@ def self_mtp_generate_step(
             num_draft,
             stats,
             sampling_temp,
+            accept_rule=accept_rule,
             mtp_cache=mtp_cache,
             rate_gate=rate_gate,
         )
@@ -1033,8 +1051,12 @@ def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0) -> int:
     return int(mx.argmax(logprobs).item())
 
 
-def _residual_sample(target_logprobs, draft_logprobs, sampling_temp: float) -> int:
-    residual = mx.maximum(mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
+def _residual_sample(
+    target_logprobs, draft_logprobs, sampling_temp: float, scale: float = 1.0
+) -> int:
+    # ``scale`` is the block-verification cumulative ratio p_tau; 1.0 (the
+    # per-token rule) multiplies bit-exactly, so the default is unchanged.
+    residual = mx.maximum(scale * mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
     total = mx.sum(residual)
     mx.eval(total)
     if float(total.item()) <= 0.0:
@@ -1052,6 +1074,65 @@ def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
     return float(u.item()) <= float(ratio.item())
 
 
+def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
+    """Block verification (Sun et al., arXiv 2403.10444): accept a draft
+    PREFIX by cumulative joint likelihood ratio instead of independent
+    per-token coin flips.
+
+    ``p_cum_i = min(p_cum_{i-1} * p_i(x_i)/q_i(x_i), 1)`` tracks the joint
+    target/draft ratio of the drafted prefix ``x_1..x_i``. Each prefix length
+    ``i`` is checked against a threshold ``h_i``: the full block uses
+    ``h_k = p_cum_k``; shorter prefixes use the residual-mass form
+    ``h_i = S_i / (S_i + (1 - p_cum_i))`` with
+    ``S_i = sum(relu(p_cum_i * p_{i+1} - q_{i+1}))`` over the vocabulary.
+    The accepted length ``tau`` is the LARGEST ``i`` whose check
+    ``eta_i <= h_i`` passes — a later position can rescue an earlier
+    failure, which is why block verification provably accepts at least as
+    many tokens in expectation as per-token rejection sampling while
+    preserving the target distribution exactly. On ``tau < k`` the
+    correction token comes from the scaled residual
+    ``relu(p_cum_tau * p - q)``; on ``tau == k`` it is a plain target
+    sample (the bonus).
+
+    ``logprobs`` has ``k+1`` target rows (row ``i`` conditions on
+    ``x_1..x_i``), ``draft_logprobs`` the ``k`` draft rows that produced
+    ``drafts``. Returns ``(n_accept, bonus)``.
+    """
+    k = len(drafts)
+    etas = mx.random.uniform(shape=(k,))
+    mx.eval(etas)
+    p_cums = [1.0]
+    p_cum = 1.0
+    tau = 0
+    for i in range(k):
+        d = drafts[i]
+        log_ratio = float((logprobs[i][d] - draft_logprobs[i][d]).item())
+        p_cum = min(p_cum * math.exp(log_ratio), 1.0)
+        p_cums.append(p_cum)
+        if i == k - 1:
+            h = p_cum
+        else:
+            s = float(
+                mx.sum(
+                    mx.maximum(
+                        p_cum * mx.exp(logprobs[i + 1]) - mx.exp(draft_logprobs[i + 1]),
+                        0.0,
+                    )
+                ).item()
+            )
+            denom = s + (1.0 - p_cum)
+            h = 1.0 if denom <= 0.0 else s / denom
+        if float(etas[i].item()) <= h:
+            tau = i + 1
+    if tau == k:
+        bonus = _sample_from_logprobs(logprobs[k], sampling_temp)
+    else:
+        bonus = _residual_sample(
+            logprobs[tau], draft_logprobs[tau], sampling_temp, scale=p_cums[tau]
+        )
+    return tau, bonus
+
+
 def _mtp_draft_verify_loop(
     model,
     cache,
@@ -1062,6 +1143,7 @@ def _mtp_draft_verify_loop(
     num_draft,
     stats,
     sampling_temp: float = 0.0,
+    accept_rule: str = "residual",
     mtp_cache=None,
     rate_gate: bool = False,
 ):
@@ -1196,19 +1278,31 @@ def _mtp_draft_verify_loop(
 
         n_accept = 0
         if sampling_temp and sampling_temp > 0:
-            while (
-                n_accept < k
-                and _accept_sampled_draft(
+            if accept_rule == "block":
+                n_accept, bonus = _block_verify(
+                    logprobs, draft_logprobs, drafts, sampling_temp
+                )
+            elif accept_rule == "exact":
+                # Upstream external-draft semantics: sample the target's own
+                # token at every position, accept while it equals the draft's
+                # sample; the first mismatch commits the target sample.
+                sampled = mx.random.categorical(logprobs)
+                mx.eval(sampled)
+                sampled = sampled.tolist()
+                while n_accept < k and sampled[n_accept] == drafts[n_accept]:
+                    n_accept += 1
+                bonus = int(sampled[n_accept])
+            else:  # "residual" — Leviathan/SpecDec rejection sampling
+                while n_accept < k and _accept_sampled_draft(
                     logprobs[n_accept], draft_logprobs[n_accept], drafts[n_accept]
-                )
-            ):
-                n_accept += 1
-            if n_accept < k:
-                bonus = _residual_sample(
-                    logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
-                )
-            else:
-                bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+                ):
+                    n_accept += 1
+                if n_accept < k:
+                    bonus = _residual_sample(
+                        logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+                    )
+                else:
+                    bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
         else:
             targets = targets.tolist()
             while n_accept < k and targets[n_accept] == drafts[n_accept]:
