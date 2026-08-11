@@ -2709,15 +2709,20 @@ class BatchGenerator:
                 # caches must honor the generator's kv-quant config: the lane
                 # would otherwise silently run unquantized and the mixed
                 # fp/quantized cohort breaks the class-specific merges.
-                # Batched kv-quant is rotating-only in-tree (plain
-                # QuantizedKVCache has no merge), so fail loudly here instead
-                # of deferring the crash to _merge_caches.
                 maybe_quantize_kv_cache(
                     caches[i],
                     self.quantized_kv_start,
                     self.kv_group_size,
                     self.kv_bits,
                 )
+            if self.kv_bits is not None:
+                # Both lanes, not just supplied caches: _make_new_cache()
+                # doesn't descend into CacheList when wrapping for
+                # max_kv_size, so a fresh job on a hybrid model can also
+                # carry a leaf that quantizes to a non-mergeable class.
+                # Batched kv-quant is rotating-only in-tree (plain
+                # QuantizedKVCache has no merge), so fail loudly here instead
+                # of deferring the crash to _merge_caches.
                 for c in caches[i]:
                     # CacheList.merge merges leaf-wise, so every nested leaf
                     # must be mergeable too — check leaves, not the wrapper.
@@ -2725,7 +2730,7 @@ class BatchGenerator:
                     for leaf in leaves:
                         if not hasattr(leaf, "merge"):
                             raise ValueError(
-                                f"kv_bits is set but a supplied cache "
+                                f"kv_bits is set but the cache for this job "
                                 f"quantizes to {type(leaf).__name__}, which "
                                 "does not support batching. Batched kv-quant "
                                 "currently requires rotating caches (set "
