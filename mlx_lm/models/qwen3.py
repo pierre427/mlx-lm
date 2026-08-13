@@ -75,8 +75,29 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            tree_slices = getattr(cache, "tree_slices", None)
+            if tree_slices is not None:
+                # Default-off tree verification hook. Sibling branches reuse
+                # logical positions, so rotate each topologically contiguous
+                # slice at its own absolute offset. Ordinary KV caches do not
+                # expose tree_slices and retain the existing fast path.
+                queries = mx.concatenate(
+                    [
+                        self.rope(queries[..., start:stop, :], offset=position)
+                        for start, stop, position in tree_slices
+                    ],
+                    axis=2,
+                )
+                keys = mx.concatenate(
+                    [
+                        self.rope(keys[..., start:stop, :], offset=position)
+                        for start, stop, position in tree_slices
+                    ],
+                    axis=2,
+                )
+            else:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
