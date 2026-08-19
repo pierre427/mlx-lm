@@ -150,13 +150,17 @@ class MoEGate(nn.Module):
         self.expert_bias = mx.zeros((args.num_experts,))
 
     def __call__(self, x):
-        return expert_select(
-            self.gate(x),
+        result = expert_select(
+            self.gate(x.astype(mx.float32)),
             self.expert_bias,
             self.top_k,
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
+        sink = getattr(self, "_hy3_atlas_sink", None)
+        if sink is not None:
+            sink(*result)
+        return result
 
 
 class MoE(nn.Module):
