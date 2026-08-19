@@ -467,6 +467,83 @@ class TestModels(unittest.TestCase):
                 self.assertEqual(logits.shape, (B, 1, args.vocab_size))
                 self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_deepseek_absorbed_mla_quantized_kv_decode(self):
+        # Regression: absorbed-MLA decode (L == 1) with a QuantizedKVCache in
+        # deepseek_v2 / deepseek_v3 (Sarvam-105B, DeepSeek-V3, ...). The 4D
+        # additive pe_scores mask (B, n_heads, L, S) must be unflattened to
+        # (B, n_kv_heads, n_repeats, L, S) in the quantized-SDPA GQA branch; a
+        # blind expand_dims mis-broadcasts the scores and crashes the output
+        # reshape (e.g. "[reshape] Cannot reshape array of size 2097152 into
+        # shape (1,64,1,512)"). Perplexity harnesses only exercise the L > 1
+        # materialized-prefill path, so decode needs explicit coverage.
+        from mlx_lm.models import deepseek_v2, deepseek_v3
+        from mlx_lm.models.cache import QuantizedKVCache, make_prompt_cache
+
+        common = dict(
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=32,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            n_routed_experts=None,
+            first_k_dense_replace=99,
+            max_position_embeddings=2048,
+        )
+        v2_rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        }
+        configs = [
+            (
+                deepseek_v2,
+                deepseek_v2.ModelArgs(
+                    model_type="deepseek_v2",
+                    rope_scaling=v2_rope_scaling,
+                    **common,
+                ),
+            ),
+            (deepseek_v3, deepseek_v3.ModelArgs(model_type="deepseek_v3", **common)),
+        ]
+        for module, args in configs:
+            model = module.Model(args)
+            mx.eval(model.parameters())
+            for B in (1, 2):
+                prompt = mx.random.randint(0, args.vocab_size, (B, 8))
+                steps = [
+                    mx.random.randint(0, args.vocab_size, (B, 1)) for _ in range(2)
+                ]
+
+                fp_caches = make_prompt_cache(model)
+                model(prompt, cache=fp_caches)
+                q_caches = [
+                    QuantizedKVCache(group_size=32, bits=8)
+                    for _ in range(args.num_hidden_layers)
+                ]
+                logits = model(prompt, cache=q_caches)
+                self.assertEqual(logits.shape, (B, 8, args.vocab_size))
+
+                for step in steps:
+                    ref = model(step, cache=fp_caches).astype(mx.float32)
+                    out = model(step, cache=q_caches).astype(mx.float32)
+                    mx.eval(ref, out)
+                    self.assertEqual(out.shape, (B, 1, args.vocab_size))
+                    self.assertTrue(mx.all(mx.isfinite(out)).item())
+                    # kv8 decode logits should track the fp16-cache baseline
+                    rel = (mx.abs(out - ref).max() / (mx.abs(ref).max() + 1e-9)).item()
+                    self.assertLess(rel, 0.05, f"{args.model_type} B={B}: {rel=}")
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)

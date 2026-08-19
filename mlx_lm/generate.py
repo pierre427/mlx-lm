@@ -5,6 +5,8 @@ import contextlib
 import copy
 import functools
 import json
+import logging
+import math
 import sys
 import time
 from collections import deque
@@ -17,6 +19,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .batch_admission import AdmissionState, LinearStateCost, StateBudget
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -2082,12 +2085,15 @@ class PromptProcessingBatch:
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
         if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
+            # Invariant: empty processor lanes are always [] (an iterable),
+            # never None -- the GenerationBatch._step consumer iterates each
+            # lane. Build an independent list per lane (never a shared object).
+            self.logits_processors = [[] for _ in range(len(self.uids))]
         samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
         logits_processors = (
             batch.logits_processors
             if any(batch.logits_processors)
-            else [None] * len(batch.uids)
+            else [[] for _ in range(len(batch.uids))]
         )
 
         self.uids.extend(batch.uids)
@@ -2143,7 +2149,9 @@ class PromptProcessingBatch:
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         else:
-            self.logits_processors = [[]] * len(keep)
+            # Independent [] per lane -- [[]] * n would share one list object
+            # so an in-place append on one lane would mutate all of them.
+            self.logits_processors = [[] for _ in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
         # Lane indices changed; recorded rollbacks refer to the old lanes.
@@ -2405,12 +2413,38 @@ class GenerationBatch:
 
         # Sample
         if any(self.samplers):
-            all_samples = []
+            # Group rows sharing the same sampler object so each unique
+            # sampler runs once, vectorized over its rows. Only samplers
+            # that declare themselves row-independent (batch_groupable, set
+            # by make_sampler) are grouped: an arbitrary callable may be
+            # stateful or draw shared randomness, so it keeps the original
+            # one-call-per-row contract.
+            groups = {}
+            order = []
             for e in range(len(self.uids)):
                 sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
+                if getattr(sample_sampler, "batch_groupable", False):
+                    key = id(sample_sampler)
+                else:
+                    key = (e,)
+                if key not in groups:
+                    groups[key] = (sample_sampler, [])
+                    order.append(key)
+                groups[key][1].append(e)
+            if len(groups) == 1:
+                ((sample_sampler, rows),) = groups.values()
+                sampled = sample_sampler(logprobs)
+            else:
+                all_samples = [None] * len(self.uids)
+                for key in order:
+                    sample_sampler, rows = groups[key]
+                    if len(rows) == 1:
+                        group_sampled = sample_sampler(logprobs[rows[0] : rows[0] + 1])
+                    else:
+                        group_sampled = sample_sampler(logprobs[mx.array(rows)])
+                    for j, e in enumerate(rows):
+                        all_samples[e] = group_sampled[j : j + 1]
+                sampled = mx.concatenate(all_samples, axis=0)
         else:
             sampled = self.fallback_sampler(logprobs)
 
@@ -2441,9 +2475,15 @@ class GenerationBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
+        # Always keep samplers/logits_processors index-aligned with uids. A
+        # per-lane list (len == old uids) must be filtered even when every
+        # lane is falsy (all-None samplers / all-[] processors); otherwise it
+        # stays longer than uids and a later extend appends at the wrong index,
+        # silently binding lanes to the wrong sampler/processor. An empty []
+        # (no per-lane info) is left untouched.
+        if self.samplers:
             self.samplers = [self.samplers[idx] for idx in keep]
-        if any(self.logits_processors):
+        if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
@@ -2556,7 +2596,11 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        prefill_batch_window: Optional[int] = None,
         max_kv_size: Optional[int] = None,
+        kv_budget_bytes: Optional[int] = None,
+        kv_cost: Optional[Tuple[float, float, Optional[int]]] = None,
+        state_budget: Optional[StateBudget] = None,
         kv_bits: Optional[int] = None,
         kv_group_size: int = 64,
         quantized_kv_start: int = 0,
@@ -2584,12 +2628,80 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
+        self.prefill_batch_window = (
+            1 if prefill_batch_window is None else prefill_batch_window
+        )
+        if self.prefill_batch_window < 1:
+            raise ValueError("prefill_batch_window must be positive")
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
         self.quantized_kv_start = quantized_kv_start
         self.prompt_trim_rollback_tokens = max(0, int(prompt_trim_rollback_tokens))
+        if state_budget is not None and (
+            kv_budget_bytes is not None or kv_cost is not None
+        ):
+            raise ValueError(
+                "state_budget cannot be combined with kv_budget_bytes/kv_cost"
+            )
+        if (
+            state_budget is not None
+            and type(state_budget.project) is not LinearStateCost
+        ):
+            raise ValueError(
+                "BatchGenerator state_budget requires LinearStateCost; "
+                "peak-only iterative policies such as StepStateCost must be "
+                "driven by their model-native scheduler with actual resident "
+                "request state"
+            )
+        if (
+            state_budget is not None
+            and state_budget.project.bytes_per_unit > 0
+            and state_budget.project.allocation_step_units is None
+        ):
+            raise ValueError(
+                "BatchGenerator budgeting over growing state requires "
+                "allocation_step_units: shared batch caches allocate in "
+                "steps at the cohort-max width, and unrounded admission "
+                "can exceed the budget. Fixed-only state may omit the step."
+            )
+        if kv_budget_bytes is not None:
+            if kv_cost is None:
+                raise ValueError(
+                    "kv_budget_bytes requires kv_cost=(fixed_bytes_per_row, "
+                    "bytes_per_token) measured for this model"
+                )
+            if len(kv_cost) < 3 or (kv_cost[1] > 0 and kv_cost[2] is None):
+                raise ValueError(
+                    "kv_cost must be (fixed_bytes, bytes_per_token, "
+                    "allocation_step_units) with a validated step whenever "
+                    "bytes_per_token > 0: unrounded per-token cost "
+                    "cannot budget shared stepped batch caches safely"
+                )
+            fixed, per_token = kv_cost[0], kv_cost[1]
+            if not (
+                math.isfinite(kv_budget_bytes)
+                and math.isfinite(fixed)
+                and math.isfinite(per_token)
+            ):
+                raise ValueError("kv_budget_bytes and kv_cost must be finite")
+            if kv_budget_bytes <= 0 or fixed < 0 or per_token < 0:
+                raise ValueError("kv_budget_bytes must be positive and kv_cost >= 0")
+        self.kv_budget_bytes = kv_budget_bytes
+        self.kv_cost = kv_cost
+        self.state_budget = state_budget
+        if kv_budget_bytes is not None:
+            step = kv_cost[2] if len(kv_cost) > 2 else None
+            self.state_budget = StateBudget(
+                kv_budget_bytes,
+                LinearStateCost(
+                    fixed,
+                    per_token,
+                    max_units=max_kv_size,
+                    allocation_step_units=step,
+                ),
+            )
 
         self._stream = stream or generation_stream
 
@@ -2848,6 +2960,17 @@ class BatchGenerator:
         return total
 
     def _make_batch(self, n: int):
+        selected = self._select_prefill_indices(n)
+        if selected == list(range(n)):
+            sequences = [self._unprocessed_sequences.popleft() for _ in range(n)]
+        else:
+            selected = set(selected)
+            queued = list(self._unprocessed_sequences)
+            sequences = [sequence for i, sequence in enumerate(queued) if i in selected]
+            self._unprocessed_sequences = deque(
+                sequence for i, sequence in enumerate(queued) if i not in selected
+            )
+
         uids = []
         caches = []
         tokens = []
@@ -2855,8 +2978,7 @@ class BatchGenerator:
         logits_processors = []
         max_tokens = []
         stop_matchers = []
-        for _ in range(n):
-            sequence = self._unprocessed_sequences.popleft()
+        for sequence in sequences:
             uids.append(sequence[0])
             caches.append(sequence[3])
             tokens.append(sequence[4])
@@ -2865,7 +2987,13 @@ class BatchGenerator:
             max_tokens.append(sequence[2])
             stop_matchers.append(sequence[7])
             self._currently_processing.append(
-                [sequence[1], 0, sum(len(s) for s in sequence[1])]
+                [
+                    sequence[1],
+                    0,
+                    sum(len(s) for s in sequence[1]),
+                    sum(c.nbytes for c in sequence[3]) == 0,
+                    len(sequence[4]) if sequence[4] else 0,
+                ]
             )
 
         return PromptProcessingBatch(
@@ -2881,6 +3009,211 @@ class BatchGenerator:
             max_tokens=max_tokens,
             prompt_trim_rollback_tokens=self.prompt_trim_rollback_tokens,
         )
+
+    def _prefill_chunk_length(self, segments):
+        if len(segments) == 1 and len(segments[0]) == 1:
+            return 0
+        return min(len(segments[0]), self.prefill_step_size)
+
+    def _select_prefill_indices(self, n: int):
+        """Select a padding-efficient, starvation-bounded admission cohort."""
+        if n <= 0:
+            return []
+
+        window = min(
+            len(self._unprocessed_sequences),
+            max(n, self.prefill_batch_window),
+        )
+        if window == n:
+            return list(range(n))
+
+        candidates = list(self._unprocessed_sequences)[:window]
+        candidate_lengths = [
+            self._prefill_chunk_length(sequence[1]) for sequence in candidates
+        ]
+        active_lengths = [
+            self._prefill_chunk_length(sequence[0])
+            for sequence in self._currently_processing
+            if not (len(sequence[0]) == 1 and len(sequence[0][0]) == 1)
+        ]
+
+        # Always admit the oldest request. This bounds every queued request's
+        # wait even if later requests keep arriving with friendlier lengths.
+        selected = [0]
+        selected_lengths = list(active_lengths)
+        if candidate_lengths[0] > 0:
+            selected_lengths.append(candidate_lengths[0])
+
+        remaining = set(range(1, window))
+        while len(selected) < n:
+
+            def padding_after_adding(i):
+                lengths = selected_lengths
+                if candidate_lengths[i] > 0:
+                    lengths = lengths + [candidate_lengths[i]]
+                if not lengths:
+                    return 0
+                return max(lengths) * len(lengths) - sum(lengths)
+
+            best = min(remaining, key=lambda i: (padding_after_adding(i), i))
+            selected.append(best)
+            if candidate_lengths[best] > 0:
+                selected_lengths.append(candidate_lengths[best])
+            remaining.remove(best)
+
+        return sorted(selected)
+
+    def _capped_tokens(self, tokens):
+        if self.max_kv_size is not None:
+            return min(tokens, self.max_kv_size)
+        return tokens
+
+    def _budget_admissible(self, n):
+        """How many of the first n queued sequences fit the state budget.
+
+        Shared batch caches (BatchKVCache) allocate every row at the
+        cohort-max step-rounded width, so cost is NON-ADDITIVE: each prefix
+        length is evaluated by recomputing the full cohort projection at
+        final extents (via the policy's ``cohort_bytes``), floored by actual
+        live bytes. No per-row resident credit is granted under stepped
+        geometry — a supplied cache's bytes cannot reduce the shared width.
+        """
+        if self.state_budget is None or n <= 0:
+            return n
+        self._sync_budget_mutation()
+        queued = list(self._unprocessed_sequences)[:n]
+        return self._admit_states(
+            [self._candidate_admission_state(seq) for seq in queued]
+        )
+
+    def _sync_budget_mutation(self):
+        if (
+            self.kv_budget_bytes is not None
+            and self.state_budget.budget_bytes != self.kv_budget_bytes
+        ):
+            # Preserve the experimental F3 attribute's mutability for callers
+            # while routing its implementation through the generic policy.
+            if not math.isfinite(self.kv_budget_bytes) or self.kv_budget_bytes <= 0:
+                raise ValueError("kv_budget_bytes must be finite and positive")
+            self.state_budget.budget_bytes = self.kv_budget_bytes
+
+    def _candidate_admission_state(self, seq):
+        new_tokens = sum(len(s) for s in seq[1])
+        history = len(seq[4]) if seq[4] else 0
+        total = history + new_tokens + seq[2]
+        existing = sum(c.nbytes for c in seq[3])
+        # Reviewer constraint: credit only against verifiable geometry.
+        # A supplied cache WITH history is inside the projection target;
+        # one WITHOUT history is unverifiable — its bytes sit OUTSIDE the
+        # projection and are charged on top, never credited.
+        unverified = float(existing) if (existing > 0 and history == 0) else 0.0
+        return AdmissionState(
+            seq[0],
+            total,
+            history,
+            metadata={
+                "phase": "queued",
+                "prompt_units": new_tokens,
+                "unverified_bytes": unverified,
+            },
+        )
+
+    def _final_extent_states(self):
+        """AdmissionStates of every admitted row at FINAL extent, for the
+        shared-width cohort projection."""
+        states = []
+        gb = self._generation_batch
+        for i in range(len(gb)):
+            current = len(gb.tokens[i])
+            final = current + max(gb.max_tokens[i] - gb._num_tokens[i], 0)
+            states.append(
+                AdmissionState(
+                    gb.uids[i], final, current, metadata={"phase": "generation"}
+                )
+            )
+        for i, seq in enumerate(self._currently_processing):
+            history = seq[4] if len(seq) > 4 else 0
+            final = history + seq[2] + self._prompt_batch.max_tokens[i]
+            states.append(
+                AdmissionState(
+                    self._prompt_batch.uids[i],
+                    final,
+                    history + seq[1],
+                    metadata={"phase": "prefill"},
+                )
+            )
+        return states
+
+    def _cohort_committed(self, candidate_states):
+        """Projected committed bytes with the exact ``candidate_states``
+        prefix admitted.
+
+        The global cohort projection (all admitted rows + the selected
+        prefix, at final extents, at the shared cohort-max rounded width)
+        dominates both the current separate prompt/generation allocations
+        and their eventual merge. Resident bytes of still-UNSELECTED queued
+        rows are simultaneous with that future growth and are ADDED — never
+        folded into a max — as are unverifiable supplied-cache bytes of
+        selected candidates. The result is floored by admitted-batch actual
+        live bytes (a stale wide allocation never assumed smaller than
+        reality). State admission budget only; not a total process
+        peak-memory guarantee (split/extend allocator transients are out of
+        scope).
+        """
+        cost = self.state_budget.project
+        cands = list(candidate_states)
+        all_states = self._final_extent_states() + cands
+        if hasattr(cost, "cohort_bytes"):
+            projected = cost.cohort_bytes(all_states)
+        else:
+            projected = sum(self.state_budget.projected_bytes(s) for s in all_states)
+        selected_unverified = sum(
+            s.metadata.get("unverified_bytes", 0.0) for s in cands
+        )
+        selected_uids = {s.uid for s in cands}
+        unselected_live = sum(
+            float(sum(c.nbytes for c in seq[3]))
+            for seq in self._unprocessed_sequences
+            if seq[0] not in selected_uids
+        )
+        admitted_live = float(
+            sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        ) + float(sum(c.nbytes for c in self._prompt_batch.prompt_cache))
+        # Order matters: the live floor applies to the BASE projection only;
+        # unverified selected bytes and unselected resident bytes are
+        # simultaneous additions a large floor must never absorb.
+        return max(projected, admitted_live) + selected_unverified + unselected_live
+
+    def _admit_states(self, states):
+        """How many of ``states`` fit, in order — recomputing the full
+        non-additive cohort cost for each exact prefix length."""
+        states = list(states)
+        admitted = 0
+        for k in range(1, len(states) + 1):
+            if self._cohort_committed(states[:k]) > self.state_budget.budget_bytes:
+                break
+            admitted = k
+        if (
+            admitted == 0
+            and states
+            and len(self._generation_batch) == 0
+            and len(self._prompt_batch) == 0
+        ):
+            # Liveness contract: a request whose projection alone exceeds
+            # the budget is admitted when nothing else is running, mirroring
+            # count-cap semantics where a single request always proceeds.
+            # Best effort, not a guarantee against out-of-memory.
+            logging.warning(
+                "Request %s projects above the state budget "
+                "(%d needed, %d budget) but nothing is running; "
+                "admitting it anyway (best effort, not a guarantee "
+                "against out-of-memory)",
+                states[0].uid,
+                int(self._cohort_committed(states[:1])),
+                int(self.state_budget.budget_bytes),
+            )
+            admitted = 1
+        return admitted
 
     def _next(self):
         generation_responses = []
@@ -2904,6 +3237,7 @@ class BatchGenerator:
             self.completion_batch_size - len(self._generation_batch),
             len(self._unprocessed_sequences),
         )
+        n = self._budget_admissible(n)
         if n > 0:
             self._prompt_batch.extend(self._make_batch(n))
 

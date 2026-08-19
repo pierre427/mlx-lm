@@ -16,6 +16,8 @@ from typing import Any
 
 import regex as re
 
+from ._schema import is_string_type
+
 tool_call_start = "<tool_call>"
 tool_call_end = "</tool_call>"
 
@@ -39,8 +41,8 @@ def _is_string_type(
         if func.get("name") != tool_name:
             continue
         params = func.get("parameters") or {}
-        arg_type = params.get("properties", {}).get(arg_name, {}).get("type")
-        return arg_type == "string"
+        schema = params.get("properties", {}).get(arg_name, {})
+        return is_string_type(schema)
     return False
 
 

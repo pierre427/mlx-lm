@@ -12,6 +12,8 @@ from typing import Any
 
 import regex as re
 
+from ._schema import is_string_type
+
 _func_name_regex = re.compile(r"^(.*?)<arg_key>", re.DOTALL)
 _func_arg_regex = re.compile(
     r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -34,7 +36,7 @@ def _get_string_arg_names(tool_name: str, tools: list[Any] | None) -> set[str]:
         return {
             name
             for name, schema in properties.items()
-            if schema.get("type") == "string"
+            if is_string_type(schema)
         }
     return set()
 
@@ -218,7 +220,7 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
             return fallback
         return dict(name="unknown", arguments={"raw": text.strip()})
 
-    func_name = match.group(1)
+    func_name = match.group(1).strip()
     string_args = _get_string_arg_names(func_name, tools)
     arg_dct = {}
     for match in _func_arg_regex.finditer(text):

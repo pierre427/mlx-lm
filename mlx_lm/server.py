@@ -43,7 +43,7 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -287,6 +287,170 @@ class TimeBudget:
         raise StopIteration()
 
 
+def _measure_kv_cost(model):
+    """Measure (raw_fixed_bytes, bytes_per_token, common_step_units) for one
+    sequence row of this model's cache.
+
+    Returns the RAW linear fit plus the validated COMMON allocation step of
+    all growing stepped leaves; step-aware (cohort-level) rounding is applied
+    by the admission layer, not here — returning padded values would double
+    count once the cohort projector rounds. Budgeting is refused when:
+    growing leaves disagree on step, a growing leaf lacks a usable step, a
+    composite cache cannot be recursed, or a rotating cache saturates inside
+    the probe range. A non-boundary verification (528 tokens) checks the
+    step-rounded projection covers observed bytes.
+    """
+    caches = make_prompt_cache(model)
+
+    def leaves(cs):
+        for c in cs:
+            inner = getattr(c, "caches", None)
+            if inner:
+                yield from leaves(inner)
+            elif hasattr(c, "nbytes"):
+                yield c
+            else:
+                raise ValueError(
+                    f"opaque cache component {type(c).__name__}: cannot "
+                    f"verify allocation growth, refusing byte budgeting"
+                )
+
+    def rotating_windows(cs):
+        for c in leaves(cs):
+            if isinstance(c, RotatingKVCache) and c.max_size is not None:
+                yield c.max_size
+
+    windows = list(rotating_windows(caches))
+    warm, probe = 256, 1024
+    verify_at = 528  # deliberately NOT a step boundary
+    third_at = 2048  # independent consistency point (step boundary)
+    if windows and max(warm + probe, verify_at, third_at) >= min(windows):
+        raise ValueError(
+            f"--state-budget-gb needs a linear-growth cache probe, but a "
+            f"rotating cache saturates at {min(windows)} tokens (inside the "
+            f"probe range). Byte budgeting is not supported for this "
+            f"model configuration."
+        )
+
+    def forward(cs, n, start):
+        toks = mx.array([[(start + i) % 100 + 1 for i in range(n)]])
+        model(toks, cache=cs)
+        mx.eval([c.state for c in cs])
+
+    leaf_list = list(leaves(caches))
+    forward(caches, warm, 0)
+    base_per_leaf = [c.nbytes for c in leaf_list]
+    forward(caches, probe, warm)
+    grown_per_leaf = [c.nbytes for c in leaf_list]
+
+    per_token = sum(g - b for g, b in zip(grown_per_leaf, base_per_leaf)) / probe
+    for c, b, g in zip(leaf_list, base_per_leaf, grown_per_leaf):
+        leaf_slope = (g - b) / probe
+        leaf_intercept = b - leaf_slope * warm
+        if leaf_intercept < -(0.01 * max(b, 1.0) + leaf_slope):
+            # Aggregate intercepts can cancel across leaves; a materially
+            # negative PER-LEAF intercept means that leaf's growth is not
+            # linear from zero
+            raise ValueError(
+                f"state-cost fit for leaf {type(c).__name__} has a "
+                f"materially negative intercept ({leaf_intercept:.0f} "
+                f"bytes); the cache does not fit fixed+linear growth, "
+                f"refusing byte budgeting"
+            )
+    raw_fixed = sum(base_per_leaf) - per_token * warm
+    if raw_fixed < -(0.01 * sum(base_per_leaf) + per_token):
+        # A materially negative intercept means the growth is not linear
+        # from zero (silently clamping would hide superlinear early growth)
+        raise ValueError(
+            f"state-cost fit has a materially negative intercept "
+            f"({raw_fixed:.0f} bytes); the cache does not fit "
+            f"fixed+linear growth, refusing byte budgeting"
+        )
+    raw_fixed = max(raw_fixed, 0.0)
+
+    # Validate ONE common allocation step across all growing leaves;
+    # fail closed on anything unverifiable (reviewer requirements).
+    steps = set()
+    for c, b, g in zip(leaf_list, base_per_leaf, grown_per_leaf):
+        if g > b:
+            step = getattr(c, "step", None)
+            if (
+                step is None
+                or isinstance(step, bool)
+                or not isinstance(step, int)
+                or step <= 0
+            ):
+                raise ValueError(
+                    f"growing cache leaf {type(c).__name__} has no usable "
+                    f"allocation step ({step!r}); refusing byte budgeting"
+                )
+            steps.add(step)
+    if len(steps) > 1:
+        raise ValueError(
+            f"growing cache leaves disagree on allocation step {sorted(steps)}; "
+            f"mixed-step budgeting is not supported"
+        )
+    common_step = steps.pop() if steps else 1
+
+    # Non-boundary verification: step-rounded projection must cover reality
+    vcaches = make_prompt_cache(model)
+    forward(vcaches, verify_at, 0)
+    observed = sum(c.nbytes for c in leaves(vcaches))
+    rounded_units = -(-verify_at // common_step) * common_step
+    projected = raw_fixed + per_token * rounded_units
+    if observed > projected:
+        raise ValueError(
+            f"state-cost safety check failed: observed {observed} bytes at "
+            f"{verify_at} tokens exceeds step-rounded projection "
+            f"{projected:.0f}; refusing byte budgeting"
+        )
+
+    # Independent higher point: the two-point fit is measured on
+    # [256, 1280]; a slope that changes past 1280 would still pass the
+    # 528 check. Verify PER LEAF at 2048 with a FRESH cache and a SINGLE
+    # aligned chunk: capacity after unaligned multi-chunk growth is
+    # previous_logical + round_up(chunk, step), which exceeds
+    # round_up(total) (root cause of the +16-token capacity observation
+    # on the earlier two-stage path) — a fresh aligned forward removes
+    # that term, so a consistent leaf predicts EXACTLY.
+    third_caches = make_prompt_cache(model)
+    forward(third_caches, third_at, 0)
+    vleaves = list(leaves(third_caches))
+    for c, b, g in zip(vleaves, base_per_leaf, grown_per_leaf):
+        leaf_slope = (g - b) / probe
+        predicted = b + leaf_slope * (third_at - warm)
+        observed_leaf = c.nbytes
+        # Single aligned chunk on a fresh cache: exact prediction expected;
+        # tolerance covers arithmetic error only
+        tolerance = max(1.0, 1e-6 * abs(predicted))
+        if abs(observed_leaf - predicted) > tolerance:
+            raise ValueError(
+                f"state-cost consistency check failed for leaf "
+                f"{type(c).__name__}: observed {observed_leaf} bytes at "
+                f"{third_at} tokens vs predicted {predicted:.0f} (fit "
+                f"measured on 256..1280); the cache does not grow "
+                f"linearly, refusing byte budgeting"
+            )
+    logging.info(
+        "state-cost third-point verification passed: %d leaves at %d "
+        "tokens, all within tolerance of the 256..1280 linear fit",
+        len(vleaves),
+        third_at,
+    )
+    logging.info(
+        "state-cost fit: per_token %.0f B, raw fixed %.0f B, common step %d "
+        "(leaves: %s); verified at %d tokens: observed %d <= projected %.0f",
+        per_token,
+        raw_fixed,
+        common_step,
+        sorted({type(c).__name__ for c in leaf_list}),
+        verify_at,
+        observed,
+        projected,
+    )
+    return raw_fixed, per_token, common_step
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -404,7 +568,36 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+_sampler_cache = {}
+
+
 def _make_sampler(args, tokenizer):
+    # Memoize on the sampling parameters so concurrent requests with identical
+    # settings share one sampler object. GenerationBatch groups rows by sampler
+    # identity, letting a whole batch sample in a single vectorized call.
+    xtc_special_tokens = (
+        tuple(tokenizer.eos_token_ids),
+        tuple(tokenizer.encode("\n")),
+    )
+    key = (
+        xtc_special_tokens,
+        args.sampling.temperature,
+        args.sampling.top_p,
+        args.sampling.top_k,
+        args.sampling.min_p,
+        args.sampling.xtc_probability,
+        args.sampling.xtc_threshold,
+    )
+    if key in _sampler_cache:
+        return _sampler_cache[key]
+    if len(_sampler_cache) > 64:
+        _sampler_cache.clear()
+    sampler = _uncached_make_sampler(args, tokenizer)
+    _sampler_cache[key] = sampler
+    return sampler
+
+
+def _uncached_make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
         top_p=args.sampling.top_p,
@@ -426,6 +619,35 @@ def _make_logits_processors(args):
         args.logits.frequency_penalty,
         args.logits.frequency_context_size,
     )
+
+
+def _segment_by_state(sm_state, text):
+    """Advance a ``TextStateMachine`` one character at a time so emitted text is
+    attributed to the state it was actually produced in, rather than to the
+    chunk's single final state.
+
+    A decoded token can merge body bytes with a control marker (e.g. a token
+    that decodes to ``"}</tool_call>"``). ``TextStateMachine.step`` returns the
+    whole chunk's emittable text plus one final-state label, so the ``"}"``
+    would be labelled ``normal`` and leak to content while going missing from
+    the tool text. Feeding the machine char by char preserves the same total
+    emittable text and buffer semantics, but splits it into per-state segments
+    and also surfaces state transitions that emit no text.
+
+    Returns ``(new_sm_state, segments)`` where ``segments`` is a list of
+    ``(emitted_text, state_name)``; a segment may carry empty text when it only
+    marks a transition (so callers can flush per-state buffers on the boundary).
+    """
+    segments = []
+    prev = sm_state[0]
+    for ch in text:
+        sm_state, emitted, cur = TextStateMachine.step(sm_state, ch)
+        if emitted or cur != prev:
+            segments.append((emitted, cur))
+        prev = cur
+        if sm_state[0] is None:
+            break
+    return sm_state, segments
 
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -788,13 +1010,40 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
-                    batch_generator = BatchGenerator(
-                        model,
-                        completion_batch_size=self.cli_args.decode_concurrency,
-                        prefill_batch_size=self.cli_args.prompt_concurrency,
-                        prefill_step_size=self.cli_args.prefill_step_size,
-                        stream=generation_stream,
-                    )
+                    try:
+                        kv_budget_bytes = None
+                        kv_cost = None
+                        if self.cli_args.state_budget_gb is not None:
+                            # INTERIM SAFETY DISABLE: shared batch caches
+                            # allocate every row at the cohort-max width, so
+                            # per-row linear projection can admit above
+                            # budget for heterogeneous cohorts (reviewer
+                            # P1). The flag refuses until cohort-aware
+                            # accounting lands; _measure_kv_cost stays
+                            # exercised by tests for the coming rework.
+                            raise ValueError(
+                                "--state-budget-gb is disabled: cohort-"
+                                "aware state accounting is not yet safe "
+                                "for shared batch caches (see "
+                                "batch_admission cohort_bytes work)"
+                            )
+                        batch_generator = BatchGenerator(
+                            model,
+                            completion_batch_size=self.cli_args.decode_concurrency,
+                            prefill_batch_size=self.cli_args.prompt_concurrency,
+                            prefill_step_size=self.cli_args.prefill_step_size,
+                            prefill_batch_window=self.cli_args.prompt_batch_window,
+                            kv_budget_bytes=kv_budget_bytes,
+                            kv_cost=kv_cost,
+                            stream=generation_stream,
+                        )
+                    except Exception as e:
+                        # Probe or constructor failure (rotating-cache
+                        # refusal, invalid budget, ...) must reach the
+                        # requester, not kill the generation thread.
+                        batch_generator = None
+                        rqueue.put(e)
+                        continue
                     unprocessed_requests.append((rqueue, request, args))
                     continue
 
@@ -1493,32 +1742,35 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Advance the text state machine to strip control sequences
+                # Advance the text state machine to strip control sequences.
+                # Attribute emitted text per state segment (a decoded token can
+                # merge body bytes with a marker, e.g. "}</tool_call>"), rather
+                # than routing the whole chunk by its single final state.
                 if gen.finish_reason == "stop":
-                    sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
+                    sm_state, _ = TextStateMachine.discard(sm_state)
+                    segments = []
                 elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
-                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
+                    sm_state, segments = _segment_by_state(sm_state, gen.text)
+                    sm_state, flushed, flush_state = TextStateMachine.flush(sm_state)
+                    if flushed:
+                        segments.append((flushed, flush_state))
                 else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    sm_state, segments = _segment_by_state(sm_state, gen.text)
+                current_state = sm_state[0]
 
-                # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
+                # Collect the clean text by state: reasoning, tool, or normal.
+                for seg_text, seg_state in segments:
+                    if seg_state == "reasoning":
+                        reasoning_text += seg_text
+                    elif seg_state == "tool":
+                        tool_text += seg_text
+                    elif seg_state == "normal":
+                        if prev_state == "tool":
+                            tool_calls.append(tool_text)
+                            tool_text = ""
+                            made_tool_call = True
+                        text += seg_text
+                    prev_state = seg_state
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1928,10 +2180,32 @@ def setup_arg_parser():
         help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
+        "--state-budget-gb",
+        type=float,
+        default=None,
+        help=(
+            "Cap projected model-state bytes (KV cache and recurrent/hybrid "
+            "state) across concurrent requests to this budget (GiB). The "
+            "per-model cost is measured with a short probe at load. The "
+            "budget should already account for weights and activation "
+            "headroom; no extra factor is applied. Default: off (admission "
+            "is count-based only)."
+        ),
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--prompt-batch-window",
+        type=int,
+        default=None,
+        help=(
+            "Maximum queued prompts considered for length-aware admission "
+            "(default: 1, preserves FIFO; try 4 times --prompt-concurrency)"
+        ),
     )
     parser.add_argument(
         "--prompt-cache-size",

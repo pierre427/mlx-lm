@@ -6,6 +6,8 @@ from typing import Any
 
 import regex as re
 
+from ._schema import is_string_type
+
 _func_name_regex = re.compile(r"^(.*?)<longcat_arg_key>", re.DOTALL)
 _func_arg_regex = re.compile(
     r"<longcat_arg_key>(.*?)</longcat_arg_key>(?:\\n|\s)*<longcat_arg_value>(.*?)</longcat_arg_value>",
@@ -29,8 +31,8 @@ def _is_string_type(
             params = func["parameters"]
             if params is None:
                 return False
-            arg_type = params.get("properties", {}).get(arg_name, {}).get("type", None)
-            return arg_type == "string"
+            schema = params.get("properties", {}).get(arg_name, {})
+            return is_string_type(schema)
     return False
 
 

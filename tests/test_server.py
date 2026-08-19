@@ -1,4 +1,4 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2024-2026 Apple Inc.
 
 import http
 import io
@@ -20,6 +20,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
+    _measure_kv_cost,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
 from mlx_lm.utils import load
@@ -44,6 +45,7 @@ class DummyModelProvider:
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
                 "draft_model": None,
+                "state_budget_gb": None,
                 "num_draft_tokens": 3,
                 "prompt_lookup_ngram": 0,
                 "prompt_lookup_tokens": 8,
@@ -57,6 +59,7 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
+                "prompt_batch_window": None,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -1064,6 +1067,339 @@ class TestLogitBiasValidation(unittest.TestCase):
         handler = self._handler(logit_bias={"5": 2, "7": -1.5, 9: 0.25})
         handler.validate_model_parameters()
         self.assertEqual(handler.logit_bias, {5: 2.0, 7: -1.5, 9: 0.25})
+
+
+class TestKVBudgetProbeFailure(unittest.TestCase):
+    def test_probe_failure_reaches_requester_and_thread_survives(self):
+        """A probe error must be delivered to the requesting queue, and the
+        generation thread must remain usable afterwards."""
+        from queue import Queue
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import mlx_lm.server as server_mod
+
+        provider = DummyModelProvider()
+        provider.cli_args.state_budget_gb = 1.0  # budget mode on → probe runs
+        provider.cli_args.decode_concurrency = 32
+        provider.cli_args.prompt_concurrency = 8
+        provider.cli_args.prefill_step_size = 2048
+
+        gen = ResponseGenerator(provider, LRUPromptCache())
+        try:
+
+            def request():
+                rqueue = Queue()
+                args = SimpleNamespace(
+                    model=SimpleNamespace(
+                        model="default_model", adapter=None, draft=None
+                    ),
+                    seed=None,
+                )
+                gen.requests.put((rqueue, {"prompt": "hello"}, args))
+                return rqueue
+
+            with patch.object(
+                server_mod,
+                "_measure_kv_cost",
+                side_effect=ValueError("probe refused"),
+            ):
+                result = request().get(timeout=30)
+                self.assertIsInstance(result, ValueError)
+
+                # Thread must still be alive and serving further requests
+                self.assertTrue(gen._generation_thread.is_alive())
+                second = request().get(timeout=30)
+                self.assertIsInstance(second, ValueError)
+        finally:
+            gen.stop_and_join()
+
+
+class _FakeLeaf:
+    """Synthetic stepped-capacity cache leaf for probe refusal tests."""
+
+    def __init__(self, slope, step=256, fixed=0):
+        self._slope = slope
+        self._fixed = fixed
+        self._tokens = 0
+        self.step = step
+        self.state = []
+
+    def grow(self, n):
+        self._tokens += n
+
+    @property
+    def nbytes(self):
+        if self._slope == 0:
+            return self._fixed
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        return self._fixed + int(self._slope * cap)
+
+
+class _FakeModel:
+    """Model stand-in: make_cache returns crafted leaves; forwards grow them."""
+
+    def __init__(self, leaf_specs):
+        # (slope, step, fixed) specs — make_cache mints FRESH leaves each
+        # call, matching real make_prompt_cache semantics
+        self._specs = leaf_specs
+
+    def make_cache(self):
+        out = []
+        for spec in self._specs:
+            if isinstance(spec, tuple):
+                leaf = _FakeLeaf(spec[0], step=spec[1], fixed=spec[2])
+            else:
+                leaf = spec  # pre-built object (opaque/step-less cases)
+            out.append(leaf)
+        return out
+
+    def __call__(self, toks, cache=None):
+        n = toks.shape[-1]
+
+        def grow(cs):
+            for c in cs:
+                inner = getattr(c, "caches", None)
+                if inner:
+                    grow(inner)
+                elif hasattr(c, "grow"):
+                    c.grow(n)
+
+        grow(cache)
+        return toks
+
+
+class TestMeasureKVCostRefusals(unittest.TestCase):
+    def test_growing_leaf_without_step_refused(self):
+        leaf = _FakeLeaf(slope=100.0)
+        leaf.step = None
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_FakeModel([leaf]))
+
+    def test_mixed_steps_refused(self):
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(
+                _FakeModel([_FakeLeaf(100.0, step=256), _FakeLeaf(100.0, step=128)])
+            )
+
+    def test_opaque_composite_refused(self):
+        class _Opaque:
+            state = []
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_FakeModel([_Opaque()]))
+
+    def test_consistent_stepped_fit_accepted(self):
+        """Per-leaf consistency: a well-behaved stepped linear cache yields
+        the raw slope, near-zero fixed, and the validated common step; the
+        internal 528-token verification passes."""
+        fixed, per_tok, step = _measure_kv_cost(
+            _FakeModel([(100.0, 256, 0), (50.0, 256, 0)])
+        )
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 150.0, delta=1.0)
+        self.assertLessEqual(fixed, per_tok * 2)
+
+    def test_fixed_only_leaf_adds_no_step_requirement(self):
+        """A fixed-size leaf (ArraysCache-like) alongside stepped growth is
+        fine; its bytes appear in fixed, not slope."""
+        fixed, per_tok, step = _measure_kv_cost(
+            _FakeModel([(100.0, 256, 0), (0, None, 5000)])
+        )
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 100.0, delta=1.0)
+        self.assertGreaterEqual(fixed, 5000 * 0.99)
+
+
+class _SlopeChangeLeaf(_FakeLeaf):
+    """Grows at slope until 1280 tokens, then twice as fast — must be
+    refused by the independent 2048 consistency check."""
+
+    @property
+    def nbytes(self):
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        if cap <= 1280:
+            return int(self._slope * cap)
+        return int(self._slope * 1280 + 2 * self._slope * (cap - 1280))
+
+
+class _FakeComposite:
+    """CacheList-like wrapper exposing .caches."""
+
+    def __init__(self, children):
+        self.caches = children
+        self.state = []
+
+
+class _CancellingLeaf(_FakeLeaf):
+    """Grows slower after 1280 — pairs with _SlopeChangeLeaf so aggregate
+    bytes match the linear fit while each leaf individually deviates."""
+
+    @property
+    def nbytes(self):
+        cap = self._tokens
+        if self.step:
+            cap = -(-cap // self.step) * self.step
+        if cap <= 1280:
+            return int(self._slope * cap)
+        return int(self._slope * 1280)  # stops growing entirely
+
+
+class TestMeasureKVCostConsistency(unittest.TestCase):
+    def test_two_leaf_cancellation_refused(self):
+        """Per-leaf verification: one leaf doubles and another stalls after
+        1280 so AGGREGATE 2048 bytes match the fit exactly — each leaf
+        individually deviates and must be refused."""
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _SlopeChangeLeaf(100.0, step=256),
+                    _CancellingLeaf(100.0, step=256),
+                ]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_negative_per_leaf_intercept_refused(self):
+        """A leaf whose growth is superlinear before the warm point has a
+        materially negative fitted intercept and must refuse — even when
+        another leaf's positive intercept cancels it in aggregate."""
+
+        class _LateStartLeaf(_FakeLeaf):
+            @property
+            def nbytes(self):
+                cap = self._tokens
+                if self.step:
+                    cap = -(-cap // self.step) * self.step
+                return int(self._slope * max(cap - 128, 0) * 1.5)
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _LateStartLeaf(100.0, step=256),
+                    _FakeLeaf(0, step=None, fixed=50_000),  # cancels aggregate
+                ]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_mild_late_growth_refused(self):
+        """Codex P1 regression: slope 100 through 1280 then 120 after —
+        only 7.5% underprojection at 2048 — must be refused (exact-boundary
+        predictions tolerate arithmetic error only, not mild drift)."""
+
+        class _MildLateLeaf(_FakeLeaf):
+            @property
+            def nbytes(self):
+                cap = self._tokens
+                if self.step:
+                    cap = -(-cap // self.step) * self.step
+                if cap <= 1280:
+                    return int(self._slope * cap)
+                return int(self._slope * 1280 + 1.2 * self._slope * (cap - 1280))
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [_MildLateLeaf(100.0, step=256)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_rotating_window_inside_third_point_refused(self):
+        """Codex P2 regression: a rotating window between 1280 and 2048
+        must refuse BEFORE probing (the third point would cross it)."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [RotatingKVCache(max_size=1536)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_slope_change_after_fit_range_refused(self):
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [_SlopeChangeLeaf(100.0, step=256)]
+
+        with self.assertRaises(ValueError):
+            _measure_kv_cost(_M([]))
+
+    def test_invalid_step_values_refused(self):
+        for bad in (True, 2.5, 0, -8):
+            leaf = _FakeLeaf(100.0)
+            leaf.step = bad
+            with self.assertRaises(ValueError):
+                _measure_kv_cost(_FakeModel([leaf]))
+
+    def test_nested_composite_recursed(self):
+        """Reviewer nested-CacheList positive case: a composite wrapping a
+        fixed leaf and a stepped growing child measures correctly through
+        recursion."""
+
+        class _M(_FakeModel):
+            def make_cache(self):
+                return [
+                    _FakeComposite(
+                        [
+                            _FakeLeaf(0, step=None, fixed=4000),
+                            _FakeLeaf(100.0, step=256),
+                        ]
+                    )
+                ]
+
+        fixed, per_tok, step = _measure_kv_cost(_M([]))
+        self.assertEqual(step, 256)
+        self.assertAlmostEqual(per_tok, 100.0, delta=1.0)
+        self.assertGreaterEqual(fixed, 4000 * 0.99)
+
+
+class TestMeasureKVCost(unittest.TestCase):
+    def test_measures_linear_cache(self):
+        model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        fixed, per_token, step = _measure_kv_cost(model)
+        self.assertGreater(per_token, 0)
+        self.assertEqual(step, 256)  # validated common KVCache step
+        # RAW fit: no slack folded in (rounding is the admission layer's
+        # job at cohort level — folding it here would double count)
+        self.assertLessEqual(fixed, per_token * 8)
+        # Cross-check against the analytic per-token KV size
+        cfg = model.args
+        expected = (
+            cfg.num_hidden_layers
+            * 2
+            * cfg.num_key_value_heads
+            * (cfg.hidden_size // cfg.num_attention_heads)
+            * 2  # bf16
+        )
+        self.assertAlmostEqual(per_token, expected, delta=expected * 0.01)
+
+    def test_safe_projection_covers_non_boundary_allocation(self):
+        """528-token regression (codex safety design): step-rounded live
+        bytes at a NON-boundary length must not exceed the safe projection.
+        This is the exact shape of the W3 smoke defect (projection admitted
+        more live cache than the budget)."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        fixed, per_token, step = _measure_kv_cost(model)
+
+        caches = make_prompt_cache(model)
+        toks = mx.array([[(i % 100) + 1 for i in range(528)]])
+        model(toks, cache=caches)
+        mx.eval([c.state for c in caches])
+        observed = sum(c.nbytes for c in caches)
+        rounded = -(-528 // step) * step
+        projected = fixed + per_token * rounded
+        self.assertLessEqual(observed, projected)
+        # And the UNROUNDED exact projection must be shown insufficient,
+        # proving step-rounding is load-bearing
+        self.assertGreater(observed, fixed + per_token * 528)
 
 
 if __name__ == "__main__":

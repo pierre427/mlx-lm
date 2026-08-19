@@ -1,11 +1,13 @@
-# Copyright © 2024 Apple Inc.
+# Copyright © 2024-2026 Apple Inc.
 
 import random
 import unittest
+from collections import deque
 from typing import List
 
 import mlx.core as mx
 
+from mlx_lm.batch_admission import LinearStateCost, StateBudget
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
@@ -467,6 +469,115 @@ class TestGenerate(unittest.TestCase):
                 )
                 break
 
+    def test_prefill_admission_groups_similar_chunk_lengths(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.model = None
+        gen.sampler = lambda x: x
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_size = 2
+        gen.prefill_batch_window = 4
+        gen.prompt_trim_rollback_tokens = 0
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+
+        def sequence(uid, length):
+            return (
+                uid,
+                [[0] * length, [1]],
+                1,
+                [],
+                [],
+                None,
+                [],
+                StopSequenceMatcher(),
+            )
+
+        gen._unprocessed_sequences = deque(
+            [
+                sequence(0, 100),
+                sequence(1, 2000),
+                sequence(2, 120),
+                sequence(3, 1900),
+            ]
+        )
+
+        batch = gen._make_batch(2)
+
+        self.assertEqual(batch.uids, [0, 2])
+        self.assertEqual([s[0] for s in gen._unprocessed_sequences], [1, 3])
+
+    def test_prefill_admission_always_selects_oldest_request(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 8
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            (uid, [[[0] * length, [1]]])
+            for uid, length in enumerate([2000, 10, 20, 30, 40, 50, 60, 70])
+        )
+
+        selected = gen._select_prefill_indices(3)
+
+        self.assertIn(0, selected)
+
+    def test_prefill_admission_accounts_for_active_prompt_batch(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 4
+        gen._currently_processing = [[[[0] * 1800, [1]], 0, 1801]]
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            [
+                (0, [[0] * 100, [1]]),
+                (1, [[0] * 1700, [1]]),
+                (2, [[0] * 120, [1]]),
+                (3, [[0] * 1600, [1]]),
+            ]
+        )
+
+        selected = gen._select_prefill_indices(2)
+
+        self.assertEqual(selected, [0, 1])
+
+    def test_prefill_admission_window_one_preserves_fifo(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.prefill_step_size = 2048
+        gen.prefill_batch_window = 1
+        gen._currently_processing = []
+        gen._old_wired_limit = None
+        gen._unprocessed_sequences = deque(
+            [
+                (0, [[0] * 100, [1]]),
+                (1, [[0] * 2000, [1]]),
+                (2, [[0] * 120, [1]]),
+                (3, [[0] * 1900, [1]]),
+            ]
+        )
+
+        selected = gen._select_prefill_indices(2)
+
+        self.assertEqual(selected, [0, 1])
+
+    def test_prefill_admission_defaults_to_fifo(self):
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prefill_batch_size=2,
+        )
+        prompts = [
+            [0] * 100,
+            [0] * 2000,
+            [0] * 120,
+            [0] * 1900,
+        ]
+        uids = gen.insert(prompts)
+
+        batch = gen._make_batch(2)
+
+        self.assertEqual(batch.uids, uids[:2])
+        gen.close()
+
     def test_batch_unique_max_toks(self):
         prompts = [
             "Write a story about Einstein",
@@ -687,6 +798,37 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
 
+    def test_batch_presence_penalty_sees_immediately_previous_sample(self):
+        """Exercise the real two-step pump, including its one-token lookahead.
+
+        The first token is forced to ``preferred``. On the very next sampling
+        step, presence penalty must already see it and select ``alternate``.
+        Reading only the externally emitted token list would be one token stale
+        at that point.
+        """
+        prompt = self.tokenizer.encode("hello")
+        preferred = self.tokenizer.vocab_size - 1
+        alternate = preferred - 1
+        self.assertNotIn(preferred, prompt)
+        self.assertNotIn(alternate, prompt)
+        processors = make_logits_processors(
+            {preferred: 2000.0, alternate: 1999.0},
+            presence_penalty=10.0,
+            presence_context_size=64,
+        )
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=2,
+            logits_processors=processors,
+        )
+        batch_gen.insert([prompt])
+
+        first = batch_gen.next_generated()[0]
+        second = batch_gen.next_generated()[0]
+
+        self.assertEqual(first.token, preferred)
+        self.assertEqual(second.token, alternate)
+
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
         logit_bias = {0: 2000.0, 1: -2000.0}
@@ -735,6 +877,786 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid0].token, 1)
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
+
+    def test_batch_shared_sampler_matches_fallback(self):
+        """Rows sharing one sampler object must match the fallback path."""
+        from mlx_lm.sample_utils import make_sampler
+
+        prompt = self.tokenizer.encode("hello world")
+        shared = make_sampler(temp=0.7, top_p=0.9)
+
+        mx.random.seed(11)
+        gen_a = BatchGenerator(self.model, max_tokens=16, sampler=shared)
+        uids_a = gen_a.insert([prompt] * 4)
+        tokens_a = {u: [] for u in uids_a}
+        done = set()
+        while len(done) < len(uids_a):
+            for r in gen_a.next_generated():
+                tokens_a[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+        del gen_a
+
+        mx.random.seed(11)
+        gen_b = BatchGenerator(self.model, max_tokens=16)
+        uids_b = gen_b.insert([prompt] * 4, samplers=[shared] * 4)
+        tokens_b = {u: [] for u in uids_b}
+        done = set()
+        while len(done) < len(uids_b):
+            for r in gen_b.next_generated():
+                tokens_b[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+        del gen_b
+
+        for ua, ub in zip(uids_a, uids_b):
+            self.assertEqual(tokens_a[ua], tokens_b[ub])
+
+    def test_batch_shared_stateful_sampler_keeps_per_row_calls(self):
+        """An unmarked stateful callable must be called once per row."""
+        calls = []
+
+        def stateful(logprobs):
+            calls.append(logprobs.shape[0])
+            return mx.array([len(calls)])
+
+        prompt = self.tokenizer.encode("hello")
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        uids = batch_gen.insert([prompt] * 3, samplers=[stateful] * 3)
+        responses = {r.uid: r for r in batch_gen.next_generated()}
+        # One call per row per step, each on a single row
+        self.assertTrue(all(width == 1 for width in calls))
+        tokens = [responses[uid].token for uid in uids]
+        self.assertEqual(len(set(tokens)), 3)
+        del batch_gen
+
+    def test_xtc_sampler_not_batch_groupable(self):
+        """XTC's scalar random gate must not be shared across rows."""
+        from mlx_lm.sample_utils import make_sampler
+
+        with_xtc = make_sampler(
+            temp=0.7, xtc_probability=0.5, xtc_threshold=0.1, xtc_special_tokens=[0]
+        )
+        without = make_sampler(temp=0.7, top_p=0.9)
+        self.assertFalse(getattr(with_xtc, "batch_groupable", False))
+        self.assertTrue(getattr(without, "batch_groupable", False))
+
+    def test_batch_shared_nonvectorizing_sampler(self):
+        """A shared sampler that always returns one token still works per-row."""
+        prompt = self.tokenizer.encode("hello")
+        constant = lambda _: mx.array([5])
+
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        uids = batch_gen.insert([prompt] * 3, samplers=[constant] * 3)
+        responses = {r.uid: r for r in batch_gen.next_generated()}
+        for uid in uids:
+            self.assertEqual(responses[uid].token, 5)
+        del batch_gen
+
+    def test_kv_budget_none_is_current_behavior(self):
+        """kv_budget_bytes=None must leave admission purely count-based."""
+        gen = BatchGenerator(self.model, max_tokens=4)
+        self.assertIsNone(gen.kv_budget_bytes)
+        # _budget_admissible must be the identity when budgeting is off
+        self.assertEqual(gen._budget_admissible(5), 5)
+
+    def test_batch_generator_rejects_peak_only_state_policy(self):
+        """AR engine cannot infer resident state for a peak-only projector."""
+
+        def quadratic_prefill_state(state):
+            return 100 * state.projected_units**2
+
+        with self.assertRaisesRegex(ValueError, "requires LinearStateCost"):
+            BatchGenerator(
+                self.model,
+                max_tokens=0,
+                state_budget=StateBudget(6_000, quadratic_prefill_state),
+            )
+
+        class _NonlinearSubclass(LinearStateCost):
+            def __call__(self, state):
+                return quadratic_prefill_state(state)
+
+        with self.assertRaisesRegex(ValueError, "requires LinearStateCost"):
+            BatchGenerator(
+                self.model,
+                state_budget=StateBudget(6_000, _NonlinearSubclass(0, 1)),
+            )
+
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                kv_budget_bytes=1_000,
+                kv_cost=(0, 1),
+                state_budget=StateBudget(1_000, quadratic_prefill_state),
+            )
+
+    def test_kv_budget_requires_kv_cost(self):
+        with self.assertRaises(ValueError):
+            BatchGenerator(self.model, kv_budget_bytes=1 << 30)
+
+    def test_kv_budget_limits_admission(self):
+        """Only as many rows admit as the projected bytes allow."""
+        prompt = self.tokenizer.encode("hello world")
+        per_tok = 1000.0
+        # Each row projects to ~(len(prompt)+4)*1000 bytes; budget fits 2 rows
+        row = (len(prompt) + 4) * per_tok
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(2.5 * row),
+            kv_cost=(0.0, per_tok, 1),
+        )
+        gen.insert([prompt] * 4)
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_kv_budget_counts_fixed_row_state(self):
+        """Hybrid-style fixed per-row bytes gate admission too."""
+        prompt = self.tokenizer.encode("hello")
+        fixed = 10_000.0
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            kv_budget_bytes=int(2.5 * fixed),
+            kv_cost=(fixed, 0.0, 1),
+        )
+        gen.insert([prompt] * 4)
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_kv_budget_caps_projection_at_max_kv_size(self):
+        """max_kv_size bounds the projected per-row growth."""
+        prompt = self.tokenizer.encode("hello world " * 20)
+        per_tok = 1000.0
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=10_000,
+            max_kv_size=8,
+            kv_budget_bytes=int(2.5 * 8 * per_tok),
+            kv_cost=(0.0, per_tok, 1),
+        )
+        gen.insert([prompt] * 4)
+        # Uncapped projection would admit 0; capped admits 2
+        self.assertEqual(gen._budget_admissible(4), 2)
+
+    def test_state_budget_caps_active_continued_history(self):
+        """A primed prefill row's capped growth starts after its history."""
+
+        class _FakeCache:
+            nbytes = 10_000
+
+        class _StubPromptBatch:
+            uids = [123]
+            max_tokens = [0]
+            prompt_cache = [_FakeCache()]
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            max_kv_size=16,
+            kv_budget_bytes=17_000,
+            kv_cost=(0.0, 1_000.0, 1),
+        )
+        gen._prompt_batch = _StubPromptBatch()
+        # 10 cached history + 10 new prompt tokens, none processed yet.
+        # Only 6 more token slots can materialize before the size-16 cap.
+        gen._currently_processing = [[[list(range(10))], 0, 10, False, 10]]
+        gen.insert([[1]])
+        # Global-cohort semantics: the active row's final extent caps at
+        # max_kv_size=16 (its 10 history + 10 new would exceed it), and the
+        # 1-unit candidate shares the cohort width: 2 rows x capped-16 x
+        # 1000 = 32K. The cap is what keeps this finite — uncapped it
+        # would be 2 x 20 x 1000 = 40K.
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 32_000
+        self.assertEqual(gen._budget_admissible(1), 1)
+
+    def test_kv_budget_oversized_single_request_liveness(self):
+        """A request alone over budget still admits when nothing is active."""
+        prompt = self.tokenizer.encode("hello world " * 50)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=64,
+            kv_budget_bytes=10,  # absurdly small
+            kv_cost=(0.0, 1000.0, 1),
+        )
+        gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 1)
+
+    def test_kv_budget_continued_generation_full_projection(self):
+        """A primed row still costs its full final length minus existing
+        bytes; history tokens are part of the projection (codex repro:
+        26KB projection must NOT fit a 20KB budget when a row is active)."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:
+            """Minimal active-batch stand-in: one row, no remaining growth."""
+
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        prompt = list(range(11))  # 11 new tokens
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=5,
+            kv_budget_bytes=20_000,
+            kv_cost=(0.0, 1000.0, 1),
+        )
+        gen.insert(
+            [prompt],
+            caches=[[_FakeCache(10_000)]],
+            all_tokens=[list(range(10))],  # 10 history tokens in the cache
+        )
+        gen._generation_batch = _StubGenBatch()
+        # Full projection = (10 + 11 + 5) * 1000 = 26000; credit 10000 →
+        # need 16000; committed already holds the 10000 live bytes →
+        # 26000 > 20000 must reject, and liveness must NOT fire (row active).
+        self.assertEqual(gen._budget_admissible(1), 0)
+
+    def test_kv_budget_no_credit_without_history(self):
+        """Cache bytes with no all_tokens history grant no byte credit."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        prompt = list(range(10))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=18_000,
+            kv_cost=(0.0, 1000.0, 1),
+        )
+        gen.insert([prompt], caches=[[_FakeCache(9_000)]])
+        gen._generation_batch = _StubGenBatch()  # suppress liveness escape
+        # Global cohort: stub (5-unit done row) and the 10-unit candidate
+        # share one allocation at the cohort-max width: 2 x 10 x 1000 =
+        # 20000. The candidate's 9000 unverifiable supplied-cache bytes
+        # are ADDED on top (never credited, never absorbed by the live
+        # floor): committed = 29000. 18000 rejects; 29000 admits.
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 29_000
+        self.assertEqual(gen._budget_admissible(1), 1)
+
+    def test_kv_budget_remove_releases_headroom(self):
+        """H4: removing a queued row frees its committed bytes (mixed
+        cached/uncached queue)."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        expensive = list(range(10))
+        cheap = list(range(2))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=13_000,
+            kv_cost=(0.0, 1000.0, 1),
+        )
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1] * 5]
+            max_tokens = [5]
+            _num_tokens = [5]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        (uid_primed,) = gen.insert(
+            [expensive],
+            caches=[[_FakeCache(10_000)]],
+            all_tokens=[list(range(10))],
+        )
+        gen.insert([cheap, cheap])
+        # Suppress the liveness escape: pretend one row is generating
+        empty_gen_batch = gen._generation_batch
+        gen._generation_batch = _StubGenBatch()
+        # Primed row projects 20 units x 1000 shared with the stub →
+        # merge 2 x 20000 = 40000 >> 13000: rejected (its 10000 live
+        # bytes also appear in floors, never as credit)
+        self.assertEqual(gen._budget_admissible(3), 0)
+        gen.remove([uid_primed])
+        gen._generation_batch = empty_gen_batch
+        # Primed row's live bytes and width are gone entirely: the two
+        # cheap rows share a 2-unit width: 2 x 2000 = 4000 <= 13000
+        self.assertEqual(gen._budget_admissible(2), 2)
+
+    def test_kv_budget_rejects_nonfinite(self):
+        for bad_budget, bad_cost in (
+            (float("inf"), (0.0, 1.0)),
+            (1 << 30, (float("nan"), 1.0)),
+            (1 << 30, (0.0, float("inf"))),
+        ):
+            with self.assertRaises(ValueError):
+                BatchGenerator(
+                    self.model,
+                    kv_budget_bytes=bad_budget,
+                    kv_cost=bad_cost,
+                )
+
+    def test_budget_requires_allocation_step(self):
+        """Fail closed: growing state without a validated step is rejected
+        at construction — both the kv_cost 2-tuple path and a direct
+        LinearStateCost without allocation geometry."""
+        from mlx_lm.batch_admission import LinearStateCost, StateBudget
+
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                kv_budget_bytes=1 << 30,
+                kv_cost=(0.0, 1000.0),  # 2-tuple: no step
+            )
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                kv_budget_bytes=1 << 30,
+                kv_cost=(0.0, 1000.0, None),  # 3-tuple None-step bypass
+            )
+        with self.assertRaises(ValueError):
+            BatchGenerator(
+                self.model,
+                state_budget=StateBudget(
+                    1 << 30, LinearStateCost(0.0, 1000.0)  # growing, no step
+                ),
+            )
+        # Fixed-only state may omit the step
+        gen = BatchGenerator(
+            self.model,
+            state_budget=StateBudget(1 << 30, LinearStateCost(1000.0, 0.0)),
+        )
+        self.assertIsNotNone(gen.state_budget)
+        del gen
+
+    def test_unselected_resident_caches_add_not_max(self):
+        """Reviewer P1 regression: resident bytes of still-unselected queued
+        rows are simultaneous with projected growth of the selected prefix —
+        they must ADD to committed, never fold into a max. Exact repro:
+        budget 1000; selected uncached 1-unit row projects 256 (stepped);
+        unselected queued supplied cache holds 900 resident bytes;
+        max(256, 900) = 900 would wrongly admit; 256 + 900 = 1156 must
+        reject."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:  # suppress liveness escape
+            uids = [999]
+            tokens = [[1]]
+            max_tokens = [1]
+            _num_tokens = [1]
+            prompt_cache = []
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=1_300,  # stub projects 256 too: see arithmetic
+            kv_cost=(0.0, 1.0, 256),
+        )
+        gen.insert([[1]])  # selected: 1 unit -> stepped 256 bytes
+        gen.insert([[1]], caches=[[_FakeCache(900)]])  # unselected resident
+        gen._generation_batch = _StubGenBatch()
+        # cohort(selected+stub) = 2 rows x 256 = 512; + unselected 900
+        # = 1412 > 1300 must reject. A max() formulation would compute
+        # max(512, 900) = 900 <= 1300 and wrongly admit.
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 1_500
+        self.assertEqual(gen._budget_admissible(1), 1)
+        del gen
+
+    def test_live_floor_never_absorbs_unverified_bytes(self):
+        """Codex order-of-operations regression: the live floor applies to
+        the base projection only. Active admitted live 1000, base global
+        projection below 1000, selected unverified cache 900: committed
+        must be at least 1900 — max(base + 900, 1000) would lose the
+        unverified charge into the floor."""
+
+        class _FakeCache:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+
+        class _StubGenBatch:
+            uids = [999]
+            tokens = [[1]]
+            max_tokens = [1]
+            _num_tokens = [1]
+            prompt_cache = [_FakeCache(1000)]  # admitted live = 1000
+
+            def __len__(self):
+                return 1
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=0,
+            kv_budget_bytes=1_800,
+            kv_cost=(0.0, 1.0, 1),
+        )
+        # Selected candidate: 1 unit projected (base cohort tiny), with a
+        # 900-byte unverifiable supplied cache (no history)
+        gen.insert([[1]], caches=[[_FakeCache(900)]])
+        gen._generation_batch = _StubGenBatch()
+        state = gen._candidate_admission_state(gen._unprocessed_sequences[0])
+        committed = gen._cohort_committed([state])
+        self.assertGreaterEqual(committed, 1_900)
+        # And the budget decision agrees: 1800 rejects, 1900 admits
+        self.assertEqual(gen._budget_admissible(1), 0)
+        gen.kv_budget_bytes = 1_900
+        self.assertEqual(gen._budget_admissible(1), 1)
+        del gen
+
+    def test_w3_shape_active_cache_never_exceeds_budget(self):
+        """Reviewer test 2 — the exact W3 smoke shape as a regression:
+        0.5 GiB budget, eight 512-prompt/16-gen rows, REAL measured cost.
+        The live admitted cache must never exceed the budget at any
+        scheduler step (the original defect admitted 0.70 GB into 0.5 GiB).
+        """
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        budget = int(0.5 * (1 << 30))
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=16,
+            prefill_batch_size=8,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        uids = gen.insert([prompt] * 8)
+        done = set()
+        max_live = 0
+        for _ in range(400):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            max_live = max(max_live, live)
+            self.assertLessEqual(live, budget)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
+        self.assertGreater(max_live, 0)
+        del gen
+
+    def test_heterogeneous_cohort_projection_covers_actual(self):
+        """Reviewer test 5 — widely different prompt lengths and unequal
+        max_tokens: the committed projection at admission must cover the
+        ACTUAL merged BatchKVCache bytes reached during processing."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,  # generous: measuring, not gating
+            kv_cost=(fixed, per_tok, step),
+        )
+        short = [(i % 100) + 1 for i in range(8)]
+        longer = [(i % 100) + 1 for i in range(300)]
+        uids = gen.insert([short, longer], max_tokens=[4, 40])
+        states = [
+            gen._candidate_admission_state(seq) for seq in gen._unprocessed_sequences
+        ]
+        projected = gen._cohort_committed(states)
+        done = set()
+        max_live = 0
+        for _ in range(200):
+            _, responses = gen.next()
+            max_live = max(max_live, gen.prompt_cache_nbytes)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
+        self.assertGreaterEqual(projected, max_live)
+        del gen
+
+    def test_continued_and_removal_at_capacity_boundary(self):
+        """Reviewer test 6 — continued generation crossing an allocation
+        boundary, then removal: projection covers actual across the
+        boundary, and removing a row releases real headroom."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,
+            kv_cost=(fixed, per_tok, step),
+        )
+        # Prompt just below the boundary; generation crosses it
+        prompt = [(i % 100) + 1 for i in range(step - 4)]
+        uid_a, uid_b = gen.insert([prompt, prompt], max_tokens=[12, 12])
+        crossed = False
+        done = set()
+        for _ in range(200):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            projected = gen._cohort_committed(states)
+            self.assertGreaterEqual(projected, live)
+            if live > 2 * (step - 4) * per_tok:
+                crossed = True  # allocation stepped past the boundary
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == 2:
+                break
+        self.assertTrue(crossed)
+        before = gen.prompt_cache_nbytes
+        # rows completed -> removed by the engine; live must have released
+        self.assertLessEqual(before, 2 * per_tok * step)
+        del gen
+
+    def test_removal_transition_rejects_then_admits(self):
+        """Reviewer test 6 strengthened (codex): a REAL transition — the
+        same candidate is REJECTED while an admitted row holds the budget,
+        and ADMITTED after that row completes and is removed, under one
+        unchanged budget."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        # Budget fits ONE 512+8 row (envelope 520+step-1=775 units) plus
+        # margin, but
+        # not two such rows.
+        one_row = fixed + per_tok * (520 + step - 1)  # envelope: final+step-1
+        budget = int(1.5 * one_row)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=8,
+            prefill_batch_size=4,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        (uid_a,) = gen.insert([prompt])
+        # Drive A into the engine (admitted via liveness-free path: it fits)
+        for _ in range(4):
+            gen.next()
+        # B arrives while A is active: two rows cannot fit -> rejected
+        (uid_b,) = gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 0)
+        # Withdraw B (else the engine would auto-admit it the moment A
+        # frees capacity, inside the same next() call), then run A out.
+        gen.remove([uid_b])
+        done = set()
+        for _ in range(200):
+            _, responses = gen.next()
+            for r in responses:
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if uid_a in done:
+                break
+        self.assertIn(uid_a, done)
+        # Same budget, identical fresh candidate: now admissible
+        gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 1)
+        del gen
+
+    def test_rejected_candidate_auto_admits_after_removal(self):
+        """Codex variant of the removal transition: the queued candidate is
+        NOT withdrawn — the engine must auto-admit it in the very step
+        where the blocking row finishes, under one unchanged budget, with
+        live state within budget throughout."""
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        one_row = fixed + per_tok * (520 + step - 1)  # envelope: final+step-1
+        budget = int(1.5 * one_row)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=8,
+            prefill_batch_size=4,
+            kv_budget_bytes=budget,
+            kv_cost=(fixed, per_tok, step),
+        )
+        prompt = [(i % 100) + 1 for i in range(512)]
+        (uid_a,) = gen.insert([prompt])
+        for _ in range(4):
+            gen.next()
+        (uid_b,) = gen.insert([prompt])
+        self.assertEqual(gen._budget_admissible(1), 0)  # rejected while A holds
+        a_done = b_done = False
+        for _ in range(400):
+            _, responses = gen.next()
+            self.assertLessEqual(gen.prompt_cache_nbytes, budget)
+            for r in responses:
+                if r.finish_reason is not None and r.uid == uid_a:
+                    a_done = True
+                if r.finish_reason is not None and r.uid == uid_b:
+                    b_done = True
+            if a_done and not b_done:
+                # B must have left the queue (auto-admitted) once A freed it
+                queued_uids = {s[0] for s in gen._unprocessed_sequences}
+                self.assertNotIn(uid_b, queued_uids)
+            if b_done:
+                break
+        self.assertTrue(a_done)
+        self.assertTrue(b_done)
+        del gen
+
+    def test_continued_caches_merge_filter_and_boundary(self):
+        """Codex-prescribed continued-cache coverage: two individually
+        primed caches (real forwards of step-4 tokens) inserted as
+        one-token continuations with matching all_tokens and unequal
+        max_tokens [1, 12]. The short row finishes while the long one
+        remains — live bytes must drop across that exact next() — and the
+        long row crosses the allocation boundary and completes. Exercises
+        _merge_caches of supplied history, continued generation,
+        filtering, and boundary growth in one reachable path."""
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        history_len = step - 4
+
+        def primed_cache():
+            caches = make_prompt_cache(self.model)
+            toks = mx.array([[(i % 100) + 1 for i in range(history_len)]])
+            self.model(toks, cache=caches)
+            mx.eval([c.state for c in caches])
+            return caches
+
+        history_tokens = [(i % 100) + 1 for i in range(history_len)]
+        gen = BatchGenerator(
+            self.model,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,  # generous: behavior, not gating
+            kv_cost=(fixed, per_tok, step),
+        )
+        uid_short, uid_long = gen.insert(
+            [[1], [1]],  # one-token continuations
+            max_tokens=[1, 12],
+            caches=[primed_cache(), primed_cache()],
+            all_tokens=[list(history_tokens), list(history_tokens)],
+        )
+        done = {}
+        live_before_finish = live_after_finish = None
+        prev_live = None
+        crossed = False
+        for _ in range(200):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            self.assertGreaterEqual(gen._cohort_committed(states), live)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done[r.uid] = True
+                    if r.uid == uid_short and uid_long not in done:
+                        live_before_finish = prev_live
+                        live_after_finish = live
+            if live > 2 * history_len * per_tok + fixed:
+                crossed = True  # boundary growth materialized
+            prev_live = live
+            if len(done) == 2:
+                break
+        self.assertIn(uid_short, done)
+        self.assertIn(uid_long, done)
+        # The short row finished first and its removal dropped live bytes
+        self.assertIsNotNone(live_before_finish)
+        self.assertLess(live_after_finish, live_before_finish)
+        self.assertTrue(crossed)
+        del gen
+
+    def test_unaligned_continuation_capacity_covered(self):
+        """Codex chunk-alignment regression: a real cache primed with 252
+        tokens then continued grows capacity to previous_logical +
+        round_up(chunk) — up to 508 units for 253 logical tokens. The
+        projection must cover that ACTUAL capacity, not round_up(logical).
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.server import _measure_kv_cost
+
+        fixed, per_tok, step = _measure_kv_cost(self.model)
+        caches = make_prompt_cache(self.model)
+        toks = mx.array([[(i % 100) + 1 for i in range(252)]])
+        self.model(toks, cache=caches)
+        mx.eval([c.state for c in caches])
+        history = [(i % 100) + 1 for i in range(252)]
+
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            prefill_batch_size=4,
+            kv_budget_bytes=1 << 33,
+            kv_cost=(fixed, per_tok, step),
+        )
+        (uid,) = gen.insert([[1]], caches=[caches], all_tokens=[history])
+        done = False
+        for _ in range(100):
+            _, responses = gen.next()
+            live = gen.prompt_cache_nbytes
+            states = [
+                gen._candidate_admission_state(seq)
+                for seq in gen._unprocessed_sequences
+            ]
+            self.assertGreaterEqual(gen._cohort_committed(states), live)
+            for r in responses:
+                if r.finish_reason is not None:
+                    done = True
+            if done:
+                break
+        self.assertTrue(done)
+        del gen
+
+    def test_kv_budget_e2e_generation_completes(self):
+        """Budgeted end-to-end run finishes all requests (queued, not lost)."""
+        prompt = self.tokenizer.encode("hello world")
+        per_tok = 1000.0
+        row = (len(prompt) + 4) * per_tok
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            # Generous REAL-scale budget: stale-width floors read actual
+            # cache nbytes (~114 KB/token on this model), so the budget
+            # must be sized to reality, not the synthetic per-token cost
+            kv_budget_bytes=int(100e6),
+            kv_cost=(0.0, per_tok, 1),
+        )
+        uids = gen.insert([prompt] * 4)
+        done = set()
+        for _ in range(200):
+            for r in gen.next_generated():
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+            if len(done) == len(uids):
+                break
+        self.assertEqual(len(done), len(uids))
 
     def test_batch_generate_with_stop_matchers(self):
         """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""

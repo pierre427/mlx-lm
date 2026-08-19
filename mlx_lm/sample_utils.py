@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import math
 from collections import Counter
@@ -44,7 +44,9 @@ def make_sampler(
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        argmax_sampler = lambda x: mx.argmax(x, axis=-1)
+        argmax_sampler.batch_groupable = True
+        return argmax_sampler
 
     # Create sampler chain
     sampling_methods = []
@@ -66,10 +68,21 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
-    # ``mx.random.state`` is thread-local, so a sampler compiled
-    # on the main thread (at import time) would ignore reseeding
-    # on another thread
-    return mx.compile(sampler, inputs=mx.random.state, outputs=mx.random.state)
+    # ``mx.random.state`` is thread-local, so a sampler compiled on the main
+    # thread (at import time) would ignore reseeding on another thread — compile
+    # here, per make_sampler call, so it binds the calling thread's state.
+    compiled = mx.compile(sampler, inputs=mx.random.state, outputs=mx.random.state)
+
+    # Every component above transforms each row independently, except XTC:
+    # its scalar random gate would be shared across rows if the sampler were
+    # applied to several rows in one call, correlating requests. mx.compile
+    # returns an mlx.gc_func that can't carry attributes, so a thin wrapper
+    # preserves the batch_groupable flag the batched sampler path reads.
+    def sampler(logprobs):
+        return compiled(logprobs)
+
+    sampler.batch_groupable = xtc_probability <= 0.0
+    return sampler
 
 
 def make_logits_processors(
@@ -402,6 +415,7 @@ def make_reasoning_budget(
     max_think_tokens: int,
     *,
     think_open: Optional[int] = None,
+    reasoning_exit_ids=None,
     tokenizer=None,
     check_every: int = 16,
     max_cycle: int = 80,
@@ -432,7 +446,15 @@ def make_reasoning_budget(
             channel before the close is forced.
         think_open (int, optional): Token id that opens the channel. If
             ``None``, generation is assumed to start inside the channel (as
-            with templates that open it for the model). Default: ``None``.
+            with templates that open it for the model). Re-arming a *second*
+            channel needs the open id: when given it is used directly; when
+            ``None`` a default uag/Qwen3.5 ``<think>`` id re-arms. Default:
+            ``None``.
+        reasoning_exit_ids (iterable[int], optional): Alternate markers that
+            leave the reasoning channel for guarding purposes WITHOUT forcing
+            ``think_close`` — e.g. the tool-call-start marker, so a trip can
+            never inject ``</think>`` into a tool body. If ``None``, defaults to
+            the uag/Qwen3.5 ``<tool_call>`` id. Default: ``None``.
         tokenizer (optional): If given, enables the decode-based line-repetition
             detector. Only its ``decode`` method is used. Default: ``None``.
         check_every (int): How often (in channel tokens) to run the loop
@@ -447,6 +469,22 @@ def make_reasoning_budget(
     """
     if max_think_tokens <= 0:
         raise ValueError(f"max_think_tokens must be positive, got {max_think_tokens}")
+
+    # Re-arm and alternate-exit markers. ``reopen_id`` is the open marker that
+    # re-arms a *second* channel: an explicit ``think_open`` wins, else a
+    # default uag/Qwen3.5 ``<think>`` id (so re-arm still works when generation
+    # started pre-opened). ``exit_ids`` are markers that leave the channel
+    # WITHOUT forcing ``think_close`` — default the ``<tool_call>`` id, so a
+    # trip never injects ``</think>`` mid-tool. A model with different ids
+    # passes them explicitly (a one-line server-wiring follow-up).
+    DEFAULT_THINK_OPEN = 248068       # <think>
+    DEFAULT_TOOL_CALL_START = 248058  # <tool_call>
+    reopen_id = think_open if think_open is not None else DEFAULT_THINK_OPEN
+    exit_ids = (
+        frozenset(reasoning_exit_ids)
+        if reasoning_exit_ids is not None
+        else frozenset({DEFAULT_TOOL_CALL_START})
+    )
 
     # How many trailing overlap tokens to re-verify per call. Speculative
     # decoders rewind `prev_tokens` between calls when draft tokens are
@@ -470,11 +508,17 @@ def make_reasoning_budget(
         state["since_check"] = 0
 
     def _consume(tid):
-        if tid == think_close:
+        if tid == think_close or tid in exit_ids:
+            # ``think_close`` (</think>) or an alternate reasoning-exit marker
+            # (e.g. <tool_call>) leaves the guarded channel. Exiting on a
+            # tool-call-start stops counting the tool body, so a trip can never
+            # force </think> mid-tool (M3). No </think> is injected here.
             state["in_think"] = False
             state["ids"] = []
             state["since_check"] = 0
-        elif think_open is not None and tid == think_open:
+        elif tid == reopen_id:
+            # A fresh reasoning-open marker re-arms the channel so a *second*
+            # <think> is budgeted too, instead of running unguarded (M2b).
             state["in_think"] = True
             state["ids"] = []
             state["since_check"] = 0

@@ -57,6 +57,7 @@ from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
 from .prompt_lookup import plan_proposal_around_verify_cliff
+from .speculation_router import RoutedSpeculationPolicy
 
 _GREEDY = make_sampler(temp=0.0)
 
@@ -238,6 +239,10 @@ class HybridStats(_PromptLookupStatsBase):
     rate_gate_delatched: bool = False
     rate_gate_spec_ms_per_tok: float = 0.0
     rate_gate_plain_ms_per_tok: float = 0.0
+    router_plain_cycles: int = 0
+    router_reengagements: int = 0
+    router_last_num_draft: int = 0
+    router_accept_prob: float = 0.0
 
     @property
     def total_emitted(self) -> int:
@@ -561,6 +566,7 @@ def adaptive_pld_generate_step(
     num_draft: int = 1,
     persistent_mtp: bool = False,
     mtp_rate_gate: bool = False,
+    speculation_router: Optional[RoutedSpeculationPolicy] = None,
     batch_size: int = 1,
     depth_table: Optional[Any] = None,
     prefill_step_size: int = 512,
@@ -909,6 +915,7 @@ def adaptive_pld_generate_step(
                     stats,
                     mtp_cache=mtp_cache,
                     rate_gate=mtp_rate_gate,
+                    speculation_router=speculation_router,
                 )
             else:
                 _stop_all_speculation(cache)
@@ -948,6 +955,7 @@ def self_mtp_generate_step(
     accept_rule: str = "residual",
     persistent_mtp: bool = False,
     rate_gate: bool = False,
+    speculation_router: Optional[RoutedSpeculationPolicy] = None,
     batch_size: int = 1,
     depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
@@ -1074,6 +1082,7 @@ def self_mtp_generate_step(
             accept_rule=accept_rule,
             mtp_cache=mtp_cache,
             rate_gate=rate_gate,
+            speculation_router=speculation_router,
         )
     finally:
         _stop_all_speculation(cache)
@@ -1190,6 +1199,7 @@ def _mtp_draft_verify_loop(
     accept_rule: str = "residual",
     mtp_cache=None,
     rate_gate: bool = False,
+    speculation_router: Optional[RoutedSpeculationPolicy] = None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -1222,6 +1232,7 @@ def _mtp_draft_verify_loop(
     gate_cycles = 0
     spec_secs = 0.0  # wall-clock over measured spec cycles
     spec_toks = 0  # tokens those cycles delivered
+    router_plain = False
 
     def _plain_step():
         # One width-1 trunk forward: commits `cur`, samples the next token.
@@ -1252,6 +1263,32 @@ def _mtp_draft_verify_loop(
             ntoks += 1
             yield tok_, lp, False
             continue
+        routed_k = None
+        if speculation_router is not None:
+            decision = speculation_router.decide(
+                max_draft=num_draft,
+                remaining=max_tokens - ntoks,
+            )
+            routed_k = decision.num_draft
+            stats.router_last_num_draft = routed_k
+            stats.router_accept_prob = decision.accept_prob
+            stats.router_reengagements = speculation_router.reengagements
+            if routed_k == 0:
+                if not router_plain:
+                    _stop_all_speculation(cache)
+                    router_plain = True
+                tok_, lp = _plain_step()
+                ntoks += 1
+                stats.router_plain_cycles += 1
+                yield tok_, lp, False
+                continue
+            if router_plain:
+                _start_speculation_or_cleanup(
+                    cache,
+                    cache,
+                    "routed MTP re-entry needs a trimmable prompt cache.",
+                )
+                router_plain = False
         if rate_gate and not stats.rate_gate_probed and gate_cycles >= _RATE_GATE_WARMUP_CYCLES:
             stats.rate_gate_probed = True
             # Honest plain reference: rollback recording (GDN/rotating-cache
@@ -1283,13 +1320,15 @@ def _mtp_draft_verify_loop(
             continue
         cycle_t0 = time.perf_counter()
         ntoks_at_cycle_start = ntoks
-        k = draft_tokens_for_budget(num_draft, max_tokens - ntoks)
+        configured_k = num_draft if routed_k is None else routed_k
+        k = draft_tokens_for_budget(configured_k, max_tokens - ntoks)
         if k == 0:
             tok_, lp = _plain_step()
             ntoks += 1
             yield tok_, lp, False
             continue
         stats.cycles += 1
+
         # ---- draft k tokens with the MTP head (chained) ----------------------
         if not persistent:
             mtp_cache = model.make_mtp_cache()
@@ -1373,6 +1412,9 @@ def _mtp_draft_verify_loop(
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
         stats.draft_proposed += k
         stats.draft_cycles += 1
+        if speculation_router is not None:
+            speculation_router.observe(k, n_accept)
+            stats.router_accept_prob = speculation_router.accept_prob
 
         # Delivered-token telemetry updates exactly at each yield boundary so
         # an early close (e.g. EOS) never overstates accepted/bonus counts.
