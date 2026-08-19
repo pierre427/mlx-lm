@@ -343,6 +343,37 @@ class TestGenerate(unittest.TestCase):
         finally:
             gen.close()
 
+    def test_fresh_lane_cachelist_non_mergeable_raises(self):
+        # The fresh lane has the same exposure as supplied caches:
+        # _make_new_cache() doesn't descend into CacheList when wrapping
+        # for max_kv_size, so a hybrid model whose make_cache() nests a
+        # plain KVCache (baichuan_m1's global layers) yields a leaf that
+        # quantizes to non-mergeable QuantizedKVCache. Must raise at
+        # insert, not AttributeError later in CacheList.merge.
+        from mlx_lm.models.cache import ArraysCache, CacheList
+
+        prompt = self.tokenizer.encode("hello there")
+        self.model.make_cache = lambda: [
+            CacheList(ArraysCache(size=2), KVCache())
+            for _ in range(len(self.model.layers))
+        ]
+        try:
+            gen = BatchGenerator(
+                self.model,
+                stop_tokens=self.tokenizer.eos_token_ids,
+                max_tokens=2,
+                max_kv_size=64,
+                kv_bits=8,
+                kv_group_size=32,
+            )
+            try:
+                with self.assertRaises(ValueError):
+                    gen.insert([prompt])
+            finally:
+                gen.close()
+        finally:
+            del self.model.make_cache
+
     def test_batch_matches_single(self):
 
         prompts = [
