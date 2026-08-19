@@ -82,8 +82,15 @@ def _make_gen_batch(model, uids, samplers, logits_processors, fallback):
 
 class TestBatchProcessorInvariant(unittest.TestCase):
     def setUp(self):
+        # Restore in tearDown: the default device is process-global, so leaking
+        # cpu here makes every later test in the session see a device_info()
+        # without max_recommended_working_set_size.
+        self._prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
         self.model = FakeModel()
+
+    def tearDown(self):
+        mx.set_default_device(self._prev_device)
 
     # ----- H1: mixed no-processor + processor lanes step without TypeError ---
     def test_mixed_processor_lanes_step_without_typeerror(self):
