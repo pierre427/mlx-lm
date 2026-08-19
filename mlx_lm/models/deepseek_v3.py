@@ -109,7 +109,7 @@ class DeepseekV3Attention(nn.Module):
         )
 
         # Instella-MoE gated attention: attn_output * sigmoid(gate(x)) before o_proj.
-        self.gated_attention = config.gated_attention
+        self.gated_attention = getattr(config, "gated_attention", False)
         if self.gated_attention:
             self.gate_proj = nn.Linear(
                 self.hidden_size, self.num_heads * self.v_head_dim, bias=False
@@ -364,10 +364,15 @@ class DeepseekV3DecoderLayer(nn.Module):
         )
         # FarSkip-Collective connectivity (Instella-MoE): enabled layers carry
         # two residual streams (full, routed-free) as a tuple between layers.
-        self.farskip = config.farskip and (
-            config.farskip_start_idx
+        # getattr with defaults: kimi_vl builds this model from its own
+        # TextArgs, which carries none of the Instella-MoE fields.
+        self.farskip = getattr(config, "farskip", False) and (
+            getattr(config, "farskip_start_idx", 0)
             <= layer_idx
-            <= min(config.farskip_end_idx, config.num_hidden_layers - 1)
+            <= min(
+                getattr(config, "farskip_end_idx", 10**9),
+                config.num_hidden_layers - 1,
+            )
         )
 
     def __call__(
@@ -389,9 +394,9 @@ class DeepseekV3DecoderLayer(nn.Module):
             mlp_in = residual
         else:
             residual = attn_in = mlp_in = x
-        if self.config.attn_only_farskip:
+        if getattr(self.config, "attn_only_farskip", False):
             mlp_in = None
-        if self.config.mlp_only_farskip:
+        if getattr(self.config, "mlp_only_farskip", False):
             attn_in = residual
 
         r = self.self_attn(self.input_layernorm(attn_in), mask, cache)
