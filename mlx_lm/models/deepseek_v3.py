@@ -48,6 +48,15 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    # Instella-MoE extensions (arXiv:2511.10628). All default off so stock
+    # DeepSeek-V3 checkpoints are unaffected.
+    gated_attention: bool = False
+    rope_interleave: bool = False
+    farskip: bool = False
+    farskip_start_idx: int = 0
+    farskip_end_idx: int = 10**9
+    attn_only_farskip: bool = False
+    mlp_only_farskip: bool = False
 
 
 class DeepseekV3Attention(nn.Module):
@@ -99,6 +108,13 @@ class DeepseekV3Attention(nn.Module):
             bias=config.attention_bias,
         )
 
+        # Instella-MoE gated attention: attn_output * sigmoid(gate(x)) before o_proj.
+        self.gated_attention = config.gated_attention
+        if self.gated_attention:
+            self.gate_proj = nn.Linear(
+                self.hidden_size, self.num_heads * self.v_head_dim, bias=False
+            )
+
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
             if mscale_all_dim:
@@ -107,6 +123,10 @@ class DeepseekV3Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
+        # traditional=True (adjacent-pair pairing) is also correct for
+        # Instella's rope_interleave=True: HF's interleaved apply differs from
+        # MLX traditional RoPE only by a fixed permutation of the rope dims,
+        # which cancels in the q_pe @ k_pe dot product.
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -186,6 +206,10 @@ class DeepseekV3Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if self.gated_attention:
+            # Gate input is the attention input x (already input-layernormed by
+            # the decoder layer), matching HF MLAGatedAttention.
+            output = output * mx.sigmoid(self.gate_proj(x))
         return self.o_proj(output)
 
 
@@ -290,16 +314,30 @@ class DeepseekV3MoE(nn.Module):
 
         self.sharding_group = None
 
-    def __call__(self, x):
+    def __call__(self, x, return_parts=False):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
+        routed = self.switch_mlp(x, inds)
+        routed = (routed * scores[..., None]).sum(axis=-2).astype(routed.dtype)
+        shared = (
+            self.shared_experts(x)
+            if self.config.n_shared_experts is not None
+            else None
+        )
 
+        # FarSkip needs routed and shared separately to maintain its two
+        # residual streams; all_sum is linear so splitting it is equivalent.
+        if return_parts:
+            if shared is None:
+                shared = mx.zeros_like(routed)
+            if self.sharding_group is not None:
+                routed = mx.distributed.all_sum(routed, group=self.sharding_group)
+                shared = mx.distributed.all_sum(shared, group=self.sharding_group)
+            return routed, shared
+
+        y = routed if shared is None else routed + shared
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
@@ -309,6 +347,7 @@ class DeepseekV3MoE(nn.Module):
 class DeepseekV3DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
+        self.config = config
         self.self_attn = DeepseekV3Attention(config)
         self.mlp = (
             DeepseekV3MoE(config)
@@ -323,17 +362,51 @@ class DeepseekV3DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # FarSkip-Collective connectivity (Instella-MoE): enabled layers carry
+        # two residual streams (full, routed-free) as a tuple between layers.
+        self.farskip = config.farskip and (
+            config.farskip_start_idx
+            <= layer_idx
+            <= min(config.farskip_end_idx, config.num_hidden_layers - 1)
+        )
 
     def __call__(
         self,
-        x: mx.array,
+        x,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+    ):
+        if not self.farskip:
+            if isinstance(x, tuple):
+                x = x[0]
+            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            h = x + r
+            r = self.mlp(self.post_attention_layernorm(h))
+            return h + r
+
+        if isinstance(x, tuple):
+            residual, attn_in = x
+            mlp_in = residual
+        else:
+            residual = attn_in = mlp_in = x
+        if self.config.attn_only_farskip:
+            mlp_in = None
+        if self.config.mlp_only_farskip:
+            attn_in = residual
+
+        r = self.self_attn(self.input_layernorm(attn_in), mask, cache)
+        residual = residual + r
+
+        if mlp_in is None:
+            mlp_in = residual
+        mlp_in = self.post_attention_layernorm(mlp_in)
+
+        if isinstance(self.mlp, DeepseekV3MoE):
+            routed, shared = self.mlp(mlp_in, return_parts=True)
+            residual_no_routed = residual + shared
+            residual = residual + routed + shared
+            return residual, residual_no_routed
+        return residual + self.mlp(mlp_in)
 
 
 class DeepseekV3Model(PipelineMixin, nn.Module):
@@ -367,6 +440,11 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
 
         for l, c in zip(self.pipeline_layers, cache):
             h = l(h, mask, cache=c)
+
+        # FarSkip layers pass (residual, residual_no_routed); the final norm
+        # uses the routed-inclusive stream, matching HF InstellaMoEModel.
+        if isinstance(h, tuple):
+            h = h[0]
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
