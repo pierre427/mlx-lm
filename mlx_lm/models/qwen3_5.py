@@ -1,5 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
+import copy
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -20,6 +22,196 @@ from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+
+
+logger = logging.getLogger(__name__)
+
+# Keep the single-matmul path below the shape-dependent quantized-kernel
+# boundary observed by Rapid-MLX. Every enabled dtype is re-probed against the
+# loaded layer's real weights before a projection quartet is rewritten.
+_GDN_FUSED_MAX_ROWS = 8
+_GDN_PROBE_DTYPES = ("bfloat16", "float16")
+
+
+def _gdn_projection_modules(layer):
+    return [
+        layer.in_proj_qkv,
+        layer.in_proj_z,
+        layer.in_proj_b,
+        layer.in_proj_a,
+    ]
+
+
+def _can_fuse_gdn_projections(layer) -> bool:
+    """Return whether a GDN projection quartet is safe to concatenate."""
+    if hasattr(layer, "in_proj_fused") or layer.sharding_group is not None:
+        return False
+    try:
+        parts = _gdn_projection_modules(layer)
+    except AttributeError:
+        return False
+
+    base = parts[0]
+    if not all(type(part) is nn.QuantizedLinear for part in parts):
+        return False
+    if getattr(base, "mode", "affine") != "affine":
+        return False
+
+    for part in parts:
+        if (
+            part.group_size,
+            part.bits,
+            getattr(part, "mode", "affine"),
+        ) != (base.group_size, base.bits, "affine"):
+            return False
+        if "bias" in part or part.get("biases") is None:
+            return False
+        if part["weight"].shape[1] != base["weight"].shape[1]:
+            return False
+        if part["weight"].dtype != base["weight"].dtype:
+            return False
+        if part["scales"].dtype != base["scales"].dtype:
+            return False
+        if part["biases"].dtype != base["biases"].dtype:
+            return False
+    return True
+
+
+def _concat_gdn_projection_parameters(parts):
+    return (
+        mx.concatenate([part["weight"] for part in parts], axis=0),
+        mx.concatenate([part["scales"] for part in parts], axis=0),
+        mx.concatenate([part["biases"] for part in parts], axis=0),
+    )
+
+
+def _array_bytes(array: mx.array) -> bytes:
+    """Return an array's raw bytes without normalizing its dtype."""
+    import numpy as np
+
+    uint_name = {1: "uint8", 2: "uint16", 4: "uint32", 8: "uint64"}[
+        array.dtype.size
+    ]
+    return np.array(mx.view(array, getattr(mx, uint_name)), copy=True).tobytes()
+
+
+def _probe_gdn_projection_parity(layer) -> frozenset:
+    """Return activation dtypes that are byte-exact through the fused kernel."""
+    parts = _gdn_projection_modules(layer)
+    weight, scales, biases = _concat_gdn_projection_parameters(parts)
+    group_size, bits = parts[0].group_size, parts[0].bits
+    bounds = []
+    total = 0
+    for part in parts:
+        total += part["weight"].shape[0]
+        bounds.append(total)
+
+    hidden_size = parts[0]["scales"].shape[1] * group_size
+    shapes = [(1, rows) for rows in range(1, _GDN_FUSED_MAX_ROWS + 1)]
+    shapes.append((2, 4))
+    passed = set()
+    for dtype_name in _GDN_PROBE_DTYPES:
+        dtype = getattr(mx, dtype_name)
+        try:
+            exact = True
+            for batch, rows in shapes:
+                inputs = (
+                    mx.random.normal(
+                        (batch, rows, hidden_size),
+                        key=mx.random.key(batch * 100 + rows),
+                    )
+                    * 0.3
+                ).astype(dtype)
+                fused = mx.quantized_matmul(
+                    inputs,
+                    weight,
+                    scales,
+                    biases,
+                    transpose=True,
+                    group_size=group_size,
+                    bits=bits,
+                )
+                fused_parts = mx.split(fused, bounds[:-1], axis=-1)
+                stock_parts = [part(inputs) for part in parts]
+                mx.eval(fused_parts, stock_parts)
+                if any(
+                    _array_bytes(stock) != _array_bytes(candidate)
+                    for stock, candidate in zip(stock_parts, fused_parts)
+                ):
+                    exact = False
+                    break
+            if exact:
+                passed.add(dtype)
+        except Exception:  # A failed kernel/dtype probe simply stays stock.
+            continue
+    return frozenset(passed)
+
+
+def _fuse_gdn_projection_layer(layer, dtypes: frozenset) -> None:
+    """Install one already-verified projection fusion, failure-atomically."""
+    parts = _gdn_projection_modules(layer)
+    weight, scales, biases = _concat_gdn_projection_parameters(parts)
+    mx.eval(weight, scales, biases)
+
+    bounds = []
+    total = 0
+    for part in parts:
+        total += part["weight"].shape[0]
+        bounds.append(total)
+
+    fused = copy.deepcopy(parts[0])
+    fused.weight = weight
+    fused.scales = scales
+    fused.biases = biases
+
+    layer._gdn_fused_bounds = tuple(bounds)
+    layer._gdn_fused_dtypes = dtypes
+    layer.in_proj_fused = fused
+    del layer.in_proj_qkv
+    del layer.in_proj_z
+    del layer.in_proj_b
+    del layer.in_proj_a
+
+
+def fuse_gated_delta_net_projections(model, *, enabled: bool = False) -> int:
+    """Opt in to the Rapid-MLX #2159 GDN projection fusion prototype.
+
+    The rewrite is deliberately disabled by default. Eligible quantized layers
+    are fused only after byte-parity probes pass on their real weights for the
+    current MLX runtime and device. Wider inputs retain four matmuls over row
+    slices of the fused arrays, avoiding duplicate projection weights.
+
+    Adapted from Rapid-MLX PR #2159 (Apache-2.0), merge commit e1785bc.
+    Returns the number of layers fused in place and never raises.
+    """
+    if not enabled:
+        return 0
+    try:
+        targets = [
+            module
+            for _, module in model.named_modules()
+            if type(module) is GatedDeltaNet and _can_fuse_gdn_projections(module)
+        ]
+    except Exception:
+        logger.warning(
+            "GDN projection fusion scan failed; model left stock", exc_info=True
+        )
+        return 0
+
+    committed = 0
+    for layer in targets:
+        try:
+            dtypes = _probe_gdn_projection_parity(layer)
+            if not dtypes:
+                continue
+            _fuse_gdn_projection_layer(layer, dtypes)
+            committed += 1
+            mx.clear_cache()
+        except Exception:
+            logger.warning(
+                "GDN projection fusion failed for one layer", exc_info=True
+            )
+    return committed
 
 
 @dataclass
@@ -134,6 +326,40 @@ class GatedDeltaNet(nn.Module):
 
         self.sharding_group = None
 
+    def _input_projections(self, inputs: mx.array):
+        if not hasattr(self, "in_proj_fused"):
+            return (
+                self.in_proj_qkv(inputs),
+                self.in_proj_z(inputs),
+                self.in_proj_b(inputs),
+                self.in_proj_a(inputs),
+            )
+
+        fused = self.in_proj_fused
+        bounds = self._gdn_fused_bounds
+        if (
+            inputs.shape[0] * inputs.shape[1] <= _GDN_FUSED_MAX_ROWS
+            and inputs.dtype in self._gdn_fused_dtypes
+        ):
+            return mx.split(fused(inputs), bounds[:-1], axis=-1)
+
+        outputs = []
+        lower = 0
+        for upper in bounds:
+            outputs.append(
+                mx.quantized_matmul(
+                    inputs,
+                    fused.weight[lower:upper],
+                    fused.scales[lower:upper],
+                    fused.biases[lower:upper],
+                    transpose=True,
+                    group_size=fused.group_size,
+                    bits=fused.bits,
+                )
+            )
+            lower = upper
+        return outputs
+
     def __call__(
         self,
         inputs: mx.array,
@@ -145,10 +371,8 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        qkv, z, b, a = self._input_projections(inputs)
+        z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
