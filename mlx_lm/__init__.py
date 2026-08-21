@@ -4,6 +4,7 @@ import os
 
 from ._version import __version__
 from .apc import APC, APCKey, AutomaticPrefixCache
+from .apc_backends import BlockAPCAdapter, SnapshotAPCAdapter
 
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
@@ -17,6 +18,8 @@ __all__ = [
     "APC",
     "APCKey",
     "AutomaticPrefixCache",
+    "BlockAPCAdapter",
+    "SnapshotAPCAdapter",
     "convert",
     "batch_generate",
     "generate",

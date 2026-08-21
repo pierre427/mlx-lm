@@ -23,9 +23,13 @@ from .models.cache import (
     KVCache,
     LRUPromptCache,
     RotatingKVCache,
-    achievable_trim,
     can_trim_prompt_cache,
 )
+
+try:
+    from .models.cache import achievable_trim
+except ImportError:  # Older mlx-lm runtimes can still use backend adapters.
+    achievable_trim = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,8 @@ class APCCapabilities:
     exact_prefix: bool
     arbitrary_branch: bool
     reason: Optional[str] = None
+    stored: Optional[bool] = None
+    native: Any = None
 
 
 @dataclass
@@ -61,6 +67,7 @@ class APCLookup:
     hit: bool
     hit_kind: Optional[str]
     miss_reason: Optional[str]
+    native: Any = None
 
 
 def _walk_cache_entries(prompt_cache: Iterable[Any]):
@@ -101,7 +108,7 @@ def inspect_apc_capabilities(prompt_cache: List[Any]) -> APCCapabilities:
         topology = "custom"
 
     arbitrary_branch = can_trim_prompt_cache(prompt_cache)
-    if not arbitrary_branch:
+    if not arbitrary_branch and achievable_trim is not None:
         # Checkpoint-aware hybrids can still branch at recorded positions.
         arbitrary_branch = achievable_trim(prompt_cache, 1) is not None
 
