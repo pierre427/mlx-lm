@@ -60,6 +60,28 @@ QWEN3_NEXT_CONFIG = {
     "max_position_embeddings": 1000,
 }
 
+QWEN3_5_CONFIG = {
+    "model_type": "qwen3_5",
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "vocab_size": 64,
+    "full_attention_interval": 4,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    "linear_key_head_dim": 64,
+    "linear_value_head_dim": 64,
+    "linear_conv_kernel_dim": 4,
+    "rope_parameters": {
+        "type": "default",
+        "rope_theta": 10000,
+        "partial_rotary_factor": 0.25,
+    },
+}
+
 KIMI_LINEAR_CONFIG = {
     "model_type": "kimi_linear",
     "vocab_size": 1000,
@@ -333,6 +355,54 @@ class TestStateCheckpointTrim(unittest.TestCase):
                 self.assertEqual(length - len(rest), expected_landing)
                 self.assertEqual(rest, tokens[expected_landing:])
         finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = old_stride
+
+    def test_tiny_qwen35_replay_matches_fresh_at_checkpoint_neighbors(self):
+        """Exercise the boundary contract through a real Qwen3.5 hybrid.
+
+        Exact hits immediately below, on, and above a checkpoint must replay
+        from the deepest interior checkpoint and reproduce a fresh prefill.
+        """
+        old_stride = os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"]
+        previous_device = mx.default_device()
+        os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = "8"
+        mx.set_default_device(mx.cpu)
+        try:
+            mx.random.seed(7)
+            model = make_model(QWEN3_5_CONFIG)
+            for length, expected_landing in ((31, 24), (32, 24), (33, 32)):
+                tokens = [
+                    ((i * 7) + 3) % QWEN3_5_CONFIG["vocab_size"]
+                    for i in range(length)
+                ]
+                stored_cache = make_prompt_cache(model)
+                prefill(model, stored_cache, tokens, chunk=8)
+
+                lru = LRUPromptCache()
+                lru.insert_cache("qwen3.5", tokens, stored_cache)
+                reused_cache, rest = lru.fetch_nearest_cache("qwen3.5", tokens)
+
+                self.assertIsNotNone(reused_cache)
+                self.assertEqual(length - len(rest), expected_landing)
+                self.assertEqual(rest, tokens[expected_landing:])
+
+                reused_logits = prefill(model, reused_cache, rest, chunk=8)
+                fresh_cache = make_prompt_cache(model)
+                fresh_logits = prefill(model, fresh_cache, tokens, chunk=8)
+                self.assertTrue(
+                    mx.allclose(
+                        reused_logits[:, -1, :],
+                        fresh_logits[:, -1, :],
+                        atol=1e-5,
+                    ).item()
+                )
+                self.assertEqual(
+                    greedy(model, reused_cache, reused_logits, 3),
+                    greedy(model, fresh_cache, fresh_logits, 3),
+                )
+        finally:
+            mx.clear_cache()
+            mx.set_default_device(previous_device)
             os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = old_stride
 
     def test_save_load_full_hybrid_with_wrapped_rotating(self):

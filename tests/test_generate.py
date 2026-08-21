@@ -237,11 +237,11 @@ class TestGenerate(unittest.TestCase):
 
     def test_insert_supplied_cache_honors_kv_bits(self):
         # Externally supplied caches must honor the generator's kv-quant
-        # config at insert: on the supported (rotating) configuration they
-        # are quantized to match the fresh-lane cohort; on the unsupported
-        # (non-rotating) one they fail loudly instead of silently running
-        # unquantized and crashing later in the cohort merge.
+        # config at insert: rotating and plain KV caches are quantized to
+        # their respective mergeable cache classes so the supplied lane
+        # matches the fresh-lane cohort.
         from mlx_lm.models.cache import (
+            QuantizedKVCache,
             RotatingQuantizedKVCache,
             make_prompt_cache,
         )
@@ -280,8 +280,13 @@ class TestGenerate(unittest.TestCase):
             kv_group_size=32,
         )
         try:
-            with self.assertRaises(ValueError):
-                gen.insert([prompt], caches=[make_prompt_cache(self.model)])
+            gen.insert([prompt], caches=[make_prompt_cache(self.model)])
+            queued_cache = gen._unprocessed_sequences[0][3]
+            self.assertTrue(all(isinstance(c, QuantizedKVCache) for c in queued_cache))
+            responses = []
+            while res := gen.next_generated():
+                responses.extend(res)
+            self.assertTrue(len(responses) > 0)
         finally:
             gen.close()
 

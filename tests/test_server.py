@@ -80,6 +80,27 @@ class TestModelProvider(unittest.TestCase):
 
         clear_cache.assert_not_called()
 
+    def test_kv_bits_keeps_mergeable_model_batchable(self):
+        """Quantized KV is supported by BatchGenerator and must not make the
+        server reject an otherwise mergeable model from continuous batching.
+        """
+        provider = self.make_provider(None)
+        provider.cli_args.kv_bits = 4
+        model = object()
+        tokenizer = types.SimpleNamespace(chat_template="template")
+        mergeable_cache = types.SimpleNamespace(merge=lambda *args: None)
+
+        with (
+            patch("mlx_lm.server.load", return_value=(model, tokenizer)),
+            patch(
+                "mlx_lm.server.make_prompt_cache",
+                return_value=[mergeable_cache],
+            ),
+        ):
+            provider._load("model")
+
+        self.assertTrue(provider.is_batchable)
+
 
 class DummyModelProvider:
     def __init__(self, with_draft=False):
