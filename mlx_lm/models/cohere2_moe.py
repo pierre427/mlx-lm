@@ -156,7 +156,19 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        qkv = getattr(self, "qkv_proj", None)
+        if qkv is not None:
+            # Fused projection (see fuse_qkv_projections): one GEMV over the
+            # row-concatenated [Wq; Wk; Wv], then split. Row-wise quantization
+            # makes this numerically identical to the three separate GEMVs.
+            fused = qkv(x)
+            nq = self.n_heads * self.head_dim
+            nk = self.n_kv_heads * self.head_dim
+            queries = fused[..., :nq]
+            keys = fused[..., nq : nq + nk]
+            values = fused[..., nq + nk :]
+        else:
+            queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -360,3 +372,50 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+
+def fuse_qkv_projections(model) -> int:
+    """Runtime graph-level fusion: replace each attention layer's q/k/v
+    projections with ONE row-concatenated projection (quantized or dense).
+
+    Motivation (megakernel M-1, 2026-08-21): at M=1 the 2048->512 k/v GEMVs
+    run at ~9% of bandwidth because every qmv kernel pays a ~10 us floor; a
+    single 2048->5120 GEMV pays it once. Per-row (group) quantization means
+    the concatenated rows are computed exactly as before -> token-identical.
+    Weights on disk are untouched; call after load(). Returns #layers fused.
+    Idempotent. The originals are dropped to free memory, so a fused model
+    must not be saved.
+
+    MEASURED NEGATIVE on North q4 (2026-08-21): bit-exact but -2.6% sync /
+    -4% async. MLX's Metal encoder already runs the three independent GEMVs
+    concurrently (separate+views 12.1 us/layer vs fused 15.2 us), so the
+    single-kernel form loses. Kept opt-in for other targets/shapes; do not
+    enable by default.
+    """
+    import copy
+
+    fused_layers = 0
+    for layer in model.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None or getattr(attn, "qkv_proj", None) is not None:
+            continue
+        q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
+        kinds = {type(q), type(k), type(v)}
+        if len(kinds) != 1:
+            continue
+        fused = copy.copy(q)
+        fused.weight = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+        if isinstance(q, nn.QuantizedLinear):
+            fused.scales = mx.concatenate([q.scales, k.scales, v.scales], axis=0)
+            if "biases" in q:
+                fused.biases = mx.concatenate([q.biases, k.biases, v.biases], axis=0)
+        if "bias" in q:
+            fused.bias = mx.concatenate([q.bias, k.bias, v.bias], axis=0)
+        attn.qkv_proj = fused
+        attn.pop("q_proj")
+        attn.pop("k_proj")
+        attn.pop("v_proj")
+        fused_layers += 1
+    if fused_layers:
+        mx.eval(model.parameters())
+    return fused_layers
