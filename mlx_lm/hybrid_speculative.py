@@ -33,7 +33,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -959,6 +959,9 @@ def self_mtp_generate_step(
     batch_size: int = 1,
     depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
+    logits_processors: Optional[
+        List[Callable[[mx.array, mx.array], mx.array]]
+    ] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding with the model's own MTP (nextn) head.
 
@@ -1005,6 +1008,12 @@ def self_mtp_generate_step(
     when the caller runs multiple lanes, then the hard M5 verify-width cap
     (drafts + bonus <= 8) applies. Defaults leave ``num_draft`` unchanged
     below the cap; the gate decides IF, the policy decides HOW DEEP.
+
+    ``logits_processors`` are applied to each target verification position
+    with its exact speculative token prefix. Stateful processors therefore use
+    the same rewind-on-shorter-history contract as external-draft speculative
+    generation and make decisions only from committed-or-tentatively-accepted
+    prefixes.
 
     Yields ``(token, logprobs, from_draft)``.
     """
@@ -1053,7 +1062,11 @@ def self_mtp_generate_step(
             model.mtp_step(prev_h, y[None], mtp_cache)  # pair (h_{L-2}, t_{L-1})
         hidden = model.model(y[None], cache=cache)   # [1, 1, H] post-final-norm
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
-        first_lp = _temperature_logprobs(model.logits(seed_h)[0, -1], sampling_temp)
+        first_logits = model.logits(seed_h)[0, -1]
+        first_logits = _apply_logits_processors(
+            logits_processors, y=y, logits=first_logits
+        )
+        first_lp = _temperature_logprobs(first_logits, sampling_temp)
         cur = _sample_from_logprobs(first_lp, sampling_temp)
     _start_speculation_or_cleanup(
         cache,
@@ -1083,6 +1096,11 @@ def self_mtp_generate_step(
             mtp_cache=mtp_cache,
             rate_gate=rate_gate,
             speculation_router=speculation_router,
+            logits_processors=logits_processors,
+            # Match generate_step's established processor context contract:
+            # prefill chunks are excluded and the final prompt token starts
+            # the rolling generation context.
+            token_prefix=y,
         )
     finally:
         _stop_all_speculation(cache)
@@ -1093,6 +1111,16 @@ def _temperature_logprobs(logits, sampling_temp: float = 0.0):
     if sampling_temp and sampling_temp > 0:
         logits = logits / float(sampling_temp)
     return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+
+def _apply_logits_processors(logits_processors, y, logits):
+    """Apply processors with the same rank convention as ``generate_step``."""
+    if not logits_processors:
+        return logits
+    batched = logits[None] if logits.ndim == 1 else logits
+    for processor in logits_processors:
+        batched = processor(y, batched)
+    return batched[0] if logits.ndim == 1 else batched
 
 
 def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0) -> int:
@@ -1200,6 +1228,8 @@ def _mtp_draft_verify_loop(
     mtp_cache=None,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
+    logits_processors=None,
+    token_prefix=None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -1233,15 +1263,29 @@ def _mtp_draft_verify_loop(
     spec_secs = 0.0  # wall-clock over measured spec cycles
     spec_toks = 0  # tokens those cycles delivered
     router_plain = False
+    # Tokens committed before ``cur``. Processor calls may temporarily walk
+    # speculative prefixes; stateful processors are required to support the
+    # same rewind-on-shorter-history contract used by speculative_generate_step.
+    token_prefix = (
+        token_prefix.astype(mx.uint32)
+        if token_prefix is not None
+        else mx.array([], mx.uint32)
+    )
 
     def _plain_step():
         # One width-1 trunk forward: commits `cur`, samples the next token.
         # Keeps the pending-pair protocol intact so persistent drafting can
         # resume seamlessly after a probe.
-        nonlocal cur, seed_h, pending_hs, pending_ts
+        nonlocal cur, seed_h, pending_hs, pending_ts, token_prefix
         with mx.stream(generation_stream):
             h = model.model(mx.array([[cur]], mx.uint32), cache=cache)
-            lp = _temperature_logprobs(model.logits(h)[0, -1], sampling_temp)
+            proc_tokens = mx.concatenate(
+                [token_prefix, mx.array([cur], mx.uint32)]
+            )
+            logits = _apply_logits_processors(
+                logits_processors, proc_tokens, model.logits(h)[0, -1]
+            )
+            lp = _temperature_logprobs(logits, sampling_temp)
             nxt = _sample_from_logprobs(lp, sampling_temp)
         if persistent and not gated_off:
             # Pairs only matter if drafting can resume; after a permanent
@@ -1251,6 +1295,7 @@ def _mtp_draft_verify_loop(
                 else mx.concatenate([pending_hs, seed_h], axis=1)
             )
             pending_ts.append(cur)
+        token_prefix = proc_tokens
         seed_h, cur = h[:, -1:, :], nxt
         stats.cycles += 1
         stats.plain_cycles += 1
@@ -1355,7 +1400,22 @@ def _mtp_draft_verify_loop(
         with mx.stream(generation_stream):
             vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
             vlogits = model.logits(vhidden)                 # [1, k+1, V]
-            logprobs = _temperature_logprobs(vlogits[0], sampling_temp)
+            processed_logits = []
+            for i in range(k + 1):
+                proc_tokens = mx.concatenate(
+                    [
+                        token_prefix,
+                        mx.array([cur] + drafts[:i], mx.uint32),
+                    ]
+                )
+                processed_logits.append(
+                    _apply_logits_processors(
+                        logits_processors, proc_tokens, vlogits[0, i]
+                    )
+                )
+            logprobs = _temperature_logprobs(
+                mx.stack(processed_logits), sampling_temp
+            )
             targets = mx.argmax(logprobs, axis=-1)
         mx.eval(targets, vhidden)
 
@@ -1428,6 +1488,9 @@ def _mtp_draft_verify_loop(
             ntoks += 1
             stats.bonus_tokens += 1
             yield bonus, logprobs[n_accept], False
+        token_prefix = mx.concatenate(
+            [token_prefix, mx.array([cur] + drafts[:n_accept], mx.uint32)]
+        )
         cur = bonus
         spec_secs += time.perf_counter() - cycle_t0
         spec_toks += ntoks - ntoks_at_cycle_start

@@ -34,8 +34,10 @@ from mlx_lm.hybrid_speculative import (
     _temperature_logprobs,
     self_mtp_generate_step,
 )
+from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.qwen3_5 import TextModel
+from mlx_lm.sample_utils import make_reasoning_budget
 
 from test_qwen3_5_mtp import tiny_args
 
@@ -257,6 +259,39 @@ class TestAcceptRuleEndToEnd(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             next(gen)
+
+    def test_stateful_logits_processor_matches_plain_generation(self):
+        # The MTP verifier walks speculative prefixes before it knows how many
+        # draft tokens will commit. A rewind-aware processor must see the same
+        # committed histories, and force the same token, as sequential decode.
+        close = 5
+
+        def procs():
+            return [
+                make_reasoning_budget(
+                    think_close=close, max_think_tokens=6, check_every=10**6
+                )
+            ]
+
+        n = 18
+        plain = [
+            int(t)
+            for t, _ in generate_step(
+                self.prompt, self.model, max_tokens=n, logits_processors=procs()
+            )
+        ]
+        spec = [
+            int(t)
+            for t, _lp, _fd in self_mtp_generate_step(
+                self.prompt,
+                self.model,
+                num_draft=2,
+                max_tokens=n,
+                logits_processors=procs(),
+            )
+        ]
+        self.assertEqual(spec, plain)
+        self.assertIn(close, spec)
 
     def test_temp_sampling_marginals_match_plain(self):
         # Per-position marginals over N seeded trials for each rule vs the

@@ -307,6 +307,34 @@ class TestStateCheckpointTrim(unittest.TestCase):
         self.assertEqual(rest2, key[-1:])
         self.assertEqual(got2[0].offset, 95)
 
+    def test_mtp_checkpoint_boundary_neighbors_keep_a_replay_token(self):
+        """Pin the exact-multiple boundary bug class seen in MTP replay.
+
+        A hybrid cache may only rewind to recurrent-state checkpoints. Around
+        a block boundary the selected landing must stay strictly before the
+        prompt tip, never returning an empty replay suffix.
+        """
+        old_stride = os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"]
+        os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = "8"
+        try:
+            for length, expected_landing in ((31, 24), (32, 24), (33, 32)):
+                boundaries = list(range(8, length + 1, 8))
+                if not boundaries or boundaries[-1] != length:
+                    boundaries.append(length)
+                cache, _ = self._synthetic_hybrid(boundaries)
+                tokens = list(range(length))
+                lru = LRUPromptCache()
+                lru.insert_cache("mtp", tokens, cache)
+
+                restored, rest = lru.fetch_nearest_cache("mtp", tokens)
+
+                self.assertIsNotNone(restored)
+                self.assertGreaterEqual(len(rest), 1)
+                self.assertEqual(length - len(rest), expected_landing)
+                self.assertEqual(rest, tokens[expected_landing:])
+        finally:
+            os.environ["MLX_LM_STATE_CHECKPOINT_STRIDE"] = old_stride
+
     def test_save_load_full_hybrid_with_wrapped_rotating(self):
         """A wrapped RotatingKVCache must persist its window checkpoints
         too — losing them drags the loaded hybrid's landing to 0 (silent

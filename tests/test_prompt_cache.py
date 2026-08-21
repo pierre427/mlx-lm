@@ -11,6 +11,7 @@ from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
+    BatchQuantizedKVCache,
     BatchKVCache,
     BatchRotatingKVCache,
     BatchRotatingQuantizedKVCache,
@@ -494,6 +495,48 @@ class TestPromptCache(unittest.TestCase):
             new_job.update_and_fetch(x, x)
         batch.extend(RotatingQuantizedKVCache.merge([new_job]))
         self.assertEqual(batch.keys[0].shape[0], 3)
+
+    def test_batch_quantized_kv_cache_asymmetric_protocol(self):
+        jobs = []
+        for length in (3, 7, 5):
+            cache = QuantizedKVCache(
+                group_size=32, key_bits=8, value_bits=4, rotate=True
+            )
+            x = mx.random.normal((1, 2, length, 32))
+            cache.update_and_fetch(x, x)
+            jobs.append(cache)
+
+        batch = QuantizedKVCache.merge(jobs)
+        self.assertIsInstance(batch, BatchQuantizedKVCache)
+        self.assertEqual(batch.key_bits, 8)
+        self.assertEqual(batch.value_bits, 4)
+        self.assertEqual(batch.offset.tolist(), [3, 7, 5])
+
+        x = mx.random.normal((3, 2, 1, 32))
+        keys, values = batch.update_and_fetch(x, x)
+        self.assertEqual(keys[0].shape[:3], (3, 2, 8))
+        self.assertEqual(values[0].shape[:3], (3, 2, 8))
+        self.assertEqual(batch.trim(1), 1)
+        self.assertEqual(batch.offset.tolist(), [3, 7, 5])
+
+        batch.filter(mx.array([0, 2]))
+        self.assertEqual(batch.offset.tolist(), [3, 5])
+        extracted = batch.extract(1)
+        self.assertIsInstance(extracted, QuantizedKVCache)
+        self.assertEqual(extracted.offset, 5)
+        self.assertEqual(extracted.key_bits, 8)
+        self.assertEqual(extracted.value_bits, 4)
+
+        other = QuantizedKVCache.merge([jobs[0]])
+        batch.extend(other)
+        self.assertEqual(batch.offset.tolist(), [3, 5, 3])
+
+    def test_batch_quantized_kv_cache_normalized_fails_closed(self):
+        cache = QuantizedKVCache(group_size=32, bits=8, normalize=True)
+        x = mx.random.normal((1, 2, 3, 32))
+        cache.update_and_fetch(x, x)
+        with self.assertRaisesRegex(ValueError, "normalized"):
+            QuantizedKVCache.merge([cache])
 
     def test_cache_list(self):
         c = CacheList(KVCache(), KVCache())

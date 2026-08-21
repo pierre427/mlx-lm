@@ -632,10 +632,17 @@ class QuantizedKVCache(_BaseCache):
     def is_trimmable(self):
         return True
 
+    def size(self):
+        return self.offset
+
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchQuantizedKVCache.merge(caches)
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -645,6 +652,8 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def nbytes(self):
+        if self.keys is None:
+            return 0
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
@@ -1968,6 +1977,360 @@ class _BucketedAttentionGroup:
     indices: tuple[int, ...]
     index_array: mx.array
     cache: "BatchKVCache"
+
+
+class BatchQuantizedKVCache(_BaseCache):
+    """Continuous-batching counterpart of :class:`QuantizedKVCache`.
+
+    Rows are right-aligned exactly like ``BatchKVCache`` while K/V remain in
+    MLX's packed ``(weight, scale, bias)`` representation.  Uniform rotation
+    and asymmetric key/value bit widths are supported. KVarN-normalized rows
+    intentionally fail closed: their frozen per-row channel scales need a
+    separate batch-attention contract before they can be merged safely.
+    """
+
+    step = 256
+
+    def __init__(
+        self,
+        left_padding: List[int],
+        group_size: int = 64,
+        bits: int = 8,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+    ):
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-p for p in left_padding])
+        self._idx = 0
+        self.group_size = group_size
+        self.key_bits = bits if key_bits is None else key_bits
+        self.value_bits = bits if value_bits is None else value_bits
+        QuantizedKVCache._validate_config(
+            group_size, self.key_bits, self.value_bits
+        )
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
+        self.rotate = rotate
+        self.normalize = False
+        self.key_scale = self.value_scale = None
+        self._right_padding = None
+
+    def _quantize(self, x, bits):
+        if self.rotate and hadamard_size_ok(x.shape[-1]):
+            x = rotate_last(x)
+        return mx.quantize(x, group_size=self.group_size, bits=bits)
+
+    def update_and_fetch(self, keys, values):
+        B, H, steps, dk = keys.shape
+        dv = values.shape[-1]
+        prev = self._idx
+        if self.keys is None or prev + steps > self.keys[0].shape[2]:
+            grow = (self.step + steps - 1) // self.step * self.step
+            new_k = _empty_quantized(
+                B, H, grow, dk, self.group_size, self.key_bits, keys.dtype
+            )
+            new_v = _empty_quantized(
+                B, H, grow, dv, self.group_size, self.value_bits, values.dtype
+            )
+            if self.keys is None:
+                self.keys, self.values = new_k, new_v
+            else:
+                if prev % self.step:
+                    self.keys = tree_map(lambda x: x[..., :prev, :], self.keys)
+                    self.values = tree_map(lambda x: x[..., :prev, :], self.values)
+                self.keys = tree_map(
+                    lambda a, b: mx.concatenate([a, b], axis=2), self.keys, new_k
+                )
+                self.values = tree_map(
+                    lambda a, b: mx.concatenate([a, b], axis=2), self.values, new_v
+                )
+        qk = self._quantize(keys, self.key_bits)
+        qv = self._quantize(values, self.value_bits)
+        self._idx += steps
+        self.offset += steps
+        for i in range(3):
+            self.keys[i][..., prev : self._idx, :] = qk[i]
+            self.values[i][..., prev : self._idx, :] = qv[i]
+        return tree_map(
+            lambda x: x[..., : self._idx, :], (self.keys, self.values)
+        )
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty "
+                    "BatchQuantizedKVCache"
+                )
+            padding = mx.array(left_padding)
+            self.left_padding += padding
+            self.offset -= padding
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is None:
+            return
+        padding = self._right_padding
+        if self.keys is not None:
+            self.keys = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.keys
+            )
+            self.values = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.values
+            )
+        self.offset -= padding
+        self.left_padding += padding
+        self._right_padding = None
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None, self.offset, self.left_padding
+        return (
+            tree_map(lambda x: x[..., : self._idx, :], self.keys),
+            tree_map(lambda x: x[..., : self._idx, :], self.values),
+            self.offset,
+            self.left_padding,
+        )
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values, self.offset, self.left_padding = value
+        self._idx = 0 if self.keys is None else self.keys[0].shape[2]
+        self._right_padding = None
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    1,
+                    self._idx,
+                    self.group_size,
+                    self.key_bits,
+                    self.value_bits,
+                    int(self.rotate),
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        (
+            version,
+            self._idx,
+            self.group_size,
+            self.key_bits,
+            self.value_bits,
+            rotate,
+        ) = map(int, value)
+        if version != 1:
+            raise ValueError(f"Unsupported BatchQuantizedKVCache version: {version}")
+        QuantizedKVCache._validate_config(
+            self.group_size, self.key_bits, self.value_bits
+        )
+        self.bits = self.key_bits if self.key_bits == self.value_bits else None
+        self.rotate = bool(rotate)
+        self.normalize = False
+        self.key_scale = self.value_scale = None
+        self._right_padding = None
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    def empty(self):
+        return self.keys is None
+
+    def size(self):
+        return self._idx
+
+    @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys[0].shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(
+            lambda total, x: total + x.nbytes,
+            (self.keys, self.values),
+            0,
+        )
+
+    def filter(self, batch_indices):
+        if self.keys is not None:
+            self.keys = tree_map(lambda x: x[batch_indices], self.keys)
+            self.values = tree_map(lambda x: x[batch_indices], self.values)
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
+        shift = int(self.left_padding.min().item())
+        if shift > 0:
+            if self.keys is not None:
+                self.keys = tree_map(lambda x: x[..., shift:, :], self.keys)
+                self.values = tree_map(lambda x: x[..., shift:, :], self.values)
+            self._idx -= shift
+            self.left_padding -= shift
+
+    def extend(self, other):
+        if (
+            self.group_size,
+            self.key_bits,
+            self.value_bits,
+            self.rotate,
+        ) != (
+            other.group_size,
+            other.key_bits,
+            other.value_bits,
+            other.rotate,
+        ):
+            raise ValueError("Cannot extend incompatible quantized batch caches")
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+        max_size = max(
+            0 if self.keys is None else self.keys[0].shape[2],
+            0 if other.keys is None else other.keys[0].shape[2],
+            max_idx,
+        )
+        ref_k = self.keys if self.keys is not None else other.keys
+        ref_v = self.values if self.values is not None else other.values
+
+        def empty_like(parts, batch):
+            return tuple(
+                mx.zeros((batch, *x.shape[1:2], 0, x.shape[-1]), dtype=x.dtype)
+                for x in parts
+            )
+
+        def pad(cache, ref_keys, ref_values):
+            if cache.keys is None:
+                batch = cache.offset.shape[0]
+                keys = empty_like(ref_keys, batch)
+                values = empty_like(ref_values, batch)
+            else:
+                keys, values = cache.keys, cache.values
+            left = max_idx - cache._idx
+            right = max_size - keys[0].shape[2] - left
+            if right < 0:
+                keys = tree_map(lambda x: x[..., :right, :], keys)
+                values = tree_map(lambda x: x[..., :right, :], values)
+                right = 0
+            if left or right:
+                spec = [(0, 0), (0, 0), (left, right), (0, 0)]
+                keys = tree_map(lambda x: mx.pad(x, spec), keys)
+                values = tree_map(lambda x: mx.pad(x, spec), values)
+            return keys, values, cache.offset, cache.left_padding + left
+
+        a, b = pad(self, ref_k, ref_v), pad(other, ref_k, ref_v)
+        self.keys = tree_map(lambda x, y: mx.concatenate([x, y]), a[0], b[0])
+        self.values = tree_map(lambda x, y: mx.concatenate([x, y]), a[1], b[1])
+        self.offset = mx.concatenate([a[2], b[2]])
+        self.left_padding = mx.concatenate([a[3], b[3]])
+        self._idx = max_idx
+
+    def extract(self, idx):
+        cache = QuantizedKVCache(
+            group_size=self.group_size,
+            bits=self.key_bits,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+            rotate=self.rotate,
+        )
+        if self.keys is None:
+            return cache
+        padding = int(self.left_padding[idx].item())
+        cache.keys = tree_map(
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            self.keys,
+        )
+        cache.values = tree_map(
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            self.values,
+        )
+        cache.offset = cache.keys[0].shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        if not caches:
+            raise ValueError("Cannot merge an empty cache list")
+        config = (
+            caches[0].group_size,
+            caches[0].key_bits,
+            caches[0].value_bits,
+            caches[0].rotate,
+        )
+        if any(c.normalize for c in caches):
+            raise ValueError(
+                "Batching normalized QuantizedKVCache is not supported safely yet"
+            )
+        if any(
+            (c.group_size, c.key_bits, c.value_bits, c.rotate) != config
+            for c in caches
+        ):
+            raise ValueError("Cannot merge incompatible QuantizedKVCache rows")
+        lengths = [c.size() for c in caches]
+        width = max(lengths)
+        batch = cls(
+            [width - n for n in lengths],
+            group_size=config[0],
+            bits=config[1],
+            key_bits=config[1],
+            value_bits=config[2],
+            rotate=config[3],
+        )
+        batch.offset = mx.array(lengths)
+        batch._idx = width
+        if width == 0:
+            return batch
+        ref_k = next(c.keys for c in caches if c.keys is not None)
+        ref_v = next(c.values for c in caches if c.values is not None)
+
+        def merge_parts(attr, ref):
+            rows = []
+            for cache, length in zip(caches, lengths):
+                parts = getattr(cache, attr)
+                if parts is None:
+                    parts = tuple(
+                        mx.zeros((1, x.shape[1], 0, x.shape[-1]), dtype=x.dtype)
+                        for x in ref
+                    )
+                pad = width - length
+                spec = [(0, 0), (0, 0), (pad, 0), (0, 0)]
+                rows.append(
+                    tree_map(lambda x: mx.pad(x[..., :length, :], spec), parts)
+                )
+            return tree_map(lambda *xs: mx.concatenate(xs), *rows)
+
+        batch.keys = merge_parts("keys", ref_k)
+        batch.values = merge_parts("values", ref_v)
+        return batch
 
 
 class BatchKVCache(_BaseCache):

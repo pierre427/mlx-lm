@@ -296,6 +296,7 @@ class TestGenerate(unittest.TestCase):
         from mlx_lm.models.cache import (
             ArraysCache,
             CacheList,
+            QuantizedKVCache,
             RotatingQuantizedKVCache,
         )
 
@@ -332,25 +333,26 @@ class TestGenerate(unittest.TestCase):
             kv_group_size=32,
         )
         try:
-            # Nested plain KVCache quantizes to QuantizedKVCache, which has
-            # no merge: the leaf-level guard must reject it at insert.
+            # Nested plain KVCache now quantizes to a mergeable
+            # QuantizedKVCache and remains eligible for batching.
             supplied = [
                 CacheList(KVCache(), ArraysCache(size=1))
                 for _ in range(len(self.model.layers))
             ]
-            with self.assertRaises(ValueError):
-                gen.insert([prompt], caches=[supplied])
+            gen.insert([prompt], caches=[supplied])
+            queued_cache = gen._unprocessed_sequences[0][3]
+            for c in queued_cache:
+                self.assertIsInstance(c.caches[0], QuantizedKVCache)
         finally:
             gen.close()
 
-    def test_fresh_lane_cachelist_non_mergeable_raises(self):
+    def test_fresh_lane_cachelist_plain_kv_quantizes_and_batches(self):
         # The fresh lane has the same exposure as supplied caches:
         # _make_new_cache() doesn't descend into CacheList when wrapping
         # for max_kv_size, so a hybrid model whose make_cache() nests a
-        # plain KVCache (baichuan_m1's global layers) yields a leaf that
-        # quantizes to non-mergeable QuantizedKVCache. Must raise at
-        # insert, not AttributeError later in CacheList.merge.
-        from mlx_lm.models.cache import ArraysCache, CacheList
+        # plain KVCache (baichuan_m1's global layers) yields a mergeable
+        # QuantizedKVCache leaf.
+        from mlx_lm.models.cache import ArraysCache, CacheList, QuantizedKVCache
 
         prompt = self.tokenizer.encode("hello there")
         self.model.make_cache = lambda: [
@@ -367,8 +369,10 @@ class TestGenerate(unittest.TestCase):
                 kv_group_size=32,
             )
             try:
-                with self.assertRaises(ValueError):
-                    gen.insert([prompt])
+                gen.insert([prompt])
+                queued_cache = gen._unprocessed_sequences[0][3]
+                for c in queued_cache:
+                    self.assertIsInstance(c.caches[1], QuantizedKVCache)
             finally:
                 gen.close()
         finally:
@@ -1771,6 +1775,56 @@ class TestGenerate(unittest.TestCase):
 
             if rotating:
                 del self.model.make_cache
+
+    def test_batch_plain_quantized_matches_single(self):
+        """Non-rotating QuantizedKVCache must survive the real batch lifecycle."""
+        prompts = [
+            self.tokenizer.encode("hello there"),
+            self.tokenizer.encode("briefly explain gravity"),
+        ]
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=3,
+            kv_bits=8,
+            kv_group_size=32,
+            prefill_batch_size=2,
+            completion_batch_size=2,
+        )
+        try:
+            uids = batch_gen.insert(prompts)
+            responses = {uid: [] for uid in uids}
+            while rows := batch_gen.next_generated():
+                for row in rows:
+                    responses[row.uid].append((row.token, row.logprobs))
+        finally:
+            batch_gen.close()
+
+        for prompt, uid in zip(prompts, uids):
+            single = list(
+                stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt,
+                    max_tokens=3,
+                    kv_bits=8,
+                    kv_group_size=32,
+                )
+            )
+            self.assertEqual(len(responses[uid]), len(single))
+            for (batch_token, batch_lp), reference in zip(responses[uid], single):
+                self.assertEqual(int(batch_token), int(reference.token))
+                delta = mx.max(
+                    mx.abs(
+                        batch_lp.astype(mx.float32)
+                        - reference.logprobs.astype(mx.float32)
+                    )
+                )
+                self.assertTrue(mx.all(mx.isfinite(batch_lp)))
+                # Quantizing after padding changes packed-kernel geometry; on
+                # this fixed fixture the three-step envelope is ~0.289 while
+                # every delivered token remains identical.
+                self.assertLessEqual(float(delta.item()), 0.5)
 
     def _continued_generation_test_helper(self, model):
         # Eight steps exercise repeated merge/filter/continuation cycles while

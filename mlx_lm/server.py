@@ -539,17 +539,6 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
-        # QuantizedKVCache does not implement batched merge/extract. Keep
-        # quantized-cache serving on the supported sequential generation path.
-        is_batchable = is_batchable and all(
-            bits is None
-            for bits in (
-                getattr(self.cli_args, "kv_bits", None),
-                getattr(self.cli_args, "kv_key_bits", None),
-                getattr(self.cli_args, "kv_value_bits", None),
-            )
-        )
-
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model

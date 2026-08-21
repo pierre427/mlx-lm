@@ -249,7 +249,11 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
-    if not mx.metal.is_available():
+    device_info = mx.device_info()
+    if (
+        not mx.metal.is_available()
+        or "max_recommended_working_set_size" not in device_info
+    ):
         try:
             yield
         finally:
@@ -258,7 +262,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         model_bytes = tree_reduce(
             lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
+        max_rec_size = device_info["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
             model_mb = model_bytes // 2**20
             max_rec_mb = max_rec_size // 2**20
@@ -2724,9 +2728,13 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        if mx.metal.is_available():
+        device_info = mx.device_info()
+        if (
+            mx.metal.is_available()
+            and "max_recommended_working_set_size" in device_info
+        ):
             self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+                device_info["max_recommended_working_set_size"]
             )
         else:
             self._old_wired_limit = None
@@ -2828,13 +2836,9 @@ class BatchGenerator:
                     self.kv_bits,
                 )
             if self.kv_bits is not None:
-                # Both lanes, not just supplied caches: _make_new_cache()
-                # doesn't descend into CacheList when wrapping for
-                # max_kv_size, so a fresh job on a hybrid model can also
-                # carry a leaf that quantizes to a non-mergeable class.
-                # Batched kv-quant is rotating-only in-tree (plain
-                # QuantizedKVCache has no merge), so fail loudly here instead
-                # of deferring the crash to _merge_caches.
+                # Both lanes, not just supplied caches: validate every nested
+                # leaf after quantization so custom cache classes fail here,
+                # rather than later inside _merge_caches.
                 for c in caches[i]:
                     # CacheList.merge merges leaf-wise, so every nested leaf
                     # must be mergeable too — check leaves, not the wrapper.
