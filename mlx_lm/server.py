@@ -33,6 +33,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .apc import AutomaticPrefixCache
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
@@ -2044,7 +2045,14 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = AutomaticPrefixCache(
+        model_provider.cli_args.prompt_cache_size,
+        max_bytes=(
+            model_provider.cli_args.prompt_cache_bytes
+            if model_provider.cli_args.prompt_cache_bytes is not None
+            else 1 << 63
+        ),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)

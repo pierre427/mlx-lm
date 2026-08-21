@@ -3,6 +3,7 @@
 import os
 
 from ._version import __version__
+from .apc import APC, APCKey, AutomaticPrefixCache
 
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
@@ -13,6 +14,9 @@ from .utils import load
 
 __all__ = [
     "__version__",
+    "APC",
+    "APCKey",
+    "AutomaticPrefixCache",
     "convert",
     "batch_generate",
     "generate",
