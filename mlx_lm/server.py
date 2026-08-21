@@ -73,6 +73,9 @@ class ToolCallFormatter:
         self._streaming = streaming
 
     def _format(self, tc):
+        # Copy before mutating -- `tc` is owned by the tool parser and may be
+        # reused/inspected by its caller; pop/assign must not touch it.
+        tc = dict(tc)
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
         tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
         out = {
@@ -86,7 +89,7 @@ class ToolCallFormatter:
         return out
 
     def __call__(self, tool_calls):
-        if not tool_calls:
+        if not tool_calls or self._tool_parser is None:
             return []
 
         result = []
@@ -101,7 +104,16 @@ class ToolCallFormatter:
                 continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
-            result.extend(self._format(tc) for tc in parsed)
+            for tc in parsed:
+                try:
+                    result.append(self._format(tc))
+                except (KeyError, TypeError, ValueError) as e:
+                    # One malformed call (e.g. missing "arguments") must not
+                    # discard the valid siblings already parsed from this block.
+                    logging.warning(
+                        f"Dropping malformed tool call ({type(e).__name__}: {e})"
+                    )
+                    continue
         return result
 
 
