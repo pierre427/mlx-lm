@@ -27,10 +27,68 @@ def _rel_l2(a, b):
 class TestGatedDelta(unittest.TestCase):
     def setUp(self):
         self._packed = gated_delta._ENABLE_GDN_PACKED
+        self._core = gated_delta._ENABLE_GDN_CORE
+        self._core_fn = gated_delta._core_gated_delta_update
         gated_delta._ENABLE_GDN_PACKED = True
+        gated_delta._ENABLE_GDN_CORE = False
 
     def tearDown(self):
         gated_delta._ENABLE_GDN_PACKED = self._packed
+        gated_delta._ENABLE_GDN_CORE = self._core
+        gated_delta._core_gated_delta_update = self._core_fn
+
+    def test_core_adapter_eligibility_is_narrow(self):
+        gated_delta._ENABLE_GDN_CORE = True
+        gated_delta._core_gated_delta_update = lambda *args, **kwargs: None
+        q, k, v, g, _, state = self._inputs(
+            1, 64, 16, 32, 128, 128, mx.bfloat16
+        )
+        self.assertTrue(
+            gated_delta._can_use_core_gated_delta(q, k, v, g, state, None)
+        )
+        self.assertFalse(
+            gated_delta._can_use_core_gated_delta(
+                q, k, v, g[..., None], state, None
+            )
+        )
+        self.assertFalse(
+            gated_delta._can_use_core_gated_delta(
+                q, k, v, g, state, mx.ones((1, 64), dtype=mx.bool_)
+            )
+        )
+        short = tuple(x[:, :1] if x.ndim >= 2 else x for x in (q, k, v, g))
+        self.assertFalse(
+            gated_delta._can_use_core_gated_delta(*short, state, None)
+        )
+        long = tuple(
+            mx.repeat(x, 5, axis=1) if x.ndim >= 2 else x
+            for x in (q, k, v, g)
+        )
+        self.assertFalse(
+            gated_delta._can_use_core_gated_delta(*long, state, None)
+        )
+
+    def test_core_adapter_passes_explicit_chunk_policy(self):
+        if mx.default_device() != mx.gpu:
+            raise unittest.SkipTest("gated delta kernels are GPU only")
+        calls = []
+
+        def fake_core(q, k, v, g, beta, **kwargs):
+            calls.append(kwargs)
+            return mx.zeros_like(v), kwargs["initial_state"]
+
+        gated_delta._ENABLE_GDN_CORE = True
+        gated_delta._core_gated_delta_update = fake_core
+        q, k, v, _, _, state = self._inputs(
+            1, 64, 16, 32, 128, 128, mx.bfloat16
+        )
+        a = mx.zeros((1, 64, 32))
+        b = mx.zeros_like(a)
+        A_log = mx.zeros((32,))
+        dt_bias = mx.zeros((32,))
+        gated_delta.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["chunk_size"], 8)
 
     def test_kill_switch_restores_original_kernel(self):
         # MLX_GDN_PACKED=0 routes back to the pre-existing simd_sum kernel.

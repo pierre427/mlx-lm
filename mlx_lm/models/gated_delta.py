@@ -12,6 +12,46 @@ import mlx.nn as nn
 # original simd_sum kernels, unchanged.
 _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
 
+# MLX's chunked gated-delta primitive is complementary to the local kernels:
+# it accelerates longer, unmasked scalar-gate prefill, while the local packed,
+# masked, and vector-gate kernels remain the compatibility path used by model
+# families with richer recurrence semantics. Keep adoption verification-gated;
+# setting MLX_GDN_CORE=1 enables the adapter when the installed MLX exposes the
+# corrected primitive.
+_ENABLE_GDN_CORE = os.environ.get("MLX_GDN_CORE", "0") == "1"
+_CORE_GDN_CHUNK_SIZE = 8
+_CORE_GDN_MIN_T = 17
+_CORE_GDN_MAX_T = 256
+_CORE_GDN_HEADS = frozenset(
+    {(24, 24), (32, 32), (16, 16), (16, 32), (16, 48), (16, 64)}
+)
+_core_gated_delta_update = getattr(mx.fast, "gated_delta_update", None)
+
+
+def _can_use_core_gated_delta(q, k, v, g, state, mask):
+    """Whether the fixed MLX primitive covers this exact recurrence layout."""
+    if not _ENABLE_GDN_CORE or _core_gated_delta_update is None:
+        return False
+    if (
+        mask is not None
+        or g.ndim != 3
+        or not (_CORE_GDN_MIN_T <= q.shape[1] <= _CORE_GDN_MAX_T)
+    ):
+        return False
+    Hk, Dk = q.shape[2:]
+    Hv, Dv = v.shape[2:]
+    return (
+        k.shape == q.shape
+        and (Hk, Hv) in _CORE_GDN_HEADS
+        and Dk == 128
+        and Dv == 128
+        and g.dtype == mx.float32
+        and state.dtype == mx.float32
+        and q.dtype in (mx.float32, mx.bfloat16, mx.float16)
+        and k.dtype in (mx.float32, mx.bfloat16, mx.float16)
+        and v.dtype in (mx.float32, mx.bfloat16, mx.float16)
+    )
+
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
@@ -597,4 +637,15 @@ def gated_delta_update(
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
+    if _can_use_core_gated_delta(q, k, v, g, state, mask):
+        return _core_gated_delta_update(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=state,
+            stream=mx.gpu,
+            chunk_size=_CORE_GDN_CHUNK_SIZE,
+        )
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
