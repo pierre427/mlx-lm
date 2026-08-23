@@ -119,6 +119,21 @@ else:
     _QUANT_SDPA_FLASH_MIN_L_MHA = 192
 
 
+
+def _contiguous_quant(q):
+    """Materialize (w, scales, biases) views before ``mx.dequantize``.
+
+    ``QuantizedKVCache`` returns capacity-padded tensors sliced to the live
+    length along the sequence axis, i.e. non-contiguous views. mlx 0.32.1's
+    ``mx.dequantize`` reads such views with the wrong group geometry
+    (ml-explore/mlx#4370, errors in the hundreds at 8-bit); ``quantized_matmul``
+    is unaffected. ``mx.contiguous`` is a no-op on already-contiguous inputs,
+    so this is free on the common path and must guard every runtime
+    ``mx.dequantize`` of cache contents.
+    """
+    return tuple(mx.contiguous(x) for x in q)
+
+
 def quantized_scaled_dot_product_attention(
     queries: mx.array,
     q_keys: tuple[mx.array, mx.array, mx.array],
@@ -147,8 +162,12 @@ def quantized_scaled_dot_product_attention(
         # S * n_kv_heads * D * 4 bytes but avoids the O(L*S) scores
         # round-trip; measured 1.3-2.5x faster than the decomposed path
         # beyond the crossover on all repeat/bits combinations.
-        keys = mx.dequantize(*q_keys, group_size=group_size, bits=key_bits)
-        values = mx.dequantize(*q_values, group_size=group_size, bits=value_bits)
+        keys = mx.dequantize(
+            *_contiguous_quant(q_keys), group_size=group_size, bits=key_bits
+        )
+        values = mx.dequantize(
+            *_contiguous_quant(q_values), group_size=group_size, bits=value_bits
+        )
         return mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=scale, mask=mask
         )

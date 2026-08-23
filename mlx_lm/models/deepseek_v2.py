@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
+    _contiguous_quant,
     create_attention_mask,
     hadamard_size_ok,
     rotate_last,
@@ -319,7 +320,9 @@ class DeepseekV2Attention(nn.Module):
         else:
             if quantized:
                 kv_latent = mx.dequantize(
-                    *kv_latent, group_size=cache.group_size, bits=cache.bits
+                    *_contiguous_quant(kv_latent),
+                    group_size=cache.group_size,
+                    bits=cache.bits,
                 )
             if latent_rotated:
                 # Recover the true latent before the (non-orthogonal) embed_q /

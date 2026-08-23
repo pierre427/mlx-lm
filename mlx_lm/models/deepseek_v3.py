@@ -10,7 +10,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    _contiguous_quant,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -193,7 +198,9 @@ class DeepseekV3Attention(nn.Module):
         else:
             if quantized:
                 kv_latent = mx.dequantize(
-                    *kv_latent, group_size=cache.group_size, bits=cache.bits
+                    *_contiguous_quant(kv_latent),
+                    group_size=cache.group_size,
+                    bits=cache.bits,
                 )
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
