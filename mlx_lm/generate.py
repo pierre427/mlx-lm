@@ -562,8 +562,9 @@ def generate_step(
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            processed_tokens = prompt[:n_to_process]
             _model_call(
-                input_tokens=prompt[:n_to_process][None],
+                input_tokens=processed_tokens[None],
                 input_embeddings=(
                     input_embeddings[:n_to_process][None]
                     if input_embeddings is not None
@@ -572,6 +573,17 @@ def generate_step(
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            # Prefill advances the model cache without calling _step(), but
+            # logits processors still need the complete token history when
+            # they first run on the final prompt token.  Preserve prompt ids
+            # here even when embeddings supply the model inputs: processors
+            # operate on token history, not embedding values.
+            if logits_processors and len(processed_tokens) > 0:
+                tokens = (
+                    mx.concat([tokens, processed_tokens])
+                    if tokens is not None
+                    else processed_tokens
+                )
             prompt_processed_tokens += n_to_process
             record_state_checkpoints(
                 prompt_cache, [checkpoint_base + prompt_processed_tokens]
@@ -850,7 +862,12 @@ def speculative_generate_step(
         s["in_think"] = think_state.in_think
 
     y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    # _step appends its input before applying processors.  Seed it with every
+    # prompt token except the final prefill token so the first draft and target
+    # decisions see the same full-prompt history as generate_step().  The
+    # existing rewind arithmetic then preserves this immutable prefix while
+    # removing tentative draft suffixes.
+    prev_tokens = y[:-1] if logits_processors else None
 
     # Create the KV cache for generation
     if prompt_cache is None:

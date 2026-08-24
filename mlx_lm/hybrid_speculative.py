@@ -1038,6 +1038,7 @@ def self_mtp_generate_step(
     mtp_cache = model.make_mtp_cache() if persistent_mtp else None
 
     y = prompt.astype(mx.uint32)
+    processor_prompt = y
     with mx.stream(generation_stream):
         prev_h = None  # trunk hidden of the previous chunk's last position
         while y.size > 1:  # leave one token to produce the seed hidden
@@ -1064,7 +1065,7 @@ def self_mtp_generate_step(
         seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
         first_logits = model.logits(seed_h)[0, -1]
         first_logits = _apply_logits_processors(
-            logits_processors, y=y, logits=first_logits
+            logits_processors, y=processor_prompt, logits=first_logits
         )
         first_lp = _temperature_logprobs(first_logits, sampling_temp)
         cur = _sample_from_logprobs(first_lp, sampling_temp)
@@ -1097,10 +1098,10 @@ def self_mtp_generate_step(
             rate_gate=rate_gate,
             speculation_router=speculation_router,
             logits_processors=logits_processors,
-            # Match generate_step's established processor context contract:
-            # prefill chunks are excluded and the final prompt token starts
-            # the rolling generation context.
-            token_prefix=y,
+            # Match generate_step's processor contract: the immutable prompt
+            # prefix is present before tentative draft tokens are appended and
+            # rewound at commit boundaries.
+            token_prefix=processor_prompt,
         )
     finally:
         _stop_all_speculation(cache)

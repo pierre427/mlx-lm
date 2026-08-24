@@ -2730,8 +2730,15 @@ class BatchKVCache(_BaseCache):
     def extract(self, idx):
         cache = KVCache()
         padding = self.left_padding[idx].item()
-        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
-        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        # An extract can happen at a server segment boundary before finalize()
+        # has shifted pending right padding out of each row.  Exclude those
+        # filler cells so a stored prompt cache has the same contents and
+        # length it would have after finalize().
+        end = self._idx
+        if self._right_padding is not None:
+            end -= int(self._right_padding[idx].item())
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding:end])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding:end])
         cache.offset = cache.keys.shape[2]
         return cache
 
@@ -3163,6 +3170,17 @@ class BatchRotatingKVCache(_BaseCache):
             self._idx,
             self.rotated,
         )
+        if self._lengths is not None and cache.keys is not None:
+            # While a right-padded prefill is in flight, offset still counts
+            # the rectangular filler cells and _lengths records the true end
+            # for each row.  Match the post-finalize snapshot without mutating
+            # the live batch cache.
+            pad = max(0, int((self.offset - self._lengths).tolist()[idx]))
+            if pad:
+                cache.keys = mx.contiguous(cache.keys[:, :, :-pad])
+                cache.values = mx.contiguous(cache.values[:, :, :-pad])
+                cache.offset -= pad
+                cache._idx = cache.keys.shape[2]
         if self.speculating and self._rollbacks:
             cache.start_speculation(self._rollback_window)
             for num_tokens, snap, keys, values in self._rollbacks:
