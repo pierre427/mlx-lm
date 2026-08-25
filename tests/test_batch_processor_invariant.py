@@ -26,9 +26,6 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
-
-generate_module = importlib.import_module("mlx_lm.generate")
-
 from mlx_lm.generate import (
     GenerationBatch,
     PromptProcessingBatch,
@@ -36,6 +33,8 @@ from mlx_lm.generate import (
     TextStateMachine,
 )
 from mlx_lm.server import _segment_by_state
+
+generate_module = importlib.import_module("mlx_lm.generate")
 
 
 class FakeModel(nn.Module):

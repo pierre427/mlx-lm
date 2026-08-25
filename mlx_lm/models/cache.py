@@ -525,8 +525,7 @@ class QuantizedKVCache(_BaseCache):
 
         return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
 
-    @property
-    def state(self):
+    def keys_and_values(self):
         if self.offset == self.keys[0].shape[2]:
             keys, values = self.keys, self.values
         else:
@@ -539,6 +538,10 @@ class QuantizedKVCache(_BaseCache):
             # which is stringified integers).
             return keys, values, self.key_scale, self.value_scale
         return keys, values
+
+    @property
+    def state(self):
+        return self.keys_and_values()
 
     @state.setter
     def state(self, v):
@@ -687,25 +690,40 @@ class KVCache(_BaseCache):
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        if self.offset < self.keys.shape[2]:
+            return (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return self.keys, self.values
 
     def size(self):
         return self.offset
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
-            return self.keys, self.values
-        else:
-            return (
-                self.keys[..., : self.offset, :],
-                self.values[..., : self.offset, :],
-            )
+        return self.keys, self.values
 
     @state.setter
     def state(self, v):
+        same_storage = getattr(self, "keys", None) is v[0]
+        previous_offset = getattr(self, "offset", None) if same_storage else None
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = (
+            self.keys.shape[2] if previous_offset is None else previous_offset
+        )
+
+    @property
+    def meta_state(self):
+        return (str(self.offset),)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if v:
+            self.offset = int(v[0])
 
     def is_trimmable(self):
         return True
@@ -2549,7 +2567,12 @@ class BatchKVCache(_BaseCache):
                     mx.take(new_keys, group.index_array, axis=0),
                     mx.take(new_values, group.index_array, axis=0),
                 )
-        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        if self._idx < self.keys.shape[2]:
+            return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+        return self.keys, self.values
 
     def bucketed_attention(self, queries, scale, mask, sinks=None):
         """Run exact length-shaped decode attention when capability-gated.
@@ -2632,19 +2655,26 @@ class BatchKVCache(_BaseCache):
 
     @property
     def state(self):
-        k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
-            k = k[..., : self._idx, :]
-            v = v[..., : self._idx, :]
-        return k, v, self.offset, self.left_padding
+        return self.keys, self.values, self.offset, self.left_padding
 
     @state.setter
     def state(self, v):
         backend = getattr(self, "attention_backend", None)
+        same_storage = getattr(self, "keys", None) is v[0]
+        previous_idx = getattr(self, "_idx", None) if same_storage else None
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = self.keys.shape[2] if previous_idx is None else previous_idx
         self._right_padding = None
         self._configure_attention_backend(backend)
+
+    @property
+    def meta_state(self):
+        return (str(self._idx),)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if v:
+            self._idx = int(v[0])
 
     def is_trimmable(self):
         return True

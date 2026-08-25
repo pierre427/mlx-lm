@@ -566,10 +566,18 @@ class TestPromptCache(unittest.TestCase):
         merged_cache = CacheList.merge((c1, c2))
         c1_ex = merged_cache.extract(0)
         self.assertTrue(mx.array_equal(c1_ex[0][0], c1[0][0]))
-        self.assertTrue(mx.array_equal(c1_ex[1].state[0], c1[1].state[0]))
+        self.assertTrue(
+            mx.array_equal(
+                c1_ex[1].keys_and_values()[0], c1[1].keys_and_values()[0]
+            )
+        )
         c2_ex = merged_cache.extract(1)
         self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
-        self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
+        self.assertTrue(
+            mx.array_equal(
+                c2_ex[1].keys_and_values()[0], c2[1].keys_and_values()[0]
+            )
+        )
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask
@@ -609,6 +617,19 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
         mask = create_attention_mask(mx.zeros((1, 4)), cache=cache, return_array=True)
         self.assertEqual(mask.shape, (4, 20))
+
+    def test_kv_state_preserves_allocated_capacity(self):
+        cache = KVCache()
+        x = mx.arange(24).reshape(1, 1, 3, 8)
+        cache.update_and_fetch(x, x)
+
+        self.assertEqual(cache.keys_and_values()[0].shape[-2], 3)
+        self.assertEqual(cache.state[0].shape[-2], cache.step)
+
+        restored = KVCache.from_state(cache.state, cache.meta_state)
+        self.assertEqual(restored.offset, 3)
+        self.assertEqual(restored.state[0].shape[-2], cache.step)
+        self.assertTrue(mx.array_equal(restored.keys_and_values()[0], x))
 
     def test_rotating_cache_mask(self):
         cache = RotatingKVCache(max_size=8)
@@ -680,7 +701,7 @@ class TestPromptCache(unittest.TestCase):
         cache.filter([0, 1])
 
         # In this case filtering left shifts the cache so it has zero padding
-        self.assertEqual(cache.state[0].shape, (2, 1, 2, 8))
+        self.assertEqual(cache.keys_and_values()[0].shape, (2, 1, 2, 8))
 
         mask = cache.make_mask(1)
         self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
@@ -703,6 +724,19 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.values.shape[0], 5)
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
+
+    def test_batch_kv_state_preserves_capacity_and_live_index(self):
+        cache = BatchKVCache(left_padding=[1, 0])
+        x = mx.arange(48).reshape(2, 1, 3, 8)
+        cache.update_and_fetch(x, x)
+
+        self.assertEqual(cache.keys_and_values()[0].shape[-2], 3)
+        self.assertEqual(cache.state[0].shape[-2], cache.step)
+
+        restored = BatchKVCache.from_state(cache.state, cache.meta_state)
+        self.assertEqual(restored._idx, 3)
+        self.assertEqual(restored.state[0].shape[-2], cache.step)
+        self.assertTrue(mx.array_equal(restored.keys_and_values()[0], x))
 
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
