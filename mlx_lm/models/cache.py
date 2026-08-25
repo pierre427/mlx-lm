@@ -360,6 +360,12 @@ class ConcatenateKVCache(_BaseCache):
 
         return self.keys, self.values
 
+    def keys_and_values(self):
+        # Buffer is always the plain temporal concatenation (offset ==
+        # keys.shape[-2]), so hand it back unchanged — used by KV-sharing
+        # layers (e.g. afm7) that read a peer layer's cache without updating.
+        return self.keys, self.values
+
     @property
     def state(self):
         return self.keys, self.values
@@ -1022,6 +1028,23 @@ class RotatingKVCache(_BaseCache):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
+
+    def keys_and_values(self):
+        # Return the live window without mutating the cache, exactly as the
+        # most recent update_and_fetch handed it back. Used by KV-sharing
+        # layers (e.g. gemma3n) that read a peer layer's cache instead of
+        # projecting their own K/V. The physical buffer is kept in the same
+        # ring order as the mask that make_mask() produces (temporal before the
+        # ring wraps, rotated once offset >= max_size), so — like
+        # update_and_fetch — we hand back the buffer as-is and let the mask
+        # account for the ring ordering. Only the unfilled tail (offset <
+        # buffer length, before wrapping) is sliced off.
+        if self.offset < self.keys.shape[2]:
+            return (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return self.keys, self.values
 
     def size(self):
         return min(self.offset, self.max_size)
