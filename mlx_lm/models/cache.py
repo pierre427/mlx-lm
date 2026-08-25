@@ -1611,21 +1611,29 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
+        # None can not be serialized so return empty array instead
+        left_padding = mx.array([]) if self.left_padding is None else self.left_padding
+        lengths = mx.array([]) if self.lengths is None else self.lengths
         checkpoints = self._persistable_checkpoints()
         if checkpoints:
-            return [list(self.cache), [list(s) for _, s in checkpoints]]
-        return self.cache
+            cache = [list(self.cache), [list(s) for _, s in checkpoints]]
+        else:
+            cache = self.cache
+        return cache, left_padding, lengths
 
     @state.setter
     def state(self, v):
-        # New-format state is [live_entries, [snapshot, ...]] (nested lists);
-        # legacy state is a flat list of arrays. The positions arrive in
-        # meta_state, whose setter runs after this one (see from_state).
-        if len(v) == 2 and isinstance(v[0], list) and isinstance(v[1], list):
-            self.cache = list(v[0])
-            self._pending_checkpoint_snapshots = [list(s) for s in v[1]]
+        cache, left_padding, lengths = v
+        self.left_padding = left_padding if left_padding.size > 0 else None
+        self.lengths = lengths if lengths.size > 0 else None
+        # New-format cache is [live_entries, [snapshot, ...]] (nested lists);
+        # legacy cache is a flat list of arrays. Positions arrive in meta_state,
+        # whose setter runs after this one (see from_state).
+        if len(cache) == 2 and isinstance(cache[0], list) and isinstance(cache[1], list):
+            self.cache = list(cache[0])
+            self._pending_checkpoint_snapshots = [list(s) for s in cache[1]]
         else:
-            self.cache = v
+            self.cache = cache
 
     @property
     def meta_state(self):
@@ -1793,11 +1801,15 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position

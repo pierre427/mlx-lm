@@ -11,7 +11,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -31,7 +30,9 @@ from .models.cache import (
     RotatingKVCache,
     TokenBuffer,
     load_prompt_cache,
+    make_prompt_cache,
     record_state_checkpoints,
+    trim_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -44,11 +45,12 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
-DEFAULT_XTC_THRESHOLD = 0.0
+DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_PREFILL_STEP_SIZE = 2048
 
 # Materialize cache fields that are not otherwise consumed by the sampled-token
 # graph often enough to bound their lazy update chains.  This is a defensive
@@ -133,7 +135,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.1,
+        default=DEFAULT_XTC_THRESHOLD,
         help="Threshold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
@@ -175,6 +177,13 @@ def setup_arg_parser():
         type=int,
         help="Set the maximum key-value cache size",
         default=None,
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of prompt tokens to process at a time. Smaller values "
+        f"lower peak memory during prefill (default: {DEFAULT_PREFILL_STEP_SIZE})",
     )
     parser.add_argument(
         "--prompt-cache-file",
@@ -487,7 +496,7 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
+        prompt_cache = make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
         )
@@ -877,8 +886,8 @@ def speculative_generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        model_cache = make_prompt_cache(model)
+        draft_cache = make_prompt_cache(draft_model)
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
@@ -975,8 +984,8 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        trim_prompt_cache(model_cache, num_draft - num_accept)
+        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -1762,38 +1771,6 @@ class BatchStats:
     generation_tps: float = 0
     generation_time: float = 0
     peak_memory: float = 0
-
-
-def _make_cache(model, left_padding, max_kv_size):
-    """
-    Convert a list of regular caches into their corresponding
-    batch-aware caches.
-    """
-
-    def to_batch_cache(c):
-        if type(c) is KVCache:
-            return BatchKVCache(left_padding)
-        elif isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
-            return c
-        elif isinstance(c, RotatingKVCache):
-            if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, CacheList):
-            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        if max_kv_size is not None:
-            return [
-                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
-            ]
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _merge_caches(caches):
@@ -3598,6 +3575,7 @@ def main():
         verbose=args.verbose,
         sampler=sampler,
         max_kv_size=args.max_kv_size,
+        prefill_step_size=args.prefill_step_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
