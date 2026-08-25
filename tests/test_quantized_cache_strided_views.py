@@ -1,9 +1,8 @@
-# mlx 0.32.1 regression (ml-explore/mlx#4370): ``mx.dequantize`` on a view
-# sliced along a non-last axis reads the wrong groups. ``QuantizedKVCache``
-# hands out exactly such views (capacity-padded ring sliced to ``offset``),
-# so every runtime ``mx.dequantize`` of cache contents must materialize the
-# view first. ``quantized_matmul`` is unaffected. These tests run the real
-# cache + attention path against a contiguous reference.
+# mlx 0.32.2 includes ml-explore/mlx#4381, which fixes the mlx#4370 regression
+# where ``mx.dequantize`` read non-last-axis views with the wrong group
+# geometry. ``QuantizedKVCache`` hands out exactly such capacity-padded views.
+# These tests keep the upstream fix as a minimum-runtime correctness gate and
+# verify that the local compatibility seam no longer materializes a copy.
 import unittest
 
 import mlx.core as mx
@@ -24,11 +23,12 @@ class TestQuantizedCacheStridedViews(unittest.TestCase):
         self.assertLess(T, cache.keys[0].shape[-2])
         return cache, q_keys, q_values
 
-    def test_dequantize_view_matches_contiguous(self):
+    def test_dequantize_view_matches_contiguous_without_guard_copy(self):
         for bits, gs in ((4, 32), (4, 64), (8, 32), (8, 64)):
             _, q_keys, q_values = self._warm_cache(bits, gs)
             for t in (q_keys, q_values):
-                a = mx.dequantize(*base._contiguous_quant(t), group_size=gs, bits=bits)
+                self.assertIs(base._contiguous_quant(t), t)
+                a = mx.dequantize(*t, group_size=gs, bits=bits)
                 b = mx.dequantize(
                     *(mx.contiguous(x) for x in t), group_size=gs, bits=bits
                 )

@@ -121,17 +121,14 @@ else:
 
 
 def _contiguous_quant(q):
-    """Materialize (w, scales, biases) views before ``mx.dequantize``.
+    """Return quantized cache views directly on mlx 0.32.2 or newer.
 
-    ``QuantizedKVCache`` returns capacity-padded tensors sliced to the live
-    length along the sequence axis, i.e. non-contiguous views. mlx 0.32.1's
-    ``mx.dequantize`` reads such views with the wrong group geometry
-    (ml-explore/mlx#4370, errors in the hundreds at 8-bit); ``quantized_matmul``
-    is unaffected. ``mx.contiguous`` is a no-op on already-contiguous inputs,
-    so this is free on the common path and must guard every runtime
-    ``mx.dequantize`` of cache contents.
+    mlx 0.32.2 includes ml-explore/mlx#4381, which fixes the strided
+    ``mx.dequantize`` corruption tracked as mlx#4370. Keeping this helper as
+    the common call-site seam makes the compatibility boundary explicit while
+    avoiding the materializing copies required by mlx 0.32.1.
     """
-    return tuple(mx.contiguous(x) for x in q)
+    return q
 
 
 def quantized_scaled_dot_product_attention(
