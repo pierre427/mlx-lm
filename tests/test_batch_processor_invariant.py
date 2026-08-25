@@ -20,10 +20,14 @@ Everything uses tiny synthetic tensors, fake samplers/processors and a fake
 model -- no weights are loaded and the GPU is never touched.
 """
 
+import importlib
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
+
+generate_module = importlib.import_module("mlx_lm.generate")
 
 from mlx_lm.generate import (
     GenerationBatch,
@@ -44,6 +48,18 @@ class FakeModel(nn.Module):
     def __call__(self, inputs, cache=None):
         # inputs: (batch, seq) -> logits: (batch, seq, vocab)
         return mx.zeros((inputs.shape[0], inputs.shape[1], self.vocab))
+
+
+class CountingStateCache:
+    """Minimal cache whose state accessor records maintenance evaluation."""
+
+    def __init__(self):
+        self.state_reads = 0
+
+    @property
+    def state(self):
+        self.state_reads += 1
+        return mx.array(self.state_reads)
 
 
 def const_sampler(token: int):
@@ -91,6 +107,42 @@ class TestBatchProcessorInvariant(unittest.TestCase):
 
     def tearDown(self):
         mx.set_default_device(self._prev_device)
+
+    def test_plain_decode_periodically_materializes_cache_state(self):
+        cache = CountingStateCache()
+        generation = generate_module.generate_step(
+            mx.array([1]),
+            self.model,
+            max_tokens=3,
+            prompt_cache=[cache],
+        )
+
+        with patch.object(generate_module, "CACHE_STATE_EVAL_INTERVAL", 2):
+            list(generation)
+
+        # The existing maintenance branch runs at decode indices 0 and 2.
+        self.assertEqual(cache.state_reads, 2)
+
+    def test_batch_decode_folds_cache_state_into_periodic_async_eval(self):
+        cache = CountingStateCache()
+        inputs = mx.zeros((1,), dtype=mx.uint32)
+        batch = GenerationBatch(
+            self.model,
+            [0],
+            inputs,
+            [cache],
+            [[1]],
+            [None],
+            _argmax_fallback,
+            [[]],
+            [StopSequenceMatcher()],
+            [100],
+        )
+
+        with patch.object(generate_module, "CACHE_STATE_EVAL_INTERVAL", 2):
+            batch._step()
+
+        self.assertEqual(cache.state_reads, 1)
 
     # ----- H1: mixed no-processor + processor lanes step without TypeError ---
     def test_mixed_processor_lanes_step_without_typeerror(self):

@@ -50,6 +50,11 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
+# Materialize cache fields that are not otherwise consumed by the sampled-token
+# graph often enough to bound their lazy update chains.  This is a defensive
+# decode-time maintenance interval, not a performance tuning knob.
+CACHE_STATE_EVAL_INTERVAL = 256
+
 
 def str2bool(string):
     return string.lower() not in ["false", "f"]
@@ -620,7 +625,8 @@ def generate_step(
         if n == max_tokens:
             break
         yield y.item(), logprobs
-        if n % 256 == 0:
+        if n % CACHE_STATE_EVAL_INTERVAL == 0:
+            mx.eval([c.state for c in prompt_cache])
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
         n += 1
@@ -2357,6 +2363,7 @@ class GenerationBatch:
 
         self._current_tokens = None
         self._current_logprobs = []
+        self._decode_steps = 0
         self._next_tokens = inputs
         self._next_logprobs = []
         self._token_context = [TokenBuffer(t) for t in tokens]
@@ -2473,7 +2480,11 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        self._decode_steps += 1
+        eval_targets = [self._next_tokens, self._next_logprobs, token_context]
+        if self._decode_steps % CACHE_STATE_EVAL_INTERVAL == 0:
+            eval_targets.append([c.state for c in self.prompt_cache])
+        mx.async_eval(*eval_targets)
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
