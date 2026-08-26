@@ -639,7 +639,7 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: float | None = None,
 ) -> Tuple[mx.array, mx.array]:
-    beta = mx.sigmoid(b)
+    beta = mx.sigmoid(b.astype(mx.float32))
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
     else:

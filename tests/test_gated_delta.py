@@ -90,6 +90,43 @@ class TestGatedDelta(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["chunk_size"], 8)
 
+    def test_update_keeps_bf16_sigmoid_in_float32(self):
+        previous_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            T = 1000
+            mx.random.seed(53877)
+            q = (mx.random.normal((1, T, 1, 1)) * 0.2).astype(mx.bfloat16)
+            k = (mx.random.normal((1, T, 1, 1)) * 0.2).astype(mx.bfloat16)
+            v = (mx.random.normal((1, T, 1, 1)) * 0.2).astype(mx.bfloat16)
+            a = (mx.random.normal((1, T, 1)) * 0.2 - 2.0).astype(mx.bfloat16)
+            b = (mx.random.normal((1, T, 1)) * 0.7 + 0.5).astype(mx.bfloat16)
+            A_log = mx.zeros((1,), dtype=mx.float32)
+            dt_bias = mx.zeros((1,), dtype=mx.float32)
+            state = mx.zeros((1, 1, 1, 1), dtype=mx.float32)
+
+            y, final_state = gated_delta.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state,
+                use_kernel=False,
+            )
+            g = gated_delta.compute_g(A_log, a, dt_bias)
+            y_ref, state_ref = gated_delta_ops(
+                q, k, v, g, mx.sigmoid(b.astype(mx.float32)), state
+            )
+            mx.eval(y, final_state, y_ref, state_ref)
+
+            self.assertLess(_rel_l2(y, y_ref), 1e-7)
+            self.assertLess(_rel_l2(final_state, state_ref), 1e-7)
+        finally:
+            mx.set_default_device(previous_device)
+
     def test_kill_switch_restores_original_kernel(self):
         # MLX_GDN_PACKED=0 routes back to the pre-existing simd_sum kernel.
         if mx.default_device() != mx.gpu:

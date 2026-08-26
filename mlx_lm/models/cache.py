@@ -2765,6 +2765,9 @@ class BatchKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        populated = self if self.keys is not None else other
+        key_dtype = populated.keys.dtype
+        value_dtype = populated.values.dtype
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
@@ -2772,8 +2775,8 @@ class BatchKVCache(_BaseCache):
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=key_dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=value_dtype)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -3176,14 +3179,17 @@ class BatchRotatingKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        populated = self if self.keys is not None else other
+        key_dtype = populated.keys.dtype
+        value_dtype = populated.values.dtype
 
         def pad(c):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=key_dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=value_dtype)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]

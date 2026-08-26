@@ -925,6 +925,43 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(batch_full.keys.shape[0], 5)
         self.assertEqual(batch_full.offset.shape[0], 5)
 
+    def test_extend_with_empty_batch_cache_preserves_kv_dtypes(self):
+        """Empty placeholders must not promote either K or V to float32."""
+        H, Dk, Dv = 2, 8, 6
+
+        def make_batch(base_cls, batch_cls, n, with_content, **kwargs):
+            caches = [base_cls(**kwargs) for _ in range(n)]
+            if with_content:
+                for cache in caches:
+                    keys = mx.ones((1, H, 5, Dk), dtype=mx.bfloat16)
+                    values = mx.ones((1, H, 5, Dv), dtype=mx.float16)
+                    cache.update_and_fetch(keys, values)
+            batch = batch_cls.merge(caches)
+            if with_content:
+                # Batch merge currently follows the key dtype for both
+                # buffers. Restore a distinct value dtype here to isolate the
+                # extend() placeholder contract under test.
+                batch.values = batch.values.astype(mx.float16)
+            return batch
+
+        cases = (
+            (KVCache, BatchKVCache, {}),
+            (RotatingKVCache, BatchRotatingKVCache, {"max_size": 16}),
+        )
+        for base_cls, batch_cls, kwargs in cases:
+            for direction in ("append", "prepend"):
+                populated = make_batch(base_cls, batch_cls, 2, True, **kwargs)
+                empty = make_batch(base_cls, batch_cls, 1, False, **kwargs)
+                if direction == "append":
+                    populated.extend(empty)
+                    result = populated
+                else:
+                    empty.extend(populated)
+                    result = empty
+                message = f"{batch_cls.__name__} {direction}"
+                self.assertEqual(result.keys.dtype, mx.bfloat16, message)
+                self.assertEqual(result.values.dtype, mx.float16, message)
+
     def test_arrays_cache_extend_with_empty(self):
         # test simple merge
         c1 = ArraysCache(2)
